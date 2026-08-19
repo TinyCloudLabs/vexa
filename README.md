@@ -1,3 +1,20 @@
+> **TinyCloud fork of Vexa** — maintained at [TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa).
+> Our changes live on branch **`tinycloud`** (based on upstream `e0b356d6`, v0.12.22); **`main` tracks
+> upstream** [Vexa-ai/vexa](https://github.com/Vexa-ai/vexa) and carries no TinyCloud commits.
+> Fork changes so far: the record-chunker's recording tap is DYNAMIC
+> (`core/meetings/modules/record-chunker`) — participants whose audio arrives after the bot's tap
+> starts are attached to the batch recording (master.webm), and the tap starts even when nobody
+> with audio is present at join. License unchanged (Apache-2.0; see `LICENSE`).
+>
+> **Sync with upstream:**
+> ```bash
+> git remote add upstream https://github.com/Vexa-ai/vexa   # once
+> git fetch upstream --tags
+> git checkout main && git merge --ff-only upstream/main && git push origin main --tags
+> git checkout tinycloud && git rebase main   # or merge; re-run record-chunker tests
+> git push origin tinycloud --force-with-lease
+> ```
+
 <div align="center">
 
 <img src="assets/logodark.svg" alt="Vexa logo" width="72"/>

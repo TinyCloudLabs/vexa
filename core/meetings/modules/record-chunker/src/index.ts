@@ -1,6 +1,11 @@
 /**
  * @vexa/record-chunker — the shared browser MediaRecorder driver.
  *
+ * MODIFIED BY TINYCLOUD (fork branch `tinycloud`, github.com/TinyCloudLabs/vexa):
+ * createRecordingTap's element combine is now DYNAMIC (DynamicElementMixer) — it
+ * starts with whatever audio is present (or none) and keeps attaching media
+ * elements that appear later, mirroring the live mixed-lane rescan.
+ *
  * Runs in browser context. Wraps a MediaRecorder over a combined audio
  * MediaStream, encodes each timeslice to base64, and hands it to an injected
  * `onChunk` callback (the recording.v1 chunk shape). On stop it emits one final
@@ -237,62 +242,142 @@ export class MediaRecorderChunker implements RecordingTap {
 // ───────────────────────────────────────────────────────────────────────
 
 /**
- * Find active media elements that expose audio. Two-pass (strict → relaxed):
- * tiles can be paused or expose audio via captureStream() rather than a direct
- * srcObject, so the relaxed pass mirrors buildCombinedStream's fallbacks. This
- * is platform-agnostic — a recording grabs every audio element on the page.
+ * How often the dynamic mix rescans the page for media-element changes (ms).
+ * Mirrors the live mixed-lane rescan (capture-bridge `__vexaMixRescan`, 2000ms) —
+ * the mechanism that already makes the LIVE path hear late-arriving tracks.
  */
-async function findMediaElements(retries = 5, delay = 2000): Promise<HTMLMediaElement[]> {
-  for (let i = 0; i < retries; i++) {
-    const all = Array.from(document.querySelectorAll("audio, video"));
-    let els = all.filter((el: any) =>
-      !el.paused && el.srcObject instanceof MediaStream && el.srcObject.getAudioTracks().length > 0
-    ) as HTMLMediaElement[];
-    if (els.length > 0) { blog(`[record-chunker] ${els.length} media elements (strict)`); return els; }
+const RESCAN_MS = 2000;
 
-    els = all.filter((el: any) => {
-      try {
-        if (el.srcObject instanceof MediaStream && el.srcObject.getAudioTracks().length > 0) return true;
-        if (typeof el.captureStream === "function" && el.captureStream()?.getAudioTracks?.().length > 0) return true;
-        if (typeof el.mozCaptureStream === "function" && el.mozCaptureStream()?.getAudioTracks?.().length > 0) return true;
-      } catch { /* not probeable; skip */ }
-      return false;
-    }) as HTMLMediaElement[];
-    if (els.length > 0) { blog(`[record-chunker] ${els.length} media elements (relaxed)`); return els; }
-
-    await new Promise((r) => setTimeout(r, delay));
-  }
-  return [];
+/**
+ * Probe one media element for an audio-bearing MediaStream. srcObject preferred;
+ * captureStream()/mozCaptureStream() as fallbacks (tiles can be paused or expose
+ * audio only via capture). Returns null when the element has no usable audio yet —
+ * the rescan will probe it again later.
+ */
+/** True when the stream has at least one LIVE audio track. Liveness (not mere track
+ *  presence) is required — otherwise an ended stream would detach and immediately
+ *  re-attach on every rescan. */
+function hasLiveAudio(s: any): boolean {
+  try {
+    return s instanceof MediaStream
+      && s.getAudioTracks().some((t: any) => t.readyState === undefined || t.readyState === "live");
+  } catch { return false; }
 }
 
-/** Mix every media element's audio into one MediaStream via a destination node. */
-async function buildCombinedStream(mediaElements: HTMLMediaElement[]): Promise<MediaStream> {
-  if (mediaElements.length === 0) throw new Error("[record-chunker] no media elements to combine");
-  const ctx = new AudioContext();
-  const dest = ctx.createMediaStreamDestination();
-  let connected = 0;
-  mediaElements.forEach((element: any, index) => {
+function probeElementStream(el: any): MediaStream | null {
+  try {
+    if (hasLiveAudio(el.srcObject)) return el.srcObject;
+    if (typeof el.captureStream === "function") {
+      const s = el.captureStream();
+      if (hasLiveAudio(s)) return s;
+    }
+    if (typeof el.mozCaptureStream === "function") {
+      const s = el.mozCaptureStream();
+      if (hasLiveAudio(s)) return s;
+    }
+  } catch { /* not probeable yet; the rescan retries */ }
+  return null;
+}
+
+/**
+ * DYNAMIC element mixer — the recording-tap twin of the live lane's `setupMix`
+ * rescan loop. Mixes every audio-bearing media element into ONE destination
+ * stream, and KEEPS attaching elements that appear (or whose srcObject changes)
+ * after the tap started. This is the fix for the two batch-recording defects the
+ * static combine had:
+ *   1. a participant whose audio track arrives AFTER the tap starts (e.g. joins
+ *      after the bot) was absent from the master although the live mixer heard
+ *      him — the tap grabbed the elements once at start and never looked again;
+ *   2. a room with NO audio-bearing element at tap start produced no recording
+ *      at all (or latched onto a stale/silent element).
+ * The destination node's stream always carries one audio track, so the
+ * MediaRecorder can start over an EMPTY mix and pick up audio as it appears.
+ * Detach (track ended / element removed / srcObject swapped) is handled on the
+ * same rescan and must never crash the recording.
+ */
+export class DynamicElementMixer {
+  private ctx: AudioContext;
+  private dest: MediaStreamAudioDestinationNode;
+  /** element → the stream/source we attached for it (dedupe + detach bookkeeping). */
+  private attached = new Map<any, { stream: MediaStream; source: MediaStreamAudioSourceNode }>();
+  private timer: any = null;
+  private rescanMs: number;
+  /** The combined mix — hand this to the MediaRecorderChunker. */
+  readonly stream: MediaStream;
+
+  constructor(rescanMs = RESCAN_MS) {
+    this.rescanMs = rescanMs;
+    this.ctx = new AudioContext();
+    (this.ctx as any).resume?.();
+    this.dest = this.ctx.createMediaStreamDestination();
+    this.stream = this.dest.stream;
+  }
+
+  /** How many elements are currently feeding the mix. */
+  get attachedCount(): number { return this.attached.size; }
+
+  /** One pass: detach dead sources, attach new audio-bearing elements. Never throws. */
+  scan(): void {
     try {
-      const s =
-        element.srcObject ||
-        (element.captureStream && element.captureStream()) ||
-        (element.mozCaptureStream && element.mozCaptureStream());
-      if (s instanceof MediaStream && s.getAudioTracks().length > 0) {
-        ctx.createMediaStreamSource(s).connect(dest);
-        connected++;
-        blog(`[record-chunker] connected element ${index + 1}/${mediaElements.length}`);
+      // Autoplay policy can leave a gesture-less AudioContext suspended → silent mix.
+      if ((this.ctx as any).state === "suspended") (this.ctx as any).resume?.();
+
+      // Detach: all tracks ended, element left the DOM, or srcObject was swapped
+      // for a NEW stream (the swap re-attaches below under the new stream).
+      for (const [el, a] of Array.from(this.attached.entries())) {
+        const tracksLive = a.stream.getAudioTracks().some((t: any) => t.readyState === "live");
+        const inDom = (document as any).contains ? (document as any).contains(el) : true;
+        const swapped = el.srcObject instanceof MediaStream && el.srcObject !== a.stream
+          && hasLiveAudio(el.srcObject);
+        if (tracksLive && inDom && !swapped) continue;
+        try { a.source.disconnect(); } catch { /* already gone */ }
+        this.attached.delete(el);
+        const why = !tracksLive ? "tracks ended" : !inDom ? "removed from DOM" : "srcObject swapped";
+        blog(`[record-chunker] detached media element (${why}); ${this.attached.size} attached`);
       }
-    } catch (e: any) { blog(`[record-chunker] could not connect element ${index + 1}: ${e?.message || e}`); }
-  });
-  if (connected === 0) throw new Error("[record-chunker] could not connect any audio streams");
-  blog(`[record-chunker] combined ${connected} streams`);
-  return dest.stream;
+
+      // Attach anything new. Dedupe by ELEMENT (not stream id): captureStream()
+      // returns a fresh stream per call, so a stream-id dedupe would re-attach
+      // capture-stream elements on every rescan.
+      const all = Array.from(document.querySelectorAll("audio, video"));
+      for (const el of all) {
+        if (this.attached.has(el)) continue;
+        const s = probeElementStream(el);
+        if (!s) continue;
+        try {
+          const source = this.ctx.createMediaStreamSource(s);
+          source.connect(this.dest);
+          this.attached.set(el, { stream: s, source });
+          blog(`[record-chunker] attached media element (${this.attached.size} attached)`);
+        } catch (e: any) {
+          blog(`[record-chunker] could not attach media element: ${e?.message || e}`);
+        }
+      }
+    } catch (e: any) {
+      blog(`[record-chunker] rescan failed (recording continues): ${e?.message || e}`);
+    }
+  }
+
+  /** Initial scan + periodic rescan (the late-joiner mechanism). */
+  start(): void {
+    this.scan();
+    this.timer = setInterval(() => this.scan(), this.rescanMs);
+  }
+
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    for (const [, a] of this.attached) { try { a.source.disconnect(); } catch { /* */ } }
+    this.attached.clear();
+    try { (this.ctx as any).close?.(); } catch { /* */ }
+  }
 }
 
 /** Options for createRecordingTap — combine all audio elements then optionally override. */
 export interface CreateRecordingTapOptions extends RecordingTapOptions {
   /** Provide a ready stream to record (e.g. the mixed-lane tab stream); else all audio elements are combined. */
   stream?: MediaStream;
+  /** Media-element rescan interval for the dynamic mix (default 2000ms — live-mixer parity). */
+  rescanMs?: number;
 }
 
 /**
@@ -307,13 +392,19 @@ export interface CreateRecordingTapOptions extends RecordingTapOptions {
  */
 export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTap {
   let chunker: MediaRecorderChunker | null = null;
+  let mixer: DynamicElementMixer | null = null;
   return {
     async start(): Promise<void> {
       let stream = opts.stream;
       if (!stream) {
-        const els = await findMediaElements();
-        if (els.length === 0) { blog("[record-chunker] no media elements — cannot record"); return; }
-        stream = await buildCombinedStream(els);
+        // Dynamic mix: start recording IMMEDIATELY over the (possibly empty)
+        // destination stream and let the rescan attach media elements as they
+        // appear — late joiners land in the master, and an empty-at-join room
+        // still yields a recording once someone with audio arrives.
+        mixer = new DynamicElementMixer(opts.rescanMs ?? RESCAN_MS);
+        mixer.start();
+        stream = mixer.stream;
+        blog(`[record-chunker] dynamic mix started (${mixer.attachedCount} elements at start; rescan every ${opts.rescanMs ?? RESCAN_MS}ms)`);
       }
       chunker = new MediaRecorderChunker({
         stream,
@@ -324,8 +415,10 @@ export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTa
       await chunker.start();
     },
     async stop(): Promise<void> {
-      await chunker?.stop();
+      await chunker?.stop();   // flush the final chunk BEFORE tearing the mix down
       chunker = null;
+      mixer?.stop();
+      mixer = null;
     },
   };
 }
