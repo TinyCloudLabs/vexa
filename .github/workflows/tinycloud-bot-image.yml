@@ -1,7 +1,9 @@
 # TinyCloud fork CI — build + push the forked Vexa bot image to GHCR.
 #
 # Runs on the `tinycloud` branch only (upstream workflows stay on main/tags).
-# Produces ghcr.io/tinycloudlabs/vexa-bot:tc-<shortsha> (+ :tinycloud rolling tag).
+# Produces ghcr.io/tinycloudlabs/vexa/bot:tc-<shortsha> (+ :tinycloud rolling tag).
+# (New package name: the old vexa-bot package was created private and cannot be
+# flipped; a fresh package inherits public visibility from the public source repo.)
 # The bot Dockerfile builds FROM vexa/meet-join-env:dev, which is itself built
 # here from core/meetings/modules/join/Dockerfile.env (same recipe as upstream's
 # release-images.yml build-bot job).
@@ -45,11 +47,11 @@ jobs:
             -t vexa/meet-join-env:dev \
             core/meetings/modules/join
 
-      - name: Build + push ghcr.io/tinycloudlabs/vexa-bot
+      - name: Build + push ghcr.io/tinycloudlabs/vexa/bot
         run: |
           set -euo pipefail
           SHORT_SHA="$(git rev-parse --short HEAD)"
-          IMAGE="ghcr.io/tinycloudlabs/vexa-bot"
+          IMAGE="ghcr.io/tinycloudlabs/vexa/bot"
           DOCKER_BUILDKIT=1 docker build \
             -f core/meetings/services/bot/Dockerfile \
             --build-arg "VEXA_IMAGE_VERSION=tc-${SHORT_SHA}" \
