@@ -39,3 +39,8 @@ synthetic probe and the real Chromium crash/close boundary test inside the built
 image. It passes no real Meet URL or production credentials. Its 3 GiB Docker limit is
 a runner-protection guard, not a production budget. Synthetic audio/log artifacts are
 retained for seven days; real-room output must not be uploaded through this workflow.
+Crash/close checks run first as a separate step; `crash_test_only` skips the long probe
+when diagnosing that boundary. Both checks stream their generated-fixture logs to the
+Actions log while retaining artifact copies. A failed check still fails the workflow.
+The crash fixture uses Chromium’s `chrome://crash` trigger, as in Playwright’s own
+`tests/library/page-event-crash.spec.ts`, and requires an actual page crash event.

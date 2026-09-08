@@ -18,6 +18,10 @@ on:
         description: Run a 15-minute synthetic Linux capture probe and browser-failure test
         type: boolean
         default: false
+      crash_test_only:
+        description: Run only the short browser crash/close checks after building
+        type: boolean
+        default: false
 
 concurrency:
   group: tinycloud-bot-image-${{ github.ref }}
@@ -72,8 +76,20 @@ jobs:
           fi
           echo "pushed ${IMAGE}:tc-${SHORT_SHA}"
 
-      - name: Validate candidate browser on Linux (synthetic media only)
-        if: ${{ inputs.validate_candidate }}
+      - name: Validate browser crash and close reporting on Linux
+        if: ${{ inputs.validate_candidate || inputs.crash_test_only }}
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/tinycloudlabs/vexa/bot:tc-$(git rev-parse --short HEAD)"
+          PROBE_DIR="${RUNNER_TEMP}/vexa-memory-probe"
+          mkdir -p "${PROBE_DIR}"
+          docker run --rm --init --memory=3g --memory-swap=3g \
+            -e NODE_OPTIONS=--import=tsx -e BOT_WORKER_ENTRY=src/browser-failure.boundary.test.ts "${IMAGE}" \
+            2>&1 | tee "${PROBE_DIR}/browser-failure.log"
+
+      - name: Validate 15-minute recording and memory on Linux (synthetic media only)
+        if: ${{ inputs.validate_candidate && !inputs.crash_test_only }}
         timeout-minutes: 25
         run: |
           set -euo pipefail
@@ -88,17 +104,17 @@ jobs:
             -e VEXA_TEST_MEMORY_HEADED=1 -e VEXA_TEST_MEMORY_RTC=1 \
             -e VEXA_TEST_MEMORY_SECONDS=900 -e VEXA_TEST_MEMORY_VIDEOS=3 \
             -e VEXA_TEST_MEMORY_OUTPUT=/probe-output/run "${IMAGE}" \
-            > "${PROBE_DIR}/probe.log" 2>&1
-          docker run --rm --init --memory=3g --memory-swap=3g \
-            -e NODE_OPTIONS=--import=tsx -e BOT_WORKER_ENTRY=src/browser-failure.boundary.test.ts "${IMAGE}" \
-            > "${PROBE_DIR}/browser-failure.log" 2>&1
+            2>&1 | tee "${PROBE_DIR}/probe.log"
 
       - name: Make synthetic validation evidence readable
-        if: ${{ always() && inputs.validate_candidate }}
-        run: sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/vexa-memory-probe"
+        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
+        run: |
+          if [ -d "${RUNNER_TEMP}/vexa-memory-probe" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/vexa-memory-probe"
+          fi
 
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && inputs.validate_candidate }}
+        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
         with:
           name: linux-synthetic-memory-${{ github.sha }}
           path: ${{ runner.temp }}/vexa-memory-probe

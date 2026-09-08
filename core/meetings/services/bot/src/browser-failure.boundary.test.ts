@@ -18,6 +18,7 @@ for (const action of ['crash', 'close'] as const) {
   const { context, page } = await launchPersistentBrowser({ dataDir, headless: true, args: ['--no-sandbox', '--mute-audio'] });
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
+    await page.setContent('<p>Controlled browser failure fixture</p>');
     const inv: Invocation = { platform: 'google_meet', botName: 'Fixture', redisUrl: 'redis://localhost:6379' };
     const events: LifecycleEvent[] = [];
     let started: () => void = () => {};
@@ -39,16 +40,21 @@ for (const action of ['crash', 'close'] as const) {
     assert.equal(ownedCloseListeners.length, 1);
     await ready;
     const observedAt = Date.now();
+    let crashObserved = false;
+    page.once('crash', () => { crashObserved = true; });
+    console.log(`START actual Chromium ${action}: ${new Date(observedAt).toISOString()}`);
     if (action === 'crash') {
-      const cdp = await context.newCDPSession(page);
-      void cdp.send('Page.crash').catch(() => {});
+      // Use the Chromium crash trigger from Playwright's own page-event-crash tests.
+      // Navigation rejects when the renderer crashes; the page event is the evidence.
+      void page.goto('chrome://crash').catch(() => {});
     } else {
       await page.close();
     }
     const result = await Promise.race([
       running,
-      new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error('browser failure was not reported within five seconds')), 5000); }),
+      new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error(`browser failure was not reported within five seconds (crash event observed: ${crashObserved})`)), 5000); }),
     ]);
+    assert.equal(crashObserved, action === 'crash', 'actual crash event matches the injected action');
     assert.equal(result.status, 'failed');
     assert.equal(result.exitCode, 1);
     const terminal = events.at(-1)!;
