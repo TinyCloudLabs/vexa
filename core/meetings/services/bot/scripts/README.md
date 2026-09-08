@@ -42,5 +42,8 @@ retained for seven days; real-room output must not be uploaded through this work
 Crash/close checks run first as a separate step; `crash_test_only` skips the long probe
 when diagnosing that boundary. Both checks stream their generated-fixture logs to the
 Actions log while retaining artifact copies. A failed check still fails the workflow.
-The crash fixture uses Chromium’s `chrome://crash` trigger, as in Playwright’s own
-`tests/library/page-event-crash.spec.ts`, and requires an actual page crash event.
+On Linux, the crash fixture sends SIGKILL only after identifying exactly one renderer
+descended from its own Node process. It simulates the incident’s OS process kill, not
+memory pressure or a kernel OOM decision. On desktop hosts it uses Chromium’s
+`chrome://crash` trigger, as in Playwright’s `tests/library/page-event-crash.spec.ts`.
+Both paths require an actual page crash event and the correct retained reason.
