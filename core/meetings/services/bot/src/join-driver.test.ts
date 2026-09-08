@@ -8,7 +8,10 @@
  * Run: tsx src/join-driver.test.ts
  */
 import { AdmissionError, AuthSessionError, TeamsJoinRedirectError, TEAMS_AUTH_REDIRECT } from '@vexa/join';
-import { admissionOutcomeToJoinOutcome } from './join-driver.js';
+import { admissionOutcomeToJoinOutcome, createBrowserJoinDriver } from './join-driver.js';
+import { EventEmitter } from 'node:events';
+import type { Page } from '@vexa/remote-browser';
+import type { Invocation } from './config.js';
 import type { JoinOutcome } from './ports.js';
 
 let passed = 0, failed = 0;
@@ -58,6 +61,19 @@ check('TeamsJoinRedirectError is NOT an AdmissionError (driver re-raises → mes
   !(teamsRedirect instanceof AdmissionError));
 check('TeamsJoinRedirectError carries the typed reasonCode in its message',
   teamsRedirect.message.startsWith(`${TEAMS_AUTH_REDIRECT}:`));
+
+for (const event of ['crash', 'close'] as const) {
+  const page = Object.assign(new EventEmitter(), { isClosed: () => false });
+  const driver = createBrowserJoinDriver(page as unknown as Page, { platform: 'google_meet' } as Invocation);
+  const failures: string[] = [];
+  const detach = driver.onFailure!((failure) => failures.push(failure));
+  page.emit(event);
+  page.emit('close');
+  check(`${event}: one accurately classified browser failure`,
+    failures.length === 1 && failures[0] === (event === 'crash' ? 'browser_crashed' : 'browser_closed'));
+  detach();
+  check(`${event}: browser listeners removed on teardown`, page.listenerCount('crash') === 0 && page.listenerCount('close') === 0);
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -13,6 +13,11 @@ pool (channel ≠ speaker), but the glow names the live speaker, so the downstre
 codec (live); the [bot](../../services/) wires it to its in-process sink (container). The `capture.v1`
 model + wire codec is [`@vexa/capture-codec`](../capture-codec/) (the SSOT).
 
+The PCM worklet transfers each completed 4096-sample buffer through its `MessagePort`, then
+allocates the next block. Transfer detaches the sender's buffer, avoiding a second backing-store
+copy waiting for garbage collection on the audio thread. The receiver still gets the same
+`Float32Array` samples and timing; this does not change the capture contract.
+
 ## Surface
 `createGmeetCaptureV1` (the producer) · `createGmeetCapture` · `createGmeetSpeakers` ·
 `createPcmCaptureNode` · `GmeetChannelBinder` · `pickBoundName`. Front door: [`src/index.ts`](src/index.ts).
@@ -23,3 +28,7 @@ model + wire codec is [`@vexa/capture-codec`](../capture-codec/) (the SSOT).
 correlation). The DOM capture itself (`pcm`/`audio`/`glow` scraping) is validated **live** in a real
 Meet (extension/bot) — consistent with how the lane has always been tested. `tsconfig` adds the `DOM`
 lib. Covered by `gate:node`, `gate:isolation`, `gate:exports`, `gate:readme`.
+
+[`src/pcm-capture.test.ts`](src/pcm-capture.test.ts) executes the shipped worklet program with
+real structured transfer semantics, checking exact sample continuity across several blocks and
+detachment of the sender's buffers. Browser memory and long-call acceptance are measured separately.

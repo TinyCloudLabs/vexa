@@ -1,7 +1,7 @@
 # TinyCloud fork CI — build + push the forked Vexa bot image to GHCR.
 #
-# Runs on the `tinycloud` branch only (upstream workflows stay on main/tags).
-# Produces ghcr.io/tinycloudlabs/vexa/bot:tc-<shortsha> (+ :tinycloud rolling tag).
+# Runs on pushes to `tinycloud` and manual dispatches of candidate branches.
+# Produces :tc-<shortsha>; only `tinycloud` updates the rolling :tinycloud tag.
 # (New package name: the old vexa-bot package was created private and cannot be
 # flipped; a fresh package inherits public visibility from the public source repo.)
 # The bot Dockerfile builds FROM vexa/meet-join-env:dev, which is itself built
@@ -13,6 +13,15 @@ on:
   push:
     branches: [tinycloud]
   workflow_dispatch:
+    inputs:
+      validate_candidate:
+        description: Run a 15-minute synthetic Linux capture probe and browser-failure test
+        type: boolean
+        default: false
+      crash_test_only:
+        description: Run only the short browser crash/close checks after building
+        type: boolean
+        default: false
 
 concurrency:
   group: tinycloud-bot-image-${{ github.ref }}
@@ -59,8 +68,55 @@ jobs:
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             --label "org.opencontainers.image.licenses=Apache-2.0" \
             -t "${IMAGE}:tc-${SHORT_SHA}" \
-            -t "${IMAGE}:tinycloud" \
             .
           docker push "${IMAGE}:tc-${SHORT_SHA}"
-          docker push "${IMAGE}:tinycloud"
+          if [ "${GITHUB_REF}" = "refs/heads/tinycloud" ]; then
+            docker tag "${IMAGE}:tc-${SHORT_SHA}" "${IMAGE}:tinycloud"
+            docker push "${IMAGE}:tinycloud"
+          fi
           echo "pushed ${IMAGE}:tc-${SHORT_SHA}"
+
+      - name: Validate browser crash and close reporting on Linux
+        if: ${{ inputs.validate_candidate || inputs.crash_test_only }}
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/tinycloudlabs/vexa/bot:tc-$(git rev-parse --short HEAD)"
+          PROBE_DIR="${RUNNER_TEMP}/vexa-memory-probe"
+          mkdir -p "${PROBE_DIR}"
+          docker run --rm --init --memory=3g --memory-swap=3g \
+            -e NODE_OPTIONS=--import=tsx -e BOT_WORKER_ENTRY=src/browser-failure.boundary.test.ts "${IMAGE}" \
+            2>&1 | tee "${PROBE_DIR}/browser-failure.log"
+
+      - name: Validate 15-minute recording and memory on Linux (synthetic media only)
+        if: ${{ inputs.validate_candidate && !inputs.crash_test_only }}
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/tinycloudlabs/vexa/bot:tc-$(git rev-parse --short HEAD)"
+          PROBE_DIR="${RUNNER_TEMP}/vexa-memory-probe"
+          mkdir -p "${PROBE_DIR}"
+          # These limits protect the runner. They are not a measured production budget.
+          # No meeting URL or production credential is passed into this fixture.
+          docker run --rm --init --memory=3g --memory-swap=3g --shm-size=2g \
+            -v "${PROBE_DIR}:/probe-output" \
+            -e NODE_OPTIONS=--import=tsx -e BOT_WORKER_ENTRY=scripts/memory-probe.ts \
+            -e VEXA_TEST_MEMORY_HEADED=1 -e VEXA_TEST_MEMORY_RTC=1 \
+            -e VEXA_TEST_MEMORY_SECONDS=900 -e VEXA_TEST_MEMORY_VIDEOS=3 \
+            -e VEXA_TEST_MEMORY_OUTPUT=/probe-output/run "${IMAGE}" \
+            2>&1 | tee "${PROBE_DIR}/probe.log"
+
+      - name: Make synthetic validation evidence readable
+        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
+        run: |
+          if [ -d "${RUNNER_TEMP}/vexa-memory-probe" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/vexa-memory-probe"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
+        with:
+          name: linux-synthetic-memory-${{ github.sha }}
+          path: ${{ runner.temp }}/vexa-memory-probe
+          retention-days: 7
+          if-no-files-found: error

@@ -100,6 +100,13 @@ _MATRIX = [
     _ADMISSION_REJECTED, _ADMISSION_TIMEOUT, _MAX_BOT_TIME,
 ]
 
+_MATRIX.append((
+    "failed-browser-crash", [ACTIVE],
+    {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
+     "reason": "browser_crashed: the meeting browser became unavailable; capture ended unexpectedly"},
+    None, "active",
+))
+
 
 @pytest.mark.parametrize("row", _MATRIX, ids=[r[0] for r in _MATRIX])
 def test_terminal_cause_attribution(row):
@@ -120,6 +127,8 @@ def test_terminal_cause_attribution(row):
     # 2. A failed exit derives error_details (from payload, or synthesized).
     if terminal_status == "failed":
         assert final["data"]["last_error"]["error_details"]
+        if terminal.get("reason"):
+            assert final["data"]["last_error"]["reason"] == terminal["reason"]
 
     # 3. The status_transition[] trail has one entry per hop, each with transition_source.
     trail = final["status_transition"]

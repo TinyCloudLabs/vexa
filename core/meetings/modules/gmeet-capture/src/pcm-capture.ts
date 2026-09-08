@@ -36,7 +36,7 @@ class VexaPcmCapture extends AudioWorkletProcessor {
     if (!ch) return true;
     for (let i = 0; i < ch.length; i++) {
       this._buf[this._n++] = ch[i];
-      if (this._n === ${BLOCK}) { this.port.postMessage(this._buf); this._buf = new Float32Array(${BLOCK}); this._n = 0; }
+      if (this._n === ${BLOCK}) { this.port.postMessage(this._buf, [this._buf.buffer]); this._buf = new Float32Array(${BLOCK}); this._n = 0; }
     }
     return true;
   }
@@ -52,7 +52,8 @@ const moduled = new WeakSet<AudioContext>();
  * Create an AudioWorklet capture node on `ctx` (which must be at 16 kHz). The
  * caller connects its source to the returned node and the node to
  * `ctx.destination` (to keep it pulled). `onPcm` receives a BLOCK-sized
- * Float32Array per frame — already a fresh copy, safe to forward without cloning.
+ * Float32Array per frame. Its backing buffer transfers out of the audio thread;
+ * the worklet retains no second copy waiting for its own garbage collection.
  *
  * `moduleUrl` (optional) is the URL the worklet module is fetched from. Pass a
  * web_accessible_resource URL (chrome.runtime.getURL('vexa-pcm-worklet.js')) under

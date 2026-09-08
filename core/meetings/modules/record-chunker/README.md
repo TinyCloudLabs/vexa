@@ -9,6 +9,9 @@ shape: `{ base64, chunkSeq, isFinal, mimeType }`). On `stop()` it emits one fina
 `recording_finalizer.py`, or the desktop via [`@vexa/recording`](../recording/) `buildRecordingMaster`)
 from the `chunkSeq` sequence.
 
+Blob encoding and host callbacks run in sequence. The final marker follows all data callbacks,
+including a slow read of the last blob, so the consumer cannot finalize ahead of the recording tail.
+
 Both lane recording taps use this once: [`@vexa/gmeet-capture`](../gmeet-capture/) (gmeet) and
 `@vexa/mixed-capture-core` (mixed/teams). The combine-the-audio step differs per lane and lives in each
 lane; the `MediaRecorder` loop is identical and lives here.
@@ -20,6 +23,11 @@ lane; the `MediaRecorder` loop is identical and lives here.
   mirroring the live mixed-lane rescan — so participants whose audio arrives AFTER the tap
   started land in the master, and ended/removed tracks detach without breaking the recording.
   (TinyCloud fork change, branch `tinycloud`: upstream grabbed the elements once at start.)
+
+The mixer uses existing `srcObject` audio directly. Video-only streams are skipped without
+calling `captureStream()` on every rescan. For file-backed elements requiring that fallback,
+unused video tracks are stopped immediately and captured audio tracks are stopped on detach
+or shutdown. Meeting-owned `srcObject` tracks are never stopped by the recorder.
 
 No fallbacks: a failed/false `onChunk` splices the chunk anyway and logs (the server reconciler
 re-fetches via `chunkSeq`); with no supported `mimeType` it logs and refuses to start.
@@ -36,5 +44,7 @@ MediaRecorder loop is pinned in isolation by [`src/chunker.smoke.test.ts`](src/c
 REAL class: seq increments from 0, base64 round-trips the blob body, `mimeType` negotiated, `stop()`
 emits exactly one `isFinal=true` final chunk). The dynamic mix is pinned by
 [`src/dynamic-tap.smoke.test.ts`](src/dynamic-tap.smoke.test.ts) (starts with zero elements, attaches
-a late joiner, survives srcObject swap + track removal, halts on stop). The live browser path is validated in a real meeting.
+a late joiner, survives srcObject swap + track removal, halts on stop, releases owned fallback
+tracks and leaves meeting-owned tracks alive). Live meeting acceptance remains separate from
+these module tests.
 Covered by `gate:node`, `gate:isolation`, `gate:exports`, `gate:readme`.
