@@ -31,6 +31,9 @@ export interface JoinResult {
   reason?: string;
 }
 
+/** Browser-observed failure. A page crash alone does not establish an OOM cause. */
+export type BrowserFailure = 'browser_crashed' | 'browser_closed';
+
 /** Drives the platform join. The real adapter wraps @vexa/join.joinMeeting + admission
  *  watchers + the removal monitor over a @vexa/remote-browser page. */
 export interface JoinDriver {
@@ -40,6 +43,8 @@ export interface JoinDriver {
   join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome | JoinResult>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
+  /** Unexpected loss of the meeting page; detach before deliberately closing it. */
+  onFailure?(cb: (failure: BrowserFailure) => void): () => void;
   /** Leave the meeting (best-effort; never throws fatally). */
   leave(reason: string): Promise<void>;
   /** Withdraw a PENDING join request from the waiting room / pre-join screen (Bug 2): cancel the
@@ -108,10 +113,9 @@ export interface AlonenessSource {
   onAlone(callback: () => void): () => void;
 }
 
-/** recording.v1 sink — accumulates capture chunks and assembles the master. The real
- *  adapter is @vexa/recording's assembler → upload; the orchestrator only signals close. */
+/** recording.v1 sink. Async close drains delivery before the worker exits. */
 export interface RecordingSink {
-  close(key: string): void;
+  close(key: string): void | Promise<void>;
 }
 
 /** One captured-signal.v1 frame as it crosses the capture-bridge tap — the VERBATIM raw

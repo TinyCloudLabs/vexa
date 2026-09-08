@@ -19,11 +19,16 @@
 (globalThis as any).btoa = (s: string) => Buffer.from(s, 'binary').toString('base64');
 (globalThis as any).window = { logBot: (_m: string) => {} };
 
-class FakeTrack { readyState: 'live' | 'ended' = 'live'; }
+class FakeTrack {
+  readyState: 'live' | 'ended' = 'live';
+  constructor(public kind = 'audio') {}
+  stop() { this.readyState = 'ended'; }
+}
 class FakeMediaStream {
   id = Math.random().toString(36).slice(2);
   constructor(private tracks: FakeTrack[] = [new FakeTrack()]) {}
-  getAudioTracks() { return this.tracks; }
+  getAudioTracks() { return this.tracks.filter(t => t.kind === 'audio'); }
+  getTracks() { return this.tracks; }
   endAll() { for (const t of this.tracks) t.readyState = 'ended'; }
 }
 (globalThis as any).MediaStream = FakeMediaStream;
@@ -75,7 +80,7 @@ class FakeMediaRecorder {
 (globalThis as any).window.MediaRecorder = FakeMediaRecorder;
 
 // import AFTER globals exist
-import { createRecordingTap, type RecordingChunk } from './index';
+import { createRecordingTap, DynamicElementMixer, type RecordingChunk } from './index';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -130,6 +135,51 @@ async function main() {
   const before = connected.length;
   await sleep(RESCAN * 3);
   check(connected.length === before, 'stop: rescan halted (no attach after stop)');
+
+  // Video-only Meet tiles must not create a new capture track on every rescan.
+  pageElements.length = 0;
+  const remoteVideo = new FakeTrack('video');
+  let fallbackCalls = 0;
+  const videoTile = Object.assign(new FakeMediaElement(new FakeMediaStream([remoteVideo])), {
+    captureStream() { fallbackCalls++; return new FakeMediaStream([new FakeTrack('video')]); },
+  });
+  pageElements.push(videoTile);
+  const mixer = new DynamicElementMixer();
+  for (let i = 0; i < 100; i++) mixer.scan();
+  check(fallbackCalls === 0, 'video-only srcObject: rescans do not allocate fallback capture tracks');
+  check(remoteVideo.readyState === 'live', 'video-only srcObject: meeting-owned track is untouched');
+
+  // A file-backed element can require captureStream. Its rejected video tracks
+  // belong to this mixer and must be released; accepted audio lives until detach.
+  pageElements.length = 0;
+  const rejected: FakeTrack[] = [];
+  const fileVideo = Object.assign(new FakeMediaElement(null), {
+    captureStream() {
+      const track = new FakeTrack('video'); rejected.push(track);
+      return new FakeMediaStream([track]);
+    },
+  });
+  pageElements.push(fileVideo);
+  for (let i = 0; i < 10; i++) mixer.scan();
+  check(rejected.length > 0 && rejected.every(t => t.readyState === 'ended'), 'rejected fallback: every temporary video track is stopped');
+  pageElements.length = 0;
+  const ownedAudio = new FakeTrack();
+  const ownedVideo = new FakeTrack('video');
+  const fileAudio = Object.assign(new FakeMediaElement(null), {
+    captureStream() { return new FakeMediaStream([ownedAudio, ownedVideo]); },
+  });
+  pageElements.push(fileAudio);
+  mixer.scan();
+  check(mixer.attachedCount === 1 && ownedAudio.readyState === 'live', 'accepted fallback: audio remains live while attached');
+  check(ownedVideo.readyState === 'ended', 'accepted fallback: unused video track is stopped immediately');
+  pageElements.length = 0;
+  mixer.scan();
+  check(ownedAudio.readyState === 'ended', 'removed fallback: owned audio track is stopped');
+  const remoteAudio = new FakeTrack();
+  pageElements.push(new FakeMediaElement(new FakeMediaStream([remoteAudio])));
+  mixer.scan();
+  mixer.stop();
+  check(remoteAudio.readyState === 'live', 'stop: meeting-owned audio track is untouched');
 
   if (failures) { console.error(`\n❌ dynamic-tap.smoke: ${failures} check(s) failed`); process.exit(1); }
   console.log('\n✅ dynamic-tap.smoke: the tap starts empty, attaches late joiners, survives removal, and stops clean.');

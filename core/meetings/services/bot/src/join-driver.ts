@@ -59,6 +59,23 @@ function joinPlatform(p: string): JoinPlatform {
 export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver {
   const platform = joinPlatform(inv.platform);
   return {
+    onFailure(cb) {
+      let reported = false;
+      const report = (failure: 'browser_crashed' | 'browser_closed') => {
+        if (reported) return;
+        reported = true;
+        cb(failure);
+      };
+      const crashed = () => report('browser_crashed');
+      const closed = () => report('browser_closed');
+      page.on('crash', crashed);
+      page.on('close', closed);
+      if (page.isClosed()) closed();
+      return () => {
+        page.off('crash', crashed);
+        page.off('close', closed);
+      };
+    },
     async join(report): Promise<JoinResult> {
       let r;
       try {
