@@ -47,13 +47,16 @@ export function createSpeakerTimeline(opts: { maxIntervals?: number; staleMs?: n
       intervals.push({ start_ms: start, end_ms: end, ...unknown() });
     }
   }
-  function advance(at: number): boolean {
+  function same(a: typeof state, b: typeof state) {
+    return a.attribution === b.attribution && a.participant_id === b.participant_id && a.name === b.name;
+  }
+  function advance(at: number, corroborated?: typeof state): boolean {
     if (origin === null || !Number.isFinite(at)) return false;
     const end = Math.round(at - origin);
     if (end < cursor) { state = unknown(); expires = cursor; return false; }
-    const knownUntil = Math.max(cursor, Math.min(end, expires));
-    append(cursor, knownUntil, state);
-    append(knownUntil, end, unknown());
+    // A change happened somewhere BETWEEN observations. Neither endpoint identifies that
+    // whole interval. Only adjacent, agreeing observations can name it; stale gaps cannot.
+    append(cursor, end, corroborated && end <= expires && same(state, corroborated) ? state : unknown());
     cursor = end;
     return true;
   }
@@ -64,8 +67,7 @@ export function createSpeakerTimeline(opts: { maxIntervals?: number; staleMs?: n
       origin = at;
     },
     observe(at: number, participants: readonly SpeakingParticipant[], energetic: boolean) {
-      if (!advance(at)) return;
-      state = unknown();
+      let next = unknown();
       if (energetic) {
         const unique = new Map<string, string | null>();
         for (const p of participants) {
@@ -74,16 +76,23 @@ export function createSpeakerTimeline(opts: { maxIntervals?: number; staleMs?: n
           // Contradictory duplicate tiles cannot establish a name.
           unique.set(p.id, unique.has(p.id) && unique.get(p.id) !== name ? null : name);
         }
-        if (unique.size > 1) state = { ...unknown(), attribution: 'overlap' };
+        if (unique.size > 1) next = { ...unknown(), attribution: 'overlap' };
         else if (unique.size === 1) {
           const [id, name] = unique.entries().next().value!;
-          if (name && name.length <= 256) state = { participant_id: id, name, attribution: 'identified' };
+          if (name && name.length <= 256) next = { participant_id: id, name, attribution: 'identified' };
         }
       }
+      if (!advance(at, next)) return;
+      state = next;
       expires = cursor + staleMs;
     },
-    drain(at: number): SpeakerTimelineChunk | undefined {
-      if (!advance(at) || origin === null) return undefined;
+    drain(at: number, final = false): SpeakerTimelineChunk | undefined {
+      if (origin === null || !Number.isFinite(at)) return undefined;
+      if (at - origin < cursor) { advance(at); return undefined; }
+      // Keep the unconfirmed tail for the next observation, even across an audio upload.
+      // At shutdown (or after a stalled observer) retain that audio interval as unknown.
+      if (final) advance(at);
+      else if (at - origin - cursor > staleMs) advance(at - staleMs);
       const chunk: SpeakerTimelineChunk = { version: 1, recording_started_at_ms: origin, intervals, capped };
       intervals = [];
       capped = false;

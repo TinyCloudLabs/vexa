@@ -38,6 +38,7 @@ try {
     w.document.getElementById('remote').srcObject = output.stream;
     await w.document.getElementById('remote').play();
     w.fixtureContext = ctx;
+    w.fixtureOscillator = oscillator;
   });
   const inv: Invocation = { platform: 'google_meet', meetingUrl: 'https://meet.fixture.test/test',
     botName: 'Timeline fixture', redisUrl: 'redis://127.0.0.1:1', transcribeEnabled: false, recordingEnabled: true };
@@ -45,7 +46,9 @@ try {
   const pipeline: BotPipeline = { async start() {}, async stop() {},
     feedAudio() { frames++; }, feedMixedAudio() {}, recordHint() {} };
   const chunks: Array<{ seq: number; final: boolean; bytes: number; timeline?: SpeakerTimelineChunk }> = [];
+  const audioParts: Buffer[] = [];
   const sink = createBotRecordingSink({ inv, uploadChunk: (seq, final, _format, bytes, metadata) => {
+    audioParts.push(Buffer.from(bytes));
     chunks.push({ seq, final, bytes: bytes.length, timeline: metadata as SpeakerTimelineChunk | undefined });
   } });
   const stopCapture = await startCaptureBridge(page, inv, pipeline);
@@ -53,6 +56,7 @@ try {
   const phase = async (ids: string[]) => {
     await page.evaluate((ids) => {
       const w = globalThis as any;
+      w.fixtureOscillator.frequency.value = ids.length === 2 ? 1320 : ids[0] === 'a' ? 440 : ids[0] === 'b' ? 880 : 1760;
       for (const id of ['a', 'b']) w.document.getElementById(id).classList.toggle('speaking', ids.includes(id));
     }, ids);
     await page.waitForTimeout(1300);
@@ -76,9 +80,35 @@ try {
   assert.ok(chunks.at(-1)?.final);
   assert.deepEqual(chunks.map(c => c.seq), chunks.map((_, i) => i));
   for (let i = 1; i < intervals.length; i++) assert.equal(intervals[i]!.start_ms, intervals[i - 1]!.end_ms);
+  // Decode the captured recording, independently of the speaker watcher. Each fixture phase
+  // has a different frequency, so stale identity around a switch is observable in the bytes.
+  const alignment = await page.evaluate(async ({ base64, intervals }) => {
+    const w = globalThis as any;
+    const bytes = Uint8Array.from(w.atob(base64), (c: string) => c.charCodeAt(0));
+    const decoded = await w.fixtureContext.decodeAudioData(bytes.buffer);
+    const samples = decoded.getChannelData(0) as Float32Array;
+    const mismatches: unknown[] = [];
+    let checked = 0;
+    for (const interval of intervals) {
+      const expected = interval.participant_id === 'a' ? 440 : interval.participant_id === 'b' ? 880 : null;
+      if (expected === null || interval.end_ms - interval.start_ms < 80) continue;
+      const midpoint = (interval.start_ms + interval.end_ms) / 2000;
+      const from = Math.max(0, Math.round((midpoint - 0.04) * decoded.sampleRate));
+      const to = Math.min(samples.length, Math.round((midpoint + 0.04) * decoded.sampleRate));
+      let crossings = 0;
+      for (let i = from + 1; i < to; i++) if (samples[i - 1]! < 0 && samples[i]! >= 0) crossings++;
+      const hz = crossings * decoded.sampleRate / (to - from);
+      if (Math.abs(hz - expected) > 30) mismatches.push({ ...interval, hz, expected });
+      checked++;
+    }
+    return { durationMs: decoded.duration * 1000, checked, mismatches };
+  }, { base64: Buffer.concat(audioParts).toString('base64'), intervals });
+  assert.ok(alignment.checked >= 2, 'both named tone phases must be decoded');
+  assert.deepEqual(alignment.mismatches, [], 'speaker identities must match captured audio tones');
+  assert.ok(Math.abs(alignment.durationMs - intervals.at(-1)!.end_ms) < 500, 'recording clock stays aligned');
   assert.ok(await page.evaluate(() => !(globalThis as any).__vexaRecordingTimelineTimer), 'timeline timer cleaned up');
   console.log(JSON.stringify({ result: 'pass', frames, chunks: chunks.length, intervals: intervals.length,
-    recording_ms: intervals.at(-1)?.end_ms, attribution: [...new Set(intervals.map(i => i.attribution))] }));
+    recording_ms: intervals.at(-1)?.end_ms, alignment, attribution: [...new Set(intervals.map(i => i.attribution))] }));
 } finally {
   if (oldTimeslice === undefined) delete process.env.VEXA_RECORDING_TIMESLICE_MS;
   else process.env.VEXA_RECORDING_TIMESLICE_MS = oldTimeslice;

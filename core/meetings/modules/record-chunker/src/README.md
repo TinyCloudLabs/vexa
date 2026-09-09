@@ -11,3 +11,6 @@ Zero external imports — pure browser. The loop is unit-pinned by
 `createSpeakerTimeline` collects recording-clock participant intervals without retaining audio.
 It expires stale evidence, distinguishes overlap from unknown, and caps pending metadata at
 256 entries; overflow is explicit unknown coverage until the next chunk drain.
+Adjacent observations must agree before an interval receives a speaker identity. Transitions and
+stale gaps are unknown. Regular drains hold the unconfirmed tail for the next observation;
+`drain(at, true)` closes the final tail as unknown when recording stops.

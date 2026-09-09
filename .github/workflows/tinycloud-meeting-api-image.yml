@@ -4,6 +4,7 @@ on:
   push:
     branches: [tinycloud]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: tinycloud-meeting-api-image-${{ github.ref }}

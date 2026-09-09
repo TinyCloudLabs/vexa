@@ -1147,7 +1147,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           }, 250);
         },
         onChunk: async (c: { base64: string; chunkSeq: number; isFinal: boolean; mimeType: string }) => {
-          const metadata = timeline?.drain(Date.now());
+          const metadata = timeline?.drain(Date.now(), c.isFinal);
           if (c.isFinal && w.__vexaRecordingTimelineTimer) {
             clearInterval(w.__vexaRecordingTimelineTimer);
             w.__vexaRecordingTimelineTimer = null;
