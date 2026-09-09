@@ -381,6 +381,10 @@ def create_app(
     async def get_recording(recording_id: int, request: Request):
         return await _forward("GET", _meeting(f"/recordings/{recording_id}"), request)
 
+    @app.get("/recordings/{recording_id}/speaker-timeline")
+    async def get_recording_speaker_timeline(recording_id: int, request: Request):
+        return await _forward("GET", _meeting(f"/recordings/{recording_id}/speaker-timeline"), request)
+
     # finalize-on-read master metadata (audio|video); the recording player fetches this, then the
     # raw_url it returns. ?type= is preserved by _forward.
     @app.get("/recordings/{recording_id}/master")

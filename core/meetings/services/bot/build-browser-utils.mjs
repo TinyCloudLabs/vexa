@@ -78,6 +78,7 @@ import {
 } from ${JSON.stringify(MIXED)};
 import {
   createRecordingTap,
+  createSpeakerTimeline,
 } from ${JSON.stringify(RECORD)};
 import {
   createJitsiSpeakers,
@@ -108,6 +109,7 @@ const VexaBrowserUtils = {
   createCsrcPoll,            // capture-bridge.ts: the transport sensor (RTP contributing sources → transitions)
   // ── recording (all platforms): MediaRecorder → recording.v1 chunks ──
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
+  createSpeakerTimeline,     // recording-clock participant metadata; no audio buffering
   // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
   createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
   createJitsiChat,           // capture-bridge.ts: w.VexaBrowserUtils.createJitsiChat

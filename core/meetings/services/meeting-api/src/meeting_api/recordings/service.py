@@ -30,6 +30,7 @@ from .jsonb import (
     signal_tape_key,
 )
 from .ports import RecordingRepo, Storage
+from .speaker_timeline import store_timeline
 
 # Media content types (parent ``recording_codec._media_content_type``, reduced to the core set).
 _CONTENT_TYPES = {"webm": "video/webm", "wav": "audio/wav", "jsonl": "application/x-ndjson",
@@ -69,6 +70,7 @@ async def upload_chunk(
     is_final: bool = True,
     duration_seconds: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    speaker_timeline: Any = None,
 ) -> dict:
     """Process ONE recording chunk upload. ``token_meeting_id`` is the verified MeetingToken's
     meeting_id (the route verifies the token before calling this).
@@ -127,6 +129,19 @@ async def upload_chunk(
     rec_payload, transitioned = await repo.mutate_recordings(meeting_id, _fold)
     recording_id = rec_payload["id"]
 
+    timeline_status = None
+    if speaker_timeline is not None:
+        try:
+            await store_timeline(storage, owner=owner or 0, recording_id=recording_id,
+                                 chunk_seq=chunk_seq, value=speaker_timeline, session_uid=session_uid,
+                                 audio_key=key, is_final=is_final)
+            timeline_status = "stored"
+        except Exception:
+            # Audio is already durable. Metadata rejection must not make the bot skip audio.
+            timeline_status = "unavailable"
+            log_event("recording_speaker_timeline_unavailable", audience="operator", span="recordings.upload",
+                      user_id=owner, meeting_id=str(meeting_id), fields={"recording_id": recording_id, "chunk_seq": chunk_seq})
+
     media_file = next((mf for mf in rec_payload["media_files"] if mf["type"] == media_type), {})
     if transitioned:
         log_event(
@@ -140,6 +155,7 @@ async def upload_chunk(
         "storage_path": key,
         "status": rec_payload["status"],
         "chunk_seq": chunk_seq,
+        **({"speaker_timeline": timeline_status} if timeline_status else {}),
     }
 
 

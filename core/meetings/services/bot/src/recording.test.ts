@@ -140,7 +140,7 @@ async function main(): Promise<void> {
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
-    interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number }
+    interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number; speaker_timeline?: unknown }
     const wire: Wire[] = [];
     const server = http.createServer((req, res) => {
       const parts: Buffer[] = [];
@@ -154,6 +154,7 @@ async function main(): Promise<void> {
           session_uid: meta.session_uid as string, chunk_seq: meta.chunk_seq as number,
           is_final: meta.is_final as boolean, format: meta.format as string,
           size: meta.file_size_bytes as number,
+          speaker_timeline: meta.speaker_timeline,
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok' }));
@@ -165,19 +166,38 @@ async function main(): Promise<void> {
     const sink = createBotRecordingSink({
       inv: inv({ connectionId: 'conn-xyz', meeting_id: 42, recordingUploadUrl: url, internalSecret: 's' }),
     });
-    sink.chunk('google_meet/w', 0, false, 'webm', new Uint8Array([1, 2, 3, 4]));
+    const timeline = { version: 1, recording_started_at_ms: 1800000000000, intervals: [], capped: false };
+    sink.chunk('google_meet/w', 0, false, 'webm', new Uint8Array([1, 2, 3, 4]), timeline);
     sink.chunk('google_meet/w', 1, false, 'webm', new Uint8Array([5, 6]));
     sink.chunk('google_meet/w', 2, true, 'webm', new Uint8Array(0));
     for (let i = 0; i < 100 && wire.length < 3; i++) await new Promise((r) => setTimeout(r, 10));
     await new Promise<void>((r) => server.close(() => r()));
 
     check('wire: 3 chunks POSTed to meeting-api', wire.length === 3, String(wire.length));
+    check('wire: speaker metadata shares the recording chunk upload', JSON.stringify(wire[0]?.speaker_timeline) === JSON.stringify(timeline));
     check('wire: session_uid == inv.connectionId on EVERY chunk (never nativeMeetingId/master key)',
       wire.length === 3 && wire.every((w) => w.session_uid === 'conn-xyz'),
       JSON.stringify(wire.map((w) => w.session_uid)));
     check('wire: seq order 0,1,2', wire.map((w) => w.chunk_seq).join(',') === '0,1,2', wire.map((w) => w.chunk_seq).join(','));
     check('wire: only the LAST chunk is_final', wire.map((w) => w.is_final).join(',') === 'false,false,true',
       wire.map((w) => w.is_final).join(','));
+  }
+
+  {
+    let release!: () => void;
+    const stalled = new Promise<void>(r => { release = r; });
+    const received: Array<{ bytes: number; metadata: boolean }> = [];
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: async (_seq, _final, _format, bytes, metadata) => {
+      await stalled;
+      received.push({ bytes: bytes.length, metadata: metadata !== undefined });
+    } });
+    const metadata = { padding: 'x'.repeat(60000) };
+    for (let seq = 0; seq < 20; seq++) sink.chunk('key', seq, seq === 19, 'webm', new Uint8Array([seq]), metadata);
+    const done = sink.close('key');
+    release();
+    await done;
+    check('metadata backpressure: all audio uploads survive', received.length === 20 && received.every(r => r.bytes === 1));
+    check('metadata backpressure: pending metadata stays within 256 KiB', received.filter(r => r.metadata).length === 4);
   }
 
   if (failed) { console.error(`\n❌ recording (L3): ${failed} check(s) FAILED.`); process.exit(1); }
