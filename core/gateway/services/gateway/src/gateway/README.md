@@ -19,3 +19,6 @@ The production edge logic, injectable. Modules:
 
 Import direction is one-way: conformance imports this package; this package imports no
 conformance code.
+
+The recording speaker timeline route forwards through the existing recording scopes and injects
+the authenticated owner identity. Deploy this route with the matching meeting-api receiver.

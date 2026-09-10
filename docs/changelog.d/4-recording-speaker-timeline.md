@@ -1,0 +1,1 @@
+Recording-only Google Meet capture retains bounded participant timing metadata with recording uploads. A recording-scoped read supplies the downstream batch transcription path; unknown/overlap and missing evidence never alter the saved audio.

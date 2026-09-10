@@ -24,6 +24,9 @@
  */
 
 /** One recording chunk, ready for upload. Mirrors the recording.v1 wire shape. */
+export { createSpeakerTimeline } from './speaker-timeline.js';
+export type { SpeakerTimelineChunk, SpeakerInterval } from './speaker-timeline.js';
+
 export interface RecordingChunk {
   base64: string;
   chunkSeq: number;

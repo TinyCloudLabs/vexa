@@ -18,6 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from .speaker_timeline import read_timeline
 from .ports import RecordingRepo, Storage
 from .service import (
     SIGNAL_MEDIA_TYPE,
@@ -203,6 +204,7 @@ def build_router(
                 media_type=media_type, media_format=media_format,
                 chunk_seq=chunk_seq, is_final=is_final,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
+                speaker_timeline=meta.get("speaker_timeline") if media_type == "audio" else None,
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -355,5 +357,21 @@ def build_router(
                 "Content-Length": str(len(slice_bytes)),
             },
         )
+
+    @router.get("/recordings/{recording_id}/speaker-timeline")
+    async def get_speaker_timeline(recording_id: int, x_user_id: Optional[str] = Header(default=None)):
+        user_id = _resolve_user_id(x_user_id)
+        recs = await repo.list_meeting_recordings(user_id)
+        rec = next((r for r in recs if r.get("id") == recording_id), None)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        try:
+            timeline = await read_timeline(storage, owner=user_id, recording_id=recording_id,
+                                           session_uid=rec.get("session_uid"))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="Speaker timeline unavailable or inconsistent")
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="Speaker timeline not available")
+        return JSONResponse(content=timeline)
 
     return router

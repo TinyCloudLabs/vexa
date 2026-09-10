@@ -1,0 +1,93 @@
+name: tinycloud-meeting-api-image
+
+on:
+  push:
+    branches: [tinycloud]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: tinycloud-meeting-api-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-meeting-api:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: meeting-api
+            directory: core/meetings/services/meeting-api
+          - component: gateway
+            directory: core/gateway/services/gateway
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fork
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Published v012 receiver and gateway source files match this release.
+      # Keep its lifecycle, deletion and pagination behavior when adding the fork's receiver diff.
+      - uses: actions/checkout@v4
+        with:
+          repository: Vexa-ai/vexa
+          ref: f64a7653acdd845224f6d7de16b58c081ff7234c
+          path: receiver
+          persist-credentials: false
+
+      - name: Apply the recording timeline receiver changes
+        run: |
+          set -euo pipefail
+          git -C fork diff --binary --unified=1 fcb1fb90c3b5199bb7369788846a9fa8ee454e3e "${GITHUB_SHA}" -- \
+            core/meetings/services/meeting-api/src/meeting_api/recordings \
+            core/meetings/services/meeting-api/tests/test_speaker_timeline.py \
+            core/gateway/services/gateway/src/gateway/app.py \
+            core/gateway/services/gateway/src/gateway/README.md \
+            core/gateway/services/gateway/tests/test_speaker_timeline.py \
+            > "${RUNNER_TEMP}/speaker-timeline.patch"
+          test -s "${RUNNER_TEMP}/speaker-timeline.patch"
+          git -C receiver apply --check "${RUNNER_TEMP}/speaker-timeline.patch"
+          git -C receiver apply "${RUNNER_TEMP}/speaker-timeline.patch"
+          cp fork/core/meetings/routes.v1.json receiver/core/meetings/routes.v1.json
+          # Extend the pinned release's exhaustive scope matrix and exact route counts by one.
+          git -C receiver apply ../fork/.github/tinycloud-gateway-acceptance.patch
+          test -f receiver/core/meetings/services/meeting-api/src/meeting_api/recordings/speaker_timeline.py
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test the assembled receiver, including existing deletion and lifecycle behavior
+        working-directory: receiver/${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          python -m pip install uv==0.9.22
+          uv run --locked pytest tests -q
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the validated receiver
+        working-directory: receiver
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git -C ../fork rev-parse --short=7 "${GITHUB_SHA}")"
+          IMAGE="ghcr.io/tinycloudlabs/vexa/${{ matrix.component }}:tc-${SHORT_SHA}"
+          DOCKER_BUILDKIT=1 docker build \
+            -f "${{ matrix.directory }}/Dockerfile" \
+            --label "org.opencontainers.image.source=https://github.com/TinyCloudLabs/vexa" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "ai.vexa.receiver.upstream-revision=f64a7653acdd845224f6d7de16b58c081ff7234c" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          echo "Published ${IMAGE}"

@@ -1036,10 +1036,10 @@
    "unique-id": "recording-blob",
    "node-type": "data-asset",
    "name": "recordings bucket (blob)",
-   "description": "chunked meeting recordings: bot uploads chunks (record-chunker), meeting-api PUTs the stitched master",
+   "description": "chunked meeting recordings and recording-clock speaker metadata: bot uploads bounded chunks, meeting-api stores metadata and PUTs the stitched audio master",
    "controls": {
     "ownership": {
-     "description": "two writers by design: bot=chunks, meeting-api=master",
+     "description": "two writers by design: bot=audio and speaker metadata chunks, meeting-api=stored recording artifacts and master",
      "requirements": [
       {
        "requirement-url": "https://vexa.ai/calm/controls/single-writer.requirement.json",

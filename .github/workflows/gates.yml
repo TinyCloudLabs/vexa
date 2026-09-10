@@ -80,6 +80,8 @@ jobs:
         env: { ONNXRUNTIME_NODE_INSTALL: skip }
       - run: pnpm typecheck
       - run: pnpm build
+      - name: Install Chromium for browser capture boundary tests
+        run: pnpm --filter @vexa/remote-browser exec playwright install --with-deps chromium
       - run: pnpm test
 
   # THE required check — branch protection + merge queue watch this single context.

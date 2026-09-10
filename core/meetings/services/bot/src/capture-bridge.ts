@@ -1040,6 +1040,9 @@ export async function startCaptureBridge(
       w.__vexaGmeetCapture = w.VexaBrowserUtils.createGmeetCapture({
         log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
         onAudio: (index: number, pcm: Float32Array) => {
+          let energy = 0;
+          for (let i = 0; i < pcm.length; i++) energy += pcm[i] * pcm[i];
+          if (pcm.length && Math.sqrt(energy / pcm.length) >= 0.008) w.__vexaTimelineAudioAt = Date.now();
           w.__vexaGmeetSpeakers?.reportTrackAudio?.(index);
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
@@ -1120,32 +1123,53 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     return Number.isFinite(n) && n > 0 ? n : 15000;
   })();
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
-  await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
+  await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string, speakerTimeline?: unknown): void => {
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
     const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
-    recording.chunk(key, chunkSeq, isFinal, format, bytes);
+    recording.chunk(key, chunkSeq, isFinal, format, bytes, speakerTimeline);
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
   // Page-side: start the generic recording tap (finds + combines the page audio elements).
-  await page.evaluate(async (timesliceMs) => {
+  await page.evaluate(async ({ timesliceMs, captureSpeakers }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (w.VexaBrowserUtils?.createRecordingTap && !w.__vexaRecordingTap) {
+      const timeline = captureSpeakers ? w.VexaBrowserUtils.createSpeakerTimeline?.() : undefined;
+      w.__vexaRecordingTimeline = timeline;
       w.__vexaRecordingTap = w.VexaBrowserUtils.createRecordingTap({
         timesliceMs,
+        onStarted: () => {
+          timeline?.start(Date.now());
+          if (timeline) w.__vexaRecordingTimelineTimer = setInterval(() => {
+            const now = Date.now();
+            const tiles = w.__vexaGmeetSpeakers?.getState?.().tiles ?? [];
+            const speaking = tiles.filter((t: any) => !t.self && t.speaking).map((t: any) => ({ id: t.id, name: t.name }));
+            timeline.observe(now, speaking, now - (w.__vexaTimelineAudioAt ?? 0) <= 500);
+          }, 250);
+        },
         onChunk: async (c: { base64: string; chunkSeq: number; isFinal: boolean; mimeType: string }) => {
-          try { await w.__vexaRecordingChunk(c.base64, c.chunkSeq, c.isFinal, c.mimeType); return true; }
+          const metadata = timeline?.drain(Date.now(), c.isFinal);
+          if (c.isFinal && w.__vexaRecordingTimelineTimer) {
+            clearInterval(w.__vexaRecordingTimelineTimer);
+            w.__vexaRecordingTimelineTimer = null;
+          }
+          try { await w.__vexaRecordingChunk(c.base64, c.chunkSeq, c.isFinal, c.mimeType, metadata); return true; }
           catch { return false; }
         },
       });
       await w.__vexaRecordingTap.start();
     }
-  }, timesliceMs).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
+  }, { timesliceMs, captureSpeakers: inv.platform === 'google_meet' && inv.transcribeEnabled === false }).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
     await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
       try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
+      finally {
+        if (w.__vexaRecordingTimelineTimer) clearInterval(w.__vexaRecordingTimelineTimer);
+        w.__vexaRecordingTimelineTimer = null;
+        w.__vexaRecordingTimeline = null;
+      }
     }).catch(() => { /* page already gone */ });
   };
 }
