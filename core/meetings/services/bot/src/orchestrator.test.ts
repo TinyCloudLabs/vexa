@@ -16,7 +16,7 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, type MeetingResult } from './orchestrator.js';
+import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, DEFAULT_RECORDING_DRAIN_MS, type MeetingResult } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
@@ -99,6 +99,43 @@ async function main(): Promise<void> {
     check(`browser crash during ${phase}: no false completion reason`, last(lc.events).completion_reason === undefined);
     check(`browser crash during ${phase}: listener detached`, detached);
   }
+  // A browser loss during pipeline.start must still close recording before the terminal callback:
+  // close() sends the server its empty is_final fallback if the browser lost the real final chunk.
+  {
+    const events: LifecycleEvent[] = [];
+    let fireFailure: (reason: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let pipelineStopped = false;
+    let finalFallbackSent = false;
+    let terminalSawFinalFallback = false;
+    const driver: JoinDriver = {
+      ...mockJoin('admitted'),
+      onFailure(cb) { fireFailure = cb; return () => { detached = true; }; },
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: { async emit(event) {
+        if (event.status === 'failed') terminalSawFinalFallback = finalFallbackSent;
+        events.push(event);
+      } },
+      join: driver,
+      pipeline: {
+        async start() { return new Promise<void>(() => {}); },
+        async stop() { pipelineStopped = true; },
+      },
+      acts: noopActs(), aloneness: noopAloneness(),
+      recording: { async close() { finalFallbackSent = true; } },
+    });
+    // This is intentionally scheduled after run() has subscribed and admitted, while start() is
+    // pending; it models a browser crash before capture has completed startup.
+    const running = o.run();
+    setTimeout(() => fireFailure('browser_crashed'), 5);
+    const result = await running;
+    check('browser crash during pipeline start: exits failed', result.status === 'failed' && result.exitCode === 1);
+    check('browser crash during pipeline start: listener detached and pipeline stopped', detached && pipelineStopped);
+    check('browser crash during pipeline start: recording final fallback precedes failed callback',
+      finalFallbackSent && terminalSawFinalFallback && last(events).status === 'failed');
+  }
+  check('recording drain: default leaves 8s each for leave and lifecycle retries', DEFAULT_RECORDING_DRAIN_MS === 4_000);
   // Browser failure must win over the silence timer and survive as an active-stage failure.
   {
     const lc = recordingSink();

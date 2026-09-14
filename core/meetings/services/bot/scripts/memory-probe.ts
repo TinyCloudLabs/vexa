@@ -69,7 +69,6 @@ let recordedBytes = 0;
 let seqs: number[] = [];
 let finalSeen = false;
 let partsAfterFinal = 0;
-let browserProcessSamples = 0;
 const resources = createResourceMonitor();
 try {
   const launched = await launchPersistentBrowser({
@@ -340,10 +339,10 @@ try {
     }
   };
   const processes = () => {
-    const output = execFileSync("ps", ["-axo", "pid=,ppid=,rss=,comm="], {
+    const psOutput = execFileSync("ps", ["-axo", "pid=,ppid=,rss=,comm="], {
       encoding: "utf8",
     }).trim();
-    const rows = output ? output.split("\n").flatMap((line) => {
+    const rows = psOutput ? psOutput.split("\n").flatMap((line) => {
       const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
       if (!match) return [];
       const [pid, ppid, rss] = match.slice(1, 4).map(Number);
@@ -383,14 +382,14 @@ try {
         .filter((m: any) => /JSHeap|Nodes|Documents|Frames/.test(m.name))
         .map((m: any) => [m.name, m.value]),
     );
-    const ps = processes();
-    const rss = ps.reduce((a, r) => a + r.rss, 0);
-    if (ps.length > 0 && rss > 0) browserProcessSamples++;
+    const browserProcesses = processes();
+    const rss = browserProcesses.reduce((a, r) => a + r.rss, 0);
+    assert(browserProcesses.length > 0 && rss > 0, "every sample includes a Chromium process with nonzero RSS");
     const footprintBinary = process.env.VEXA_TEST_MEMORY_FOOTPRINT_BINARY;
     const footprints = footprintBinary
       ? execFileSync(
           footprintBinary,
-          ps.map((p) => String(p.pid)),
+          browserProcesses.map((p) => String(p.pid)),
           { encoding: "utf8" },
         )
           .trim()
@@ -420,7 +419,7 @@ try {
       parts: seqs.length,
       nodeRss: process.memoryUsage().rss,
       browserRss: rss,
-      processes: ps,
+      processes: browserProcesses,
       ...(footprints
         ? {
             footprints,
@@ -464,7 +463,6 @@ try {
       }
     }
   }
-  assert(browserProcessSamples > 0, "browser RSS/process sampling produced at least one nonzero browser sample");
   if (mode !== "capture" && mode !== "idle") {
     assert(finalSeen, "final recording marker");
     assert.equal(

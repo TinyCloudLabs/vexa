@@ -76,7 +76,7 @@ jobs:
   validate-candidate:
     needs: build-bot
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     # A tinycloud push always validates before it may promote. Manual candidates opt in to the
     # validation they need without changing a rolling tag.
     if: ${{ github.ref == 'refs/heads/tinycloud' || inputs.validate_candidate || inputs.crash_test_only }}
@@ -103,7 +103,7 @@ jobs:
             2>&1 | tee "${PROBE_DIR}/browser-failure.log"
 
       - name: Validate 15-minute recording and memory on Linux (synthetic media only)
-        if: ${{ github.ref == 'refs/heads/tinycloud' || (inputs.validate_candidate && !inputs.crash_test_only) }}
+        if: ${{ !inputs.crash_test_only && (github.ref == 'refs/heads/tinycloud' || inputs.validate_candidate) }}
         timeout-minutes: 25
         run: |
           set -euo pipefail
@@ -137,7 +137,7 @@ jobs:
 
   promote-tinycloud:
     needs: [build-bot, validate-candidate]
-    if: ${{ github.ref == 'refs/heads/tinycloud' && needs.build-bot.result == 'success' && needs.validate-candidate.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/tinycloud' && !inputs.crash_test_only && needs.build-bot.result == 'success' && needs.validate-candidate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

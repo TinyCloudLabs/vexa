@@ -147,8 +147,9 @@ export interface RunOptions {
   recordingDrainMs?: number;
 }
 
-/** Reserve room inside the 20s SIGTERM watchdog for the 8s platform leave and terminal callback. */
-export const DEFAULT_RECORDING_DRAIN_MS = 8_000;
+/** Four seconds for the recording final marker, then eight seconds each for platform leave and the
+ * lifecycle callback's bounded retries inside the 20s SIGTERM watchdog. */
+export const DEFAULT_RECORDING_DRAIN_MS = 4_000;
 
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
@@ -432,6 +433,12 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       // Already admitted (the browser is seated in the meeting) → LEAVE before exiting, or we
       // strand a ghost participant. Best-effort; never masks the failure.
       if (browserFault) {
+        // Browser loss can race a partially-started capture bridge. Detach its observer before
+        // cleanup, then stop it and close recording so its empty is_final fallback reaches the
+        // server before this terminal failure is emitted.
+        stopFailure();
+        await deps.pipeline.stop().catch(() => { /* a partial start may have allocated capture */ });
+        await closeRecording();
         unsubscribe();
         return browserFailureResult();
       }
