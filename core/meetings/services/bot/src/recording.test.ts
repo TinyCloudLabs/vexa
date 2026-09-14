@@ -45,6 +45,21 @@ function fakeUploader(): { seen: Seen[]; upload: ChunkUploader } {
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 async function main(): Promise<void> {
+  for (const explicitFinal of [false, true]) {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: number[] = [];
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: async (seq) => { await blocked; delivered.push(seq); } });
+    sink.chunk('google_meet/drain', 0, false, 'webm', new Uint8Array([1]));
+    if (explicitFinal) sink.chunk('google_meet/drain', 1, true, 'webm', new Uint8Array(0));
+    let closed = false;
+    const closing = Promise.resolve(sink.close('google_meet/drain')).then(() => { closed = true; });
+    await flush();
+    check(`drain (${explicitFinal ? 'explicit' : 'fallback'} final): close waits for pending uploads`, !closed);
+    release();
+    await closing;
+    check('drain: data and final acknowledged before close resolves', delivered.join(',') === '0,1');
+  }
   // ── 1) each timeslice uploads IMMEDIATELY, in seq order, bytes forwarded ─────────────────────
   {
     const { seen, upload } = fakeUploader();

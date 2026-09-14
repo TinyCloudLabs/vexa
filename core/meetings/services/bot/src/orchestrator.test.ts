@@ -77,6 +77,54 @@ const allLegal = (s: BotStatus[]) => s.every((st, i) => i === 0 || st === s[i - 
 const allConform = (e: LifecycleEvent[]) => e.every((ev) => validateLifecycle(ev));
 
 async function main(): Promise<void> {
+  for (const phase of ['joining', 'active'] as const) {
+    const lc = recordingSink();
+    let fail: () => void = () => {};
+    let detached = false;
+    const driver: JoinDriver = {
+      ...mockJoin('admitted'),
+      async join() { return phase === 'joining' ? new Promise<JoinOutcome>(() => {}) : 'admitted'; },
+      onFailure(cb) { fail = () => cb('browser_crashed'); return () => { detached = true; }; },
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join: driver,
+      pipeline: { async start() { return new Promise<void>(() => {}); }, async stop() {} },
+      acts: noopActs(), aloneness: noopAloneness(),
+    });
+    const running = o.run();
+    setTimeout(fail, 5);
+    const result = await running;
+    check(`browser crash during ${phase}: interrupts pending work`, result.status === 'failed' && result.exitCode === 1);
+    check(`browser crash during ${phase}: stage retained`, last(lc.events).failure_stage === phase);
+    check(`browser crash during ${phase}: no false completion reason`, last(lc.events).completion_reason === undefined);
+    check(`browser crash during ${phase}: listener detached`, detached);
+  }
+  // Browser failure must win over the silence timer and survive as an active-stage failure.
+  {
+    const lc = recordingSink();
+    let fireFailure: (reason: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let recordingClosed = false;
+    const driver = {
+      ...mockJoin('admitted'),
+      onFailure(cb: (reason: 'browser_crashed' | 'browser_closed') => void) { fireFailure = cb; return () => { detached = true; }; },
+    };
+    const alone = noopAloneness();
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join: driver, pipeline: noopPipeline(), acts: noopActs(), aloneness: alone,
+      recording: { close() { recordingClosed = true; } },
+      resources: () => ({ peak_memory_bytes: 123456, oom_kill_delta: 1 }),
+    });
+    const running = o.run({ maxActiveMs: 100 });
+    setTimeout(() => fireFailure('browser_crashed'), 5);
+    const result = await running;
+    check('browser crash: failed, nonzero exit', result.status === 'failed' && result.exitCode !== 0);
+    check('browser crash: active stage, precise retained reason', last(lc.events).failure_stage === 'active' && last(lc.events).reason?.startsWith('browser_crashed:') === true);
+    check('browser crash: no false silence or join failure', last(lc.events).completion_reason === undefined);
+    check('browser crash: failed event conforms to existing lifecycle.v1', allConform(lc.events));
+    check('browser crash: resource evidence survives the terminal event', last(lc.events).bot_resources?.peak_memory_bytes === 123456 && last(lc.events).bot_resources?.oom_kill_delta === 1);
+    check('browser crash: monitor detached and recording closed', detached && recordingClosed);
+  }
   // ── happy: admitted → `leave` act → completed(stopped) ──
   {
     const lc = recordingSink();

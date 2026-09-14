@@ -103,8 +103,8 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
       // (no phantom recording), and at most once (a real is_final already set finalSent).
-      if (!anyChunk || finalSent) return;
-      enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      if (anyChunk && !finalSent) enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      return queue;
     },
   };
 }

@@ -35,6 +35,7 @@ import { createBotRecordingSink } from './recording.js';
 import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
+import { createResourceMonitor } from './resources.js';
 import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
@@ -311,6 +312,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     ? { probeSecondary: () => pingRedis(inv.redisUrl) }
     : undefined;
 
+  const resources = createResourceMonitor({ log: (message) => console.log(message) });
   const orchestrator = createOrchestrator(inv, {
     lifecycle,
     join,
@@ -320,6 +322,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     recording: recording as RecordingSink | undefined,
     reachability,
     degraded: () => sttFaults.report(),
+    resources: () => resources.snapshot(),
   });
 
   // Disposability (P7): a termination signal ends the active phase gracefully (leave → flush →
@@ -332,6 +335,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     const result = await orchestrator.run({ maxActiveMs: deriveMaxActiveMs(inv, aloneSilenceWindowMs, env) });
     return result.exitCode;
   } finally {
+    resources.stop();
     releaseSignals();
     // Tear down the pipeline (capture bridge + recording + engine) + browser (best-effort — a
     // teardown failure must not change the exit code). The orchestrator already stopped the pipeline

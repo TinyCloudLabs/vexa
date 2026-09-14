@@ -106,6 +106,23 @@ export function createBrowserJoinDriver(
   // reach them. Closure state, not a field — the port stays a plain interface.
   let lastSignals: JoinSignals | undefined;
   return {
+    onFailure(cb) {
+      let reported = false;
+      const report = (failure: 'browser_crashed' | 'browser_closed') => {
+        if (reported) return;
+        reported = true;
+        cb(failure);
+      };
+      const crashed = () => report('browser_crashed');
+      const closed = () => report('browser_closed');
+      page.on('crash', crashed);
+      page.on('close', closed);
+      if (page.isClosed()) closed();
+      return () => {
+        page.off('crash', crashed);
+        page.off('close', closed);
+      };
+    },
     async join(report): Promise<JoinResult> {
       const timer = createJoinTimer(now);
       const signals = (extra: JoinSignals = {}): JoinSignals => {

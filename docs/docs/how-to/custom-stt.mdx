@@ -61,6 +61,23 @@ TRANSCRIPTION_MODEL=mistralai/Voxtral-Mini-4B-Realtime-2602
 Use the exact model id returned by your gateway's `GET /v1/models`; deployments may expose a
 different Voxtral checkpoint or served name.
 
+## Tinfoil
+
+Tinfoil's OpenAI-compatible transcription endpoint can be used without changing Vexa's Google
+Meet capture, speaker channels, speech windows, silence gates, hallucination filtering, or timing.
+Vexa sends each already-owned PCM window and accepts only returned text; attribution and transcript
+assembly remain in the Vexa pipeline.
+
+```bash
+TRANSCRIPTION_SERVICE_URL=https://inference.tinfoil.sh
+TRANSCRIPTION_SERVICE_TOKEN=<TINFOIL_API_KEY>
+TRANSCRIPTION_MODEL=voxtral-small-24b
+```
+
+The offline contract test pins the appended `/v1/audio/transcriptions` path, bearer authentication,
+WAV file, model, language, prompt, and a text-only response. A live TinyCloud account probe and
+two-speaker Google Meet acceptance remain pending; do not put that account's key in source or CI.
+
 ## Example: FunASR or SenseVoice
 
 <Note>

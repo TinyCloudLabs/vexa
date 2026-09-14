@@ -35,6 +35,7 @@ import type {
   AlonenessSource,
   RecordingSink,
   ControlPlaneProbe,
+  BrowserFailure,
 } from './ports.js';
 
 export interface OrchestratorDeps {
@@ -62,6 +63,8 @@ export interface OrchestratorDeps {
   /** Producer clock for lifecycle facts. Injected by tests; each logical event is stamped once
    *  before the lifecycle adapter performs any HTTP retry. */
   now?: () => string;
+  /** Container resource evidence sampled at terminal emission, before browser cleanup. */
+  resources?: () => LifecycleEvent['bot_resources'];
 }
 
 /** The dedicated non-zero exit code for a pre-join control-plane-unreachable abort (#530). On
@@ -177,6 +180,10 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // it says so here or the reason dies with the container. A reporter fault must never change the
     // exit path (P18: report, but never at the cost of the report itself).
     let degraded: Record<string, unknown> | undefined;
+    let resources: LifecycleEvent['bot_resources'];
+    if (isTerminal(status) && deps.resources) {
+      try { resources = deps.resources(); } catch { resources = undefined; }
+    }
     if (isTerminal(status) && deps.degraded) {
       try { degraded = deps.degraded(); } catch { degraded = undefined; }
     }
@@ -186,6 +193,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       timestamp: extra.timestamp ?? eventTime(),
       ...extra,
       ...(degraded ?? {}),
+      ...(resources ? { bot_resources: resources } : {}),
     });
   };
 
@@ -227,7 +235,34 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (act.action === 'leave') stop('stopped');
   }
 
+  let browserFault: { kind: BrowserFailure; timestamp: string } | undefined;
+  let signalBrowserFailure: () => void = () => {};
+  const browserFailed = new Promise<void>((resolve) => { signalBrowserFailure = resolve; });
+  let stopFailure: () => void = () => {};
+
+  async function browserFailureResult(): Promise<MeetingResult> {
+    const fault = browserFault!;
+    const failure_stage = cur === 'active' ? 'active'
+      : cur === 'awaiting_admission' ? 'awaiting_admission' : 'joining';
+    await emit('failed', {
+      failure_stage, exit_code: 1, timestamp: fault.timestamp,
+      reason: `${fault.kind}: the meeting browser became unavailable; capture ended unexpectedly`,
+    });
+    return { exitCode: 1, status: 'failed' };
+  }
+
   async function run(opts: RunOptions = {}): Promise<MeetingResult> {
+    stopFailure = deps.join.onFailure?.((kind) => {
+      if (browserFault) return;
+      browserFault = { kind, timestamp: eventTime() };
+      console.error(`[bot] ${kind}: meeting browser failure observed at ${browserFault.timestamp}`);
+      signalBrowserFailure();
+    }) ?? (() => {});
+    try { return await runInner(opts); }
+    finally { stopFailure(); }
+  }
+
+  async function runInner(opts: RunOptions): Promise<MeetingResult> {
     // ── reachability gate (#530, P18) — the FIRST lifecycle emit is LOAD-BEARING ──
     // The `joining` event must be sent regardless; we consult its delivery verdict. Reachable ⇒
     // ZERO added latency (the secondary channel is never probed). Primary unreachable ⇒ probe the
@@ -297,8 +332,10 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       const raced = await Promise.race<{ aborted: false; result: JoinResult } | { aborted: true }>([
         deps.join.join(report).then((o) => ({ aborted: false as const, result: normalizeJoin(o) })),
         aborted.then(() => ({ aborted: true as const })),
+        browserFailed.then(() => { throw new Error('meeting browser failed'); }),
       ]);
       if (raced.aborted) {
+        stopFailure();
         // WITHDRAW before exit (Bug 2): cancel the ask-to-join / close the pre-join tab so the join
         // request is dropped — bounded + best-effort (the platform withdraw itself caps its clicks;
         // the guaranteed fallback closes the page). The bot never reached active, so the terminal is
@@ -326,6 +363,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       await reportChain;   // flush in-flight reports before deciding admission
     } catch (e) {
       unsubscribe();
+      if (browserFault) return browserFailureResult();
       // A raw throw out of the join (browser crash, navigation error, an unrecognised platform).
       // The driver parked its measurements before re-raising, so even this path is evidenced —
       // typically as `navigation_failure` (system_fault) off the transport marker in the message.
@@ -358,14 +396,23 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       return { exitCode: 1, status: 'failed', completionReason: reason };
     }
     if (cur !== 'active') await emit('active');   // the join driver may already have reported active
+    if (browserFault) { unsubscribe(); return browserFailureResult(); }
 
     // ── active: start the engine, wire removal + aloneness + the optional time cap (acts already subscribed) ──
     try {
-      await deps.pipeline.start();
+      await Promise.race([
+        deps.pipeline.start(),
+        browserFailed.then(() => { throw new Error('meeting browser failed'); }),
+      ]);
     } catch (e) {
       // Already admitted (the browser is seated in the meeting) → LEAVE before exiting, or we
       // strand a ghost participant. Best-effort; never masks the failure.
-      deps.recording?.close(recordingKey);
+      await deps.recording?.close(recordingKey);
+      if (browserFault) {
+        unsubscribe();
+        return browserFailureResult();
+      }
+      stopFailure();
       await deps.join.leave('pipeline_start_failed').catch(() => { /* best-effort */ });
       unsubscribe();
       await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
@@ -377,7 +424,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       ? setTimeout(() => signalEnd?.('max_bot_time_exceeded'), opts.maxActiveMs)
       : null;
 
-    const reason = await ended;
+    const reason = await Promise.race([ended, browserFailed.then(() => undefined)]);
 
     // ── graceful teardown (best-effort; never masks the completion reason) ──
     if (cap) clearTimeout(cap);
@@ -385,12 +432,14 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     stopAloneness();
     stopRemoval();
     await deps.pipeline.stop().catch(() => { /* best-effort */ });
-    deps.recording?.close(recordingKey);
+    await deps.recording?.close(recordingKey);
+    stopFailure();
+    if (browserFault) return browserFailureResult();
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
     // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.
     await Promise.race([
-      deps.join.leave(reason).catch(() => { /* best-effort */ }),
+      deps.join.leave(reason!).catch(() => { /* best-effort */ }),
       new Promise<void>((resolve) => setTimeout(resolve, 8000)),
     ]);
 

@@ -42,6 +42,25 @@ join** and terminate fast with a typed, attributed outcome instead of an opaque 
 
 ## Contracts
 
+Browser failure is observed independently of audio silence. A Chromium page crash produces
+`failed`, exit code 1, and a `reason` beginning `browser_crashed:`; an unexpected page close uses
+`browser_closed:`. The failure stage names where capture stopped. These failures omit the
+completion enum rather than misclassifying an active-call crash as silence or a join failure.
+The normal leave path detaches the browser monitor before deliberately closing the page.
+
+Every 30 seconds, `[bot] resources` logs container memory current/peak/limit (where available),
+OOM-kill counters, and Node RSS. The terminal event retains this evidence in `bot_resources`.
+`sampled_peak_memory_bytes` is a lower bound from periodic samples; `peak_memory_bytes` comes
+from the kernel. Missing cgroup data stays absent. A page crash alone does not establish OOM.
+
+The recording sink drains its queued uploads before teardown completes. The browser recorder
+delivers its last data callback before the completion marker. Permanently failed uploads are
+still logged; these ordering guarantees do not make an unreachable object store reliable.
+
+Run `pnpm --filter @vexa/bot test:browser-failure` to inject a real Chromium crash and close.
+This test requires Chromium and fails when it is unavailable. It does not reproduce OOM or
+replace a long Google Meet validation.
+
 **Owns:** none — the bot is a worker that implements published meetings contracts.
 **Consumes:** [`invocation.v1`](../../contracts/invocation.v1) (boot config),
 [`acts.v1`](../../contracts/acts.v1) (inbound commands),
@@ -69,3 +88,24 @@ autonomous PASS/FAIL verdict (`make -C eval verify` for the offline oracle self-
 - ✅ delivered — `acts.v1` ingress (redis subscriber; unknown acts dropped, never thrown)
 - ✅ delivered — recording assembler core (webm/wav/seq, L2/L3)
 - 🟡 partial — browser join + capture + recording-upload + speak (wired; L4-gated, proven on VM via `eval/`, not unit tests)
+
+## Synthetic memory probe
+
+After building the bot and browser modules, run:
+
+```sh
+VEXA_TEST_MEMORY_RTC=1 VEXA_TEST_MEMORY_FULL_HEADLESS=1 pnpm --filter @vexa/bot test:memory combined 900 3 /tmp/vexa-memory-new-run
+```
+
+The output directory must not already exist. Arguments are mode (`combined`, `capture`,
+`recording`, `idle`), duration in seconds, number of synthetic video streams, and output path.
+Three oscillator audio streams are always generated. The optional RTC leg sends tracks through
+a local peer connection. Full Chromium runs invisibly; no meeting credentials are used.
+Measurements include process RSS, renderer JS heap, capture frame counts, recording byte counts
+and chunk order. Audio is saved as `master.webm` for independent decoding. A two-GiB browser-RSS
+guard aborts the local fixture; it is not a measured production capacity limit.
+
+This probe measures components on the host where it runs. macOS RSS can omit compressed memory;
+use Linux cgroup measurements for the deployment budget. A flat synthetic trace does not prove
+a real Google Meet is stable. The deployment still requires a controlled 60-minute Meet and
+repeated-call validation with decoded recording completeness and retained failure evidence.

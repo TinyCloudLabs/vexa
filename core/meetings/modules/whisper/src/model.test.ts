@@ -70,6 +70,30 @@ async function run() {
       `formats=${JSON.stringify(formats)}`);
     check('json-only response remains a valid transcription result', first.text === 'voxtral ok', `text=${JSON.stringify(first.text)}`);
   }
+  // Tinfoil uses the same OpenAI transcription shape. This is a request-shape contract only:
+  // it does not contact a tenant account or claim a live meeting result.
+  {
+    let request: { url?: unknown; headers?: Record<string, string>; body?: string } = {};
+    (globalThis as any).fetch = async (url: unknown, init: { headers: Record<string, string>; body: Buffer }) => {
+      request = { url, headers: init.headers, body: Buffer.from(init.body).toString('latin1') };
+      return new Response(JSON.stringify({ text: 'private meeting text' }), { status: 200 });
+    };
+    const result = await new TranscriptionClient({
+      serviceUrl: 'https://inference.tinfoil.sh',
+      apiToken: 'test-tinfoil-token',
+      model: 'voxtral-small-24b',
+      maxRetries: 0,
+    }).transcribe(pcm, 'en', 'quarterly planning');
+    check('Tinfoil: exact OpenAI transcription URL', request.url === 'https://inference.tinfoil.sh/v1/audio/transcriptions', String(request.url));
+    check('Tinfoil: bearer token and Voxtral model reach the wire',
+      request.headers?.Authorization === 'Bearer test-tinfoil-token' && modelPartOf(request.body ?? '') === 'voxtral-small-24b');
+    check('Tinfoil: PCM WAV, language, and prompt reach the wire',
+      /name="file"; filename="audio.wav"/.test(request.body ?? '')
+      && /name="language"\r\n\r\nen\r\n/.test(request.body ?? '')
+      && /name="prompt"\r\n\r\nquarterly planning\r\n/.test(request.body ?? ''));
+    check('Tinfoil: text-only response is accepted without changing timing metadata',
+      result.text === 'private meeting text' && result.segments.length === 0 && result.duration === 0);
+  }
 
   (globalThis as any).fetch = realFetch;
   if (failed) { console.error(`\n❌ stt model: ${failed} check(s) FAILED.`); process.exit(1); }

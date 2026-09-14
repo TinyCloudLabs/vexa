@@ -23,9 +23,10 @@ const enc = (s: string): string => Buffer.from(s, 'binary').toString('base64');
 
 /** A fake Blob whose arrayBuffer() yields the bytes we seeded. */
 class FakeBlob {
-  constructor(private bytes: Uint8Array) {}
+  constructor(private bytes: Uint8Array, private delayMs = 0) {}
   get size() { return this.bytes.length; }
   async arrayBuffer(): Promise<ArrayBuffer> {
+    if (this.delayMs) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
     return this.bytes.buffer.slice(this.bytes.byteOffset, this.bytes.byteOffset + this.bytes.byteLength);
   }
 }
@@ -42,7 +43,7 @@ class FakeMediaRecorder {
   start(_timeslice?: number) { this.state = 'recording'; this.onstart?.(); }
   stop() { this.state = 'inactive'; this.onstop?.(); }
   /** test helper — deliver a timeslice blob */
-  emit(bytes: Uint8Array) { this.ondataavailable?.({ data: new FakeBlob(bytes) }); }
+  emit(bytes: Uint8Array, delayMs = 0) { this.ondataavailable?.({ data: new FakeBlob(bytes, delayMs) }); }
 }
 (globalThis as any).MediaRecorder = FakeMediaRecorder;
 (globalThis as any).window.MediaRecorder = FakeMediaRecorder; // brick reads window.MediaRecorder.isTypeSupported
@@ -70,10 +71,9 @@ async function main() {
   // two timeslice chunks with distinct bodies
   const body0 = new Uint8Array([1, 2, 3, 4, 250, 0, 127]);
   const body1 = new Uint8Array([9, 8, 7]);
-  mr.emit(body0);
+  // A slow blob read must not let the next chunk or the completion marker overtake it.
+  mr.emit(body0, 30);
   mr.emit(body1);
-  // let the async ondataavailable handlers settle
-  await new Promise((r) => setTimeout(r, 10));
 
   await chunker.stop(); // → onstop → final chunk
 
