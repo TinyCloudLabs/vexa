@@ -255,13 +255,20 @@ const RESCAN_MS = 2000;
  * audio only via capture). Returns null when the element has no usable audio yet —
  * the rescan will probe it again later.
  */
+/** ONE liveness rule for attach and detach. A track whose host does not expose
+ *  `readyState` counts as live, so the same track cannot read live to the attach
+ *  pass and ended to the detach pass — that disagreement would attach and detach
+ *  the same element on every rescan. */
+function isLiveTrack(t: any): boolean {
+  return t?.readyState === undefined || t.readyState === "live";
+}
+
 /** True when the stream has at least one LIVE audio track. Liveness (not mere track
  *  presence) is required — otherwise an ended stream would detach and immediately
  *  re-attach on every rescan. */
 function hasLiveAudio(s: any): boolean {
   try {
-    return s instanceof MediaStream
-      && s.getAudioTracks().some((t: any) => t.readyState === undefined || t.readyState === "live");
+    return s instanceof MediaStream && s.getAudioTracks().some(isLiveTrack);
   } catch { return false; }
 }
 
@@ -343,7 +350,7 @@ export class DynamicElementMixer {
       // Detach: all tracks ended, element left the DOM, or srcObject was swapped
       // for a NEW stream (the swap re-attaches below under the new stream).
       for (const [el, a] of Array.from(this.attached.entries())) {
-        const tracksLive = a.stream.getAudioTracks().some((t: any) => t.readyState === "live");
+        const tracksLive = a.stream.getAudioTracks().some(isLiveTrack);
         const inDom = (document as any).contains ? (document as any).contains(el) : true;
         const swapped = el.srcObject instanceof MediaStream && el.srcObject !== a.stream
           && hasLiveAudio(el.srcObject);
