@@ -16,8 +16,18 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, DEFAULT_RECORDING_DRAIN_MS, type MeetingResult } from './orchestrator.js';
+import {
+  createOrchestrator,
+  CONTROL_PLANE_UNREACHABLE,
+  CONTROL_PLANE_UNREACHABLE_EXIT,
+  DEFAULT_PIPELINE_STOP_MS,
+  DEFAULT_PLATFORM_LEAVE_MS,
+  DEFAULT_RECORDING_DRAIN_MS,
+  type MeetingResult,
+} from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
+import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
+import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
 import type { Invocation } from './config.js';
@@ -105,37 +115,61 @@ async function main(): Promise<void> {
     const events: LifecycleEvent[] = [];
     let fireFailure: (reason: 'browser_crashed' | 'browser_closed') => void = () => {};
     let detached = false;
-    let pipelineStopped = false;
+    let captureEntered!: () => void;
+    const captureStarted = new Promise<void>((resolve) => { captureEntered = resolve; });
+    let finishCapture!: (stop: () => Promise<void>) => void;
+    let captureDetached = false;
+    let recordingStarted = 0;
+    let engineStarted = 0;
+    let engineStopped = 0;
     let finalFallbackSent = false;
     let terminalSawFinalFallback = false;
     const driver: JoinDriver = {
       ...mockJoin('admitted'),
       onFailure(cb) { fireFailure = cb; return () => { detached = true; }; },
     };
+    const pipeline = createLivePipeline({
+      startCapture: async () => {
+        captureEntered();
+        return new Promise<() => Promise<void>>((resolve) => { finishCapture = resolve; });
+      },
+      startRecording: async () => {
+        recordingStarted++;
+        return async () => {};
+      },
+      engine: {
+        async start() { engineStarted++; },
+        async stop() { engineStopped++; },
+      },
+      onFault: () => {},
+    });
     const o = createOrchestrator(inv(), {
       lifecycle: { async emit(event) {
         if (event.status === 'failed') terminalSawFinalFallback = finalFallbackSent;
         events.push(event);
       } },
       join: driver,
-      pipeline: {
-        async start() { return new Promise<void>(() => {}); },
-        async stop() { pipelineStopped = true; },
-      },
+      pipeline,
       acts: noopActs(), aloneness: noopAloneness(),
       recording: { async close() { finalFallbackSent = true; } },
     });
-    // This is intentionally scheduled after run() has subscribed and admitted, while start() is
-    // pending; it models a browser crash before capture has completed startup.
     const running = o.run();
-    setTimeout(() => fireFailure('browser_crashed'), 5);
+    await captureStarted;
+    fireFailure('browser_crashed');
+    while (engineStopped === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    finishCapture(async () => { captureDetached = true; });
     const result = await running;
+    while (!captureDetached) await new Promise((resolve) => setTimeout(resolve, 0));
     check('browser crash during pipeline start: exits failed', result.status === 'failed' && result.exitCode === 1);
-    check('browser crash during pipeline start: listener detached and pipeline stopped', detached && pipelineStopped);
+    check('browser crash during pipeline start: real pipeline tears down late capture and stays stopped',
+      detached && captureDetached && recordingStarted === 0 && engineStarted === 0,
+      `detached=${detached} captureDetached=${captureDetached} recordingStarted=${recordingStarted} engineStarted=${engineStarted}`);
     check('browser crash during pipeline start: recording final fallback precedes failed callback',
       finalFallbackSent && terminalSawFinalFallback && last(events).status === 'failed');
   }
-  check('recording drain: default leaves 8s each for leave and lifecycle retries', DEFAULT_RECORDING_DRAIN_MS === 4_000);
+  check('teardown defaults preserve slack under the 20s SIGTERM watchdog',
+    DEFAULT_PIPELINE_STOP_MS + DEFAULT_RECORDING_DRAIN_MS + DEFAULT_PLATFORM_LEAVE_MS + DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS
+      < DEFAULT_SIGTERM_GRACE_MS);
   // Browser failure must win over the silence timer and survive as an active-stage failure.
   {
     const lc = recordingSink();
@@ -308,11 +342,13 @@ async function main(): Promise<void> {
       async leave() { left++; observedFailure('browser_closed'); }, async withdraw() {},
     };
     const o = createOrchestrator(inv(), {
-      lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+      lifecycle: lc, join,
+      pipeline: { async start() {}, async stop() { return new Promise<void>(() => {}); } },
+      acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
       recording: { close() { return new Promise<void>(() => {}); } },
     });
     const started = Date.now();
-    const running = o.run({ recordingDrainMs: 5 });
+    const running = o.run({ pipelineStopMs: 5, recordingDrainMs: 5 });
     setTimeout(() => fireLeave({ action: 'leave' }), 5);
     const res = await running;
     check('recording-drain: normal teardown is bounded and emits completed',
@@ -331,15 +367,15 @@ async function main(): Promise<void> {
       async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
       onRemoval() { return () => {}; },
       onFailure(cb) { observedFailure = (kind) => { if (!detached) cb(kind); }; return () => { detached = true; }; },
-      async leave() { left++; observedFailure('browser_closed'); }, async withdraw() {},
+      async leave() { left++; observedFailure('browser_closed'); return new Promise<void>(() => {}); }, async withdraw() {},
     };
     const started = Date.now();
     const res = await createOrchestrator(inv(), {
       lifecycle: lc, join,
-      pipeline: { async start() { throw new Error('partial capture init failed'); }, async stop() {} },
+      pipeline: { async start() { throw new Error('partial capture init failed'); }, async stop() { return new Promise<void>(() => {}); } },
       acts: noopActs(), aloneness: noopAloneness(),
       recording: { close() { return new Promise<void>(() => {}); } },
-    }).run({ recordingDrainMs: 5 });
+    }).run({ pipelineStopMs: 5, recordingDrainMs: 5, platformLeaveMs: 5 });
     check('recording-drain: pipeline-start failure is bounded and emits failed',
       res.status === 'failed' && res.completionReason === 'join_failure' && Date.now() - started < 500 && left === 1);
     check('pipeline teardown noise: detached observer retains pipeline failure', detached && last(lc.events).reason?.includes('partial capture init failed') === true);

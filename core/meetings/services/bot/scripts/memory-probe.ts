@@ -384,7 +384,6 @@ try {
     );
     const browserProcesses = processes();
     const rss = browserProcesses.reduce((a, r) => a + r.rss, 0);
-    assert(browserProcesses.length > 0 && rss > 0, "every sample includes a Chromium process with nonzero RSS");
     const footprintBinary = process.env.VEXA_TEST_MEMORY_FOOTPRINT_BINARY;
     const footprints = footprintBinary
       ? execFileSync(
@@ -435,6 +434,10 @@ try {
       heapUsage,
       ...heap,
     });
+    assert(
+      browserProcesses.length > 0 && rss > 0,
+      `every sample includes a Chromium process with nonzero RSS (processes=${browserProcesses.length}, rss=${rss})`,
+    );
     assert(rss < 2 * 1024 ** 3, "local probe exceeds 2 GiB guard");
     const remainingMs = sampleDeadline - Date.now();
     if (remainingMs <= 0) break;

@@ -145,11 +145,17 @@ export interface RunOptions {
   maxActiveMs?: number;
   /** Maximum time reserved for queued recording delivery during teardown. Tests may shorten it. */
   recordingDrainMs?: number;
+  /** Maximum time to wait for pipeline capture/engine teardown. Tests may shorten it. */
+  pipelineStopMs?: number;
+  /** Maximum time to wait for the platform leave operation. Tests may shorten it. */
+  platformLeaveMs?: number;
 }
 
-/** Four seconds for the recording final marker, then eight seconds each for platform leave and the
- * lifecycle callback's bounded retries inside the 20s SIGTERM watchdog. */
+/** The live HTTP lifecycle adapter has an 8s terminal-callback horizon. These teardown caps reserve
+ * 2s of scheduling/cleanup slack inside the 20s SIGTERM watchdog: 2s + 4s + 4s + 8s = 18s. */
+export const DEFAULT_PIPELINE_STOP_MS = 2_000;
 export const DEFAULT_RECORDING_DRAIN_MS = 4_000;
+export const DEFAULT_PLATFORM_LEAVE_MS = 4_000;
 
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
@@ -269,6 +275,38 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   }
 
   async function runInner(opts: RunOptions): Promise<MeetingResult> {
+    const settleWithin = async (
+      operation: Promise<void>,
+      budgetMs: number,
+      timeoutMessage: string,
+    ): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const settled = await Promise.race([
+          operation.then(() => true).catch(() => true),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), budgetMs); }),
+        ]);
+        if (!settled) console.error(timeoutMessage);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const stopPipeline = (): Promise<void> => {
+      const budgetMs = opts.pipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
+      return settleWithin(
+        deps.pipeline.stop(),
+        budgetMs,
+        `[bot] pipeline: stop exceeded ${budgetMs}ms; continuing bounded teardown`,
+      );
+    };
+    const leavePlatform = (reason: string): Promise<void> => {
+      const budgetMs = opts.platformLeaveMs ?? DEFAULT_PLATFORM_LEAVE_MS;
+      return settleWithin(
+        deps.join.leave(reason),
+        budgetMs,
+        `[bot] platform: leave exceeded ${budgetMs}ms; continuing to terminal lifecycle`,
+      );
+    };
     const closeRecording = async (): Promise<void> => {
       if (!deps.recording) return;
       const budgetMs = opts.recordingDrainMs ?? DEFAULT_RECORDING_DRAIN_MS;
@@ -437,15 +475,15 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         // cleanup, then stop it and close recording so its empty is_final fallback reaches the
         // server before this terminal failure is emitted.
         stopFailure();
-        await deps.pipeline.stop().catch(() => { /* a partial start may have allocated capture */ });
+        await stopPipeline();
         await closeRecording();
         unsubscribe();
         return browserFailureResult();
       }
       stopFailure();
-      await deps.pipeline.stop().catch(() => { /* a partial start may have allocated capture */ });
+      await stopPipeline();
       await closeRecording();
-      await deps.join.leave('pipeline_start_failed').catch(() => { /* best-effort */ });
+      await leavePlatform('pipeline_start_failed');
       unsubscribe();
       await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
@@ -466,16 +504,13 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // Deliberate pipeline/browser teardown can close the page. Detach first so teardown noise
     // cannot rewrite the successful end already selected above.
     stopFailure();
-    await deps.pipeline.stop().catch(() => { /* best-effort */ });
+    await stopPipeline();
     await closeRecording();
     if (browserFault) return browserFailureResult();
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
-    // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.
-    await Promise.race([
-      deps.join.leave(reason!).catch(() => { /* best-effort */ }),
-      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
-    ]);
+    // assembly + the `completed` callback flush. Best-effort and capped to preserve watchdog slack.
+    await leavePlatform(reason!);
 
     console.error(`[bot] orchestrator: emitting completed (reason=${reason}, from=${cur})`);
     try {

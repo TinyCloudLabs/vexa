@@ -531,25 +531,41 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   // resolves promptly — the bot is already seated); later attempts fire on a timer without ever
   // rejecting start(). A transient/slow model load thus self-heals without evicting the bot.
   const tryEngineStart = async (attempt: number): Promise<void> => {
+    if (stopped) return;
     try {
       await engine.start();
+      // stop() may have won while engine.start() was in flight. Stop the late start as well so the
+      // engine cannot become active again after capture/recording teardown has already completed.
+      if (stopped) await engine.stop().catch(() => { /* best-effort; stop already won */ });
     } catch (e) {
+      if (stopped) return;
       onFault('engine-start', e);
-      if (stopped || attempt >= maxAttempts) return;   // give up (already published loud); bot STAYS
+      if (attempt >= maxAttempts) return;   // give up (already published loud); bot STAYS
       retryTimer = setTimeout(() => { retryTimer = null; void tryEngineStart(attempt + 1); }, delayMs);
     }
   };
 
   return {
     async start(): Promise<void> {
+      if (stopped) return;
       // capture-start — best-effort (a page media Event / exposeFunction reject must not evict).
-      try { stopCapture = await startCapture(); }
-      catch (e) { onFault('capture-start', e); }
+      try {
+        const stop = await startCapture();
+        if (stopped) await stop().catch(() => { /* stop won while capture was attaching */ });
+        else stopCapture = stop;
+      }
+      catch (e) { if (!stopped) onFault('capture-start', e); }
+      if (stopped) return;
       // recording-start — best-effort.
       if (startRecording) {
-        try { stopRecording = await startRecording(); }
-        catch (e) { onFault('recording-start', e); }
+        try {
+          const stop = await startRecording();
+          if (stopped) await stop().catch(() => { /* stop won while recording was attaching */ });
+          else stopRecording = stop;
+        }
+        catch (e) { if (!stopped) onFault('recording-start', e); }
       }
+      if (stopped) return;
       // engine-start — non-fatal degrade + bounded retry (the pyannote model load; #593 root cause).
       await tryEngineStart(1);
       // NOTHING rethrows ⇒ the orchestrator never sees a pipeline.start() throw ⇒ no self-evict.
