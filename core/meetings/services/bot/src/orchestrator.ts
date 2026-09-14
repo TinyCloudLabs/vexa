@@ -143,7 +143,12 @@ export interface RunOptions {
   /** A hard cap on the active phase (ms). Resolves the run with max_bot_time_exceeded.
    *  Defaults to off (0) — the live composition root derives it from automaticLeave. */
   maxActiveMs?: number;
+  /** Maximum time reserved for queued recording delivery during teardown. Tests may shorten it. */
+  recordingDrainMs?: number;
 }
+
+/** Reserve room inside the 20s SIGTERM watchdog for the 8s platform leave and terminal callback. */
+export const DEFAULT_RECORDING_DRAIN_MS = 8_000;
 
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
@@ -263,6 +268,25 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   }
 
   async function runInner(opts: RunOptions): Promise<MeetingResult> {
+    const closeRecording = async (): Promise<void> => {
+      if (!deps.recording) return;
+      const budgetMs = opts.recordingDrainMs ?? DEFAULT_RECORDING_DRAIN_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const drained = await Promise.race([
+          Promise.resolve(deps.recording.close(recordingKey)).then(() => true).catch((e) => {
+            console.error(`[bot] recording: close failed; completed chunks remain durable but queued chunks may be missing: ${String(e)}`);
+            return true;
+          }),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), budgetMs); }),
+        ]);
+        if (!drained) {
+          console.error(`[bot] recording: upload drain exceeded ${budgetMs}ms; completed chunks remain durable but queued chunks may be missing; continuing leave and terminal lifecycle`);
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
     // ── reachability gate (#530, P18) — the FIRST lifecycle emit is LOAD-BEARING ──
     // The `joining` event must be sent regardless; we consult its delivery verdict. Reachable ⇒
     // ZERO added latency (the secondary channel is never probed). Primary unreachable ⇒ probe the
@@ -407,12 +431,13 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     } catch (e) {
       // Already admitted (the browser is seated in the meeting) → LEAVE before exiting, or we
       // strand a ghost participant. Best-effort; never masks the failure.
-      await deps.recording?.close(recordingKey);
       if (browserFault) {
         unsubscribe();
         return browserFailureResult();
       }
       stopFailure();
+      await deps.pipeline.stop().catch(() => { /* a partial start may have allocated capture */ });
+      await closeRecording();
       await deps.join.leave('pipeline_start_failed').catch(() => { /* best-effort */ });
       unsubscribe();
       await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
@@ -431,9 +456,11 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     unsubscribe();
     stopAloneness();
     stopRemoval();
-    await deps.pipeline.stop().catch(() => { /* best-effort */ });
-    await deps.recording?.close(recordingKey);
+    // Deliberate pipeline/browser teardown can close the page. Detach first so teardown noise
+    // cannot rewrite the successful end already selected above.
     stopFailure();
+    await deps.pipeline.stop().catch(() => { /* best-effort */ });
+    await closeRecording();
     if (browserFault) return browserFailureResult();
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master

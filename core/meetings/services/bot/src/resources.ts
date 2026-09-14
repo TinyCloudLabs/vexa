@@ -31,7 +31,8 @@ export function createResourceMonitor(opts: {
     const peak = numeric(contents('/sys/fs/cgroup/memory.peak'))
       ?? numeric(contents('/sys/fs/cgroup/memory/memory.max_usage_in_bytes'));
     if (current !== undefined) sampledPeak = Math.max(sampledPeak ?? 0, current);
-    const limit = numeric(contents('/sys/fs/cgroup/memory.max'));
+    const limit = numeric(contents('/sys/fs/cgroup/memory.max'))
+      ?? numeric(contents('/sys/fs/cgroup/memory/memory.limit_in_bytes'));
     const kills = oomKills();
     return {
       node_rss_bytes: (opts.nodeRss ?? (() => process.memoryUsage().rss))(),
@@ -44,7 +45,9 @@ export function createResourceMonitor(opts: {
     };
   };
   const report = () => {
-    try { opts.log?.(`[bot] resources ${JSON.stringify(snapshot())}`); } catch { /* diagnostic cannot affect capture */ }
+    // sampled_peak_memory_bytes is evidence, not a display detail: update it even without logging.
+    const sample = snapshot();
+    try { opts.log?.(`[bot] resources ${JSON.stringify(sample)}`); } catch { /* diagnostic cannot affect capture */ }
   };
   report();
   const timer = setInterval(report, opts.intervalMs ?? 30_000);

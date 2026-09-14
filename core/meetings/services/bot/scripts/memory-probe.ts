@@ -69,7 +69,7 @@ let recordedBytes = 0;
 let seqs: number[] = [];
 let finalSeen = false;
 let partsAfterFinal = 0;
-const start = Date.now();
+let browserProcessSamples = 0;
 const resources = createResourceMonitor();
 try {
   const launched = await launchPersistentBrowser({
@@ -87,6 +87,13 @@ try {
   });
   context = launched.context;
   const page = launched.page;
+  const browserBundle =
+    process.env.VEXA_TEST_MEMORY_BROWSER_BUNDLE ??
+    join(dirname(fileURLToPath(import.meta.url)), "../dist/browser-utils.global.js");
+  // Match the bot's production path: the bundle is present at document start, before Meet builds
+  // its media graph. addScriptTag after admission observes a materially different page lifecycle.
+  await context.addInitScript("globalThis.__name = globalThis.__name || ((fn) => fn);");
+  await context.addInitScript({ path: browserBundle });
   if (liveMeetUrl) {
     const screenshots = join(output, "screenshots");
     mkdirSync(screenshots, { mode: 0o700 });
@@ -118,15 +125,6 @@ try {
   } else {
     await page.goto(`http://127.0.0.1:${(server.address() as any).port}`);
   }
-  await page.evaluate("globalThis.__name = (fn) => fn;");
-  await page.addScriptTag({
-    path:
-      process.env.VEXA_TEST_MEMORY_BROWSER_BUNDLE ??
-      join(
-        dirname(fileURLToPath(import.meta.url)),
-        "../dist/browser-utils.global.js",
-      ),
-  });
   await page.exposeFunction("logBot", (m: string) =>
     appendFileSync(join(output, "capture.log"), m + "\n"),
   );
@@ -342,15 +340,17 @@ try {
     }
   };
   const processes = () => {
-    const rows = execFileSync("ps", ["-axo", "pid=,ppid=,rss=,comm="], {
+    const output = execFileSync("ps", ["-axo", "pid=,ppid=,rss=,comm="], {
       encoding: "utf8",
-    })
-      .trim()
-      .split("\n")
-      .map((l) => {
-        const m = l.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/)!;
-        return { pid: +m[1], ppid: +m[2], rss: +m[3] * 1024, command: m[4] };
-      });
+    }).trim();
+    const rows = output ? output.split("\n").flatMap((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+      if (!match) return [];
+      const [pid, ppid, rss] = match.slice(1, 4).map(Number);
+      return Number.isSafeInteger(pid) && Number.isSafeInteger(ppid) && Number.isSafeInteger(rss)
+        ? [{ pid, ppid, rss: rss * 1024, command: match[4] }]
+        : [];
+    }) : [];
     const ids = new Set([process.pid]);
     for (let i = 0; i < 8; i++)
       for (const r of rows) if (ids.has(r.ppid)) ids.add(r.pid);
@@ -372,8 +372,11 @@ try {
     browser: context.browser()?.version(),
     pid: process.pid,
   });
-  for (let elapsed = 0; elapsed <= seconds; elapsed += 15) {
-    if (elapsed) await new Promise((r) => setTimeout(r, 15000));
+  const sampleStartedAt = Date.now();
+  const sampleDeadline = sampleStartedAt + seconds * 1000;
+  let nextNativeSampleAt = sampleStartedAt;
+  for (;;) {
+    const elapsedMs = Date.now() - sampleStartedAt;
     const metrics = (await cdp.send("Performance.getMetrics")).metrics;
     const heap = Object.fromEntries(
       metrics
@@ -382,6 +385,7 @@ try {
     );
     const ps = processes();
     const rss = ps.reduce((a, r) => a + r.rss, 0);
+    if (ps.length > 0 && rss > 0) browserProcessSamples++;
     const footprintBinary = process.env.VEXA_TEST_MEMORY_FOOTPRINT_BINARY;
     const footprints = footprintBinary
       ? execFileSync(
@@ -398,16 +402,18 @@ try {
       () => (window as any).probeCaptureStreams,
     );
     const heapUsage = await cdp.send("Runtime.getHeapUsage");
-    if (nativeSampling && elapsed % 60 === 0) {
+    if (nativeSampling && Date.now() >= nextNativeSampleAt) {
+      const sampleId = Math.floor(elapsedMs / 1000);
       writeFileSync(
-        join(output, `native-memory-${elapsed}.json`),
+        join(output, `native-memory-${sampleId}.json`),
         JSON.stringify(await cdp.send("Memory.getSamplingProfile")),
       );
-      await memoryDump(elapsed);
+      await memoryDump(sampleId);
+      nextNativeSampleAt += 60_000;
     }
     log({
       type: "sample",
-      elapsedMs: Date.now() - start,
+      elapsedMs,
       frames,
       framesByChannel: Object.fromEntries(framesByChannel),
       recordedBytes,
@@ -431,7 +437,11 @@ try {
       ...heap,
     });
     assert(rss < 2 * 1024 ** 3, "local probe exceeds 2 GiB guard");
+    const remainingMs = sampleDeadline - Date.now();
+    if (remainingMs <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(15_000, remainingMs)));
   }
+  const sampledDurationMs = Date.now() - sampleStartedAt;
   await stopRecording?.();
   stopRecording = null;
   await stopCapture?.();
@@ -440,7 +450,7 @@ try {
     if (liveMeetUrl) {
       assert(frames > 0, "live Meet delivered captured audio frames");
     } else {
-      const minimumFrames = Math.floor(((seconds * 16000) / 4096) * 0.99);
+      const minimumFrames = Math.floor(((sampledDurationMs * 16000) / (1000 * 4096)) * 0.99);
       assert.equal(
         framesByChannel.size,
         3,
@@ -454,6 +464,7 @@ try {
       }
     }
   }
+  assert(browserProcessSamples > 0, "browser RSS/process sampling produced at least one nonzero browser sample");
   if (mode !== "capture" && mode !== "idle") {
     assert(finalSeen, "final recording marker");
     assert.equal(
@@ -468,7 +479,7 @@ try {
   }
   log({
     type: "complete",
-    elapsedMs: Date.now() - start,
+    elapsedMs: Date.now() - sampleStartedAt,
     frames,
     framesByChannel: Object.fromEntries(framesByChannel),
     recordedBytes,

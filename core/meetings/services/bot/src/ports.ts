@@ -148,7 +148,8 @@ export interface AlonenessSource {
   onAlone(callback: () => void): () => void;
 }
 
-/** recording.v1 sink. Async close drains delivery before the worker exits. */
+/** recording.v1 sink. Async close attempts to drain delivery; the orchestrator bounds that wait so
+ * a serialized retry backlog cannot prevent the platform leave or terminal lifecycle event. */
 export interface RecordingSink {
   close(key: string): void | Promise<void>;
 }

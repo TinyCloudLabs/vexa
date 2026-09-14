@@ -276,6 +276,8 @@ interface ElementStream {
   stream: MediaStream;
   /** captureStream creates tracks we own; srcObject tracks belong to the meeting. */
   owned: boolean;
+  /** captureStream may return a fresh stream while srcObject stays null, unlike a direct source. */
+  fromSrcObject: boolean;
 }
 
 function stopTracks(stream: MediaStream): void {
@@ -288,7 +290,7 @@ function probeElementStream(el: any): ElementStream | null {
     // creates another live video track on every rescan, retaining browser media
     // resources even though this recorder never consumes video.
     if (el.srcObject instanceof MediaStream) {
-      return hasLiveAudio(el.srcObject) ? { stream: el.srcObject, owned: false } : null;
+      return hasLiveAudio(el.srcObject) ? { stream: el.srcObject, owned: false, fromSrcObject: true } : null;
     }
     const capture = el.captureStream ?? el.mozCaptureStream;
     if (typeof capture !== "function") return null;
@@ -299,7 +301,7 @@ function probeElementStream(el: any): ElementStream | null {
     for (const track of stream.getTracks()) {
       if (track.kind !== 'audio') { try { track.stop(); } catch { /* already gone */ } }
     }
-    return { stream, owned: true };
+    return { stream, owned: true, fromSrcObject: false };
   } catch { /* not probeable yet; the rescan retries */ }
   return null;
 }
@@ -352,8 +354,7 @@ export class DynamicElementMixer {
       for (const [el, a] of Array.from(this.attached.entries())) {
         const tracksLive = a.stream.getAudioTracks().some(isLiveTrack);
         const inDom = (document as any).contains ? (document as any).contains(el) : true;
-        const swapped = el.srcObject instanceof MediaStream && el.srcObject !== a.stream
-          && hasLiveAudio(el.srcObject);
+        const swapped = a.fromSrcObject && el.srcObject !== a.stream;
         if (tracksLive && inDom && !swapped) continue;
         try { a.source.disconnect(); } catch { /* already gone */ }
         if (a.owned) stopTracks(a.stream);

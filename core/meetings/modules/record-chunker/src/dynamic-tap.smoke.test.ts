@@ -117,6 +117,13 @@ async function main() {
   await sleep(RESCAN * 3);
   check(connected.length === 1 && connected[0].stream === bob2, 'swap: new srcObject re-attached, old source disconnected');
 
+  bob.srcObject = null;
+  await sleep(RESCAN * 3);
+  check(connected.length === 0, 'srcObject cleared: stale attachment detached');
+  bob.srcObject = bob2;
+  await sleep(RESCAN * 3);
+  check(connected.length === 1 && connected[0].stream === bob2, 'srcObject restored: current stream attached once');
+
   // 4. TRACK REMOVAL — ended tracks detach without crashing; recorder keeps recording.
   bob2.endAll();
   await sleep(RESCAN * 3);

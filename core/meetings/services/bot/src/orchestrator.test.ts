@@ -255,6 +255,59 @@ async function main(): Promise<void> {
     check('pipeline-fail: events conform', allConform(lc.events));
   }
 
+  // A serialized upload retry must not consume the 20s signal watchdog and hide the leave or
+  // terminal event. Deliberate leave closes the browser in this fixture, so it also proves the
+  // failure observer is detached before teardown noise can rewrite a successful meeting.
+  {
+    const lc = recordingSink();
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    let observedFailure: (kind: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let left = 0;
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      onFailure(cb) { observedFailure = (kind) => { if (!detached) cb(kind); }; return () => { detached = true; }; },
+      async leave() { left++; observedFailure('browser_closed'); }, async withdraw() {},
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+      recording: { close() { return new Promise<void>(() => {}); } },
+    });
+    const started = Date.now();
+    const running = o.run({ recordingDrainMs: 5 });
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    const res = await running;
+    check('recording-drain: normal teardown is bounded and emits completed',
+      res.status === 'completed' && res.completionReason === 'stopped' && Date.now() - started < 500 && left === 1);
+    check('browser teardown noise: detached observer preserves completed terminal', detached && last(lc.events).status === 'completed');
+  }
+
+  // A partial pipeline start may have started recording. Its blocked delivery is bounded too, and
+  // the deliberate leave cannot relabel the real pipeline error as a browser failure.
+  {
+    const lc = recordingSink();
+    let observedFailure: (kind: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let left = 0;
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      onFailure(cb) { observedFailure = (kind) => { if (!detached) cb(kind); }; return () => { detached = true; }; },
+      async leave() { left++; observedFailure('browser_closed'); }, async withdraw() {},
+    };
+    const started = Date.now();
+    const res = await createOrchestrator(inv(), {
+      lifecycle: lc, join,
+      pipeline: { async start() { throw new Error('partial capture init failed'); }, async stop() {} },
+      acts: noopActs(), aloneness: noopAloneness(),
+      recording: { close() { return new Promise<void>(() => {}); } },
+    }).run({ recordingDrainMs: 5 });
+    check('recording-drain: pipeline-start failure is bounded and emits failed',
+      res.status === 'failed' && res.completionReason === 'join_failure' && Date.now() - started < 500 && left === 1);
+    check('pipeline teardown noise: detached observer retains pipeline failure', detached && last(lc.events).reason?.includes('partial capture init failed') === true);
+  }
+
   // ── host removal while active → completed(evicted) ──
   {
     const lc = recordingSink();
