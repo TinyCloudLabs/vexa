@@ -34,6 +34,16 @@ export interface GmeetPipelineOptions {
   config?: SpeakerStreamManagerConfig;
   /** Silence gap (ms) on a channel that ends its turn (→ re-bind on the next onset). Default 1000. */
   onsetGapMs?: number;
+  /** Maximum STT requests this bot may execute concurrently. Default 3, matching the healthy
+   *  three-turn production witness while bounding the previously unbounded fan-out. */
+  maxConcurrentTranscriptions?: number;
+  /** Maximum total STT requests retained by one bot (active + queued). Default 3. This is a
+   *  circuit breaker: once the CPU service falls behind, retaining an unbounded number of PCM
+   *  snapshots only turns service overload into a bot OOM and a much later silent failure. */
+  maxPendingTranscriptions?: number;
+  /** Cooldown after a caller timeout before another request starts. Default 30s. The server can
+   *  keep computing after fetch aborts, so immediate slot reuse would overlap orphaned inference. */
+  timeoutRecoveryDelayMs?: number;
   /** Surface a transcribe FAILURE (P18: fail loud + attributable). The pipeline still
    *  degrades gracefully (empty turn) so it doesn't wedge, but it reports the fault here
    *  so the host can make it observable (a /ws health frame, telemetry, lifecycle) instead
@@ -51,8 +61,32 @@ export interface GmeetPipeline {
 export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const UNKNOWN = opts.unknownLabel ?? 'Speaker';
   const ONSET_GAP = opts.onsetGapMs ?? 1000;
+  const requestedConcurrency = Math.floor(opts.maxConcurrentTranscriptions ?? 3);
+  const MAX_CONCURRENT_TRANSCRIPTIONS = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
+    ? requestedConcurrency
+    : 3;
+  const requestedPending = Math.floor(opts.maxPendingTranscriptions ?? 3);
+  const MAX_PENDING_TRANSCRIPTIONS = Math.max(
+    MAX_CONCURRENT_TRANSCRIPTIONS,
+    Number.isFinite(requestedPending) && requestedPending > 0 ? requestedPending : 3,
+  );
+  const requestedRecoveryDelayMs = Math.floor(opts.timeoutRecoveryDelayMs ?? 30_000);
+  const TIMEOUT_RECOVERY_DELAY_MS = Number.isFinite(requestedRecoveryDelayMs) && requestedRecoveryDelayMs >= 0
+    ? requestedRecoveryDelayMs
+    : 30_000;
   const mgr = new SpeakerStreamManager(opts.config);
   const inflight = new Set<Promise<void>>();
+  const closing = new Set<Promise<void>>();
+  const closedTurns = new Set<string>();
+  const pendingBySpeaker = new Map<string, number>();
+  const terminalInFlightSpeakers = new Set<string>();
+  const transcriptionWaiters: Array<() => void> = [];
+  let activeTranscriptions = 0;
+  let transcriptionBlockedUntilMs = 0;
+  let disposing = false;
+  let requestDispose: () => void = () => {};
+  const disposeRequested = new Promise<void>((resolve) => { requestDispose = resolve; });
+  let disposePromise: Promise<void> | undefined;
   // Per channel: the CURRENT turn's stream key, bound name, last-audio time, turn counter.
   const chan = new Map<number, { key: string; name: string; lastMs: number; turn: number }>();
 
@@ -77,19 +111,123 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const langOf = (l: string | undefined): string | undefined =>
     l && l !== 'unknown' ? l : undefined;
 
-  mgr.onSegmentReady = (speakerId, _name, audio) => {
-    const p = (async () => {
-      try {
-        const r = await opts.transcribe(audio, mgr.getLastConfirmedText(speakerId) || undefined);
-        const segs = r?.segments;
-        mgr.handleTranscriptionResult(speakerId, (r?.text || '').trim(), segs?.[segs.length - 1]?.end, segs, langOf(r?.language));
-      } catch (e) {
-        opts.onError?.(e);                          // P18: report the fault, don't swallow it…
-        mgr.handleTranscriptionResult(speakerId, '');   // …but still free the turn (graceful degrade)
+  const pauseAfterUnknownTimeout = (fault: unknown): void => {
+    if ((fault as { kind?: string } | null)?.kind !== 'timeout') return;
+    transcriptionBlockedUntilMs = Math.max(
+      transcriptionBlockedUntilMs,
+      Date.now() + TIMEOUT_RECOVERY_DELAY_MS,
+    );
+  };
+
+  const withTranscriptionSlot = async <T>(work: () => Promise<T>): Promise<T> => {
+    await new Promise<void>((resolve) => {
+      if (activeTranscriptions < MAX_CONCURRENT_TRANSCRIPTIONS) {
+        activeTranscriptions++;
+        resolve();
+      } else {
+        transcriptionWaiters.push(resolve);
       }
-    })();
+    });
+    try {
+      // Another concurrent request can time out while this waiter sleeps and extend the unknown-
+      // server-work horizon. Recompute after every wake; a single snapshot can wake into the newer
+      // orphan and overlap it.
+      while (transcriptionBlockedUntilMs > Date.now()) {
+        if (disposing) {
+          throw Object.assign(
+            new Error('meeting teardown began during STT timeout cooldown; refusing delayed request'),
+            { source: 'stt', kind: 'overloaded', retryable: false },
+          );
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, transcriptionBlockedUntilMs - Date.now());
+          }),
+          disposeRequested,
+        ]);
+        if (timer) clearTimeout(timer);
+      }
+      if (disposing && transcriptionBlockedUntilMs > 0) {
+        throw Object.assign(
+          new Error('meeting teardown began after an STT timeout; refusing recovery request'),
+          { source: 'stt', kind: 'overloaded', retryable: false },
+        );
+      }
+      return await work();
+    } catch (fault) {
+      // Trip BEFORE handing the slot to the next waiter. The server may keep computing after the
+      // HTTP caller times out; releasing first creates a race where one more request starts.
+      pauseAfterUnknownTimeout(fault);
+      throw fault;
+    } finally {
+      const next = transcriptionWaiters.shift();
+      if (next) next(); // hand this reserved slot directly to the next queued request
+      else activeTranscriptions--;
+    }
+  };
+
+  const releaseClosedTurn = (speakerId: string): void => {
+    if (!closedTurns.has(speakerId) || (pendingBySpeaker.get(speakerId) ?? 0) > 0) return;
+    mgr.removeSpeaker(speakerId);
+    closedTurns.delete(speakerId);
+  };
+
+  mgr.onSegmentReady = (speakerId, _name, audio, requestId, terminal = false) => {
+    // A deferred-final request is created synchronously while its superseded predecessor is still
+    // in `inflight` (the predecessor's finally runs immediately after this callback returns). Let
+    // that same-speaker replacement inherit the predecessor's budget slot; otherwise a cap of one
+    // would discard audio appended after the first request snapshot.
+    const replacingSameSpeaker = (pendingBySpeaker.get(speakerId) ?? 0) > 0;
+    if (terminal && terminalInFlightSpeakers.has(speakerId)) {
+      const fault = Object.assign(
+        new Error(`terminal STT replacement already active for ${speakerId}`),
+        { kind: 'overloaded', retryable: false },
+      );
+      try { opts.onError?.(fault); } catch { /* fault reporting must not wedge the speaker buffer */ }
+      mgr.handleTranscriptionResult(speakerId, '', undefined, undefined, undefined, requestId);
+      return;
+    }
+    if (!terminal && inflight.size >= MAX_PENDING_TRANSCRIPTIONS && !replacingSameSpeaker) {
+      const fault = Object.assign(
+        new Error(`bot STT backlog reached ${MAX_PENDING_TRANSCRIPTIONS} requests; refusing additional PCM retention`),
+        { kind: 'overloaded', retryable: false },
+      );
+      try { opts.onError?.(fault); } catch { /* fault reporting must not wedge the speaker buffer */ }
+      mgr.handleTranscriptionResult(speakerId, '', undefined, undefined, undefined, requestId);
+      releaseClosedTurn(speakerId);
+      return;
+    }
+    if (terminal) terminalInFlightSpeakers.add(speakerId);
+    pendingBySpeaker.set(speakerId, (pendingBySpeaker.get(speakerId) ?? 0) + 1);
+    let p: Promise<void>;
+    p = (async () => {
+      try {
+        // A teardown-only terminal replacement intentionally overlaps its superseded draft. It
+        // gets one separately bounded allowance per already-active speaker, so all final tails
+        // share the same 30-second request horizon instead of serializing into 60 seconds.
+        const invoke = () => opts.transcribe(audio, mgr.getLastConfirmedText(speakerId) || undefined);
+        const r = terminal ? await invoke() : await withTranscriptionSlot(invoke);
+        const segs = r?.segments;
+        mgr.handleTranscriptionResult(speakerId, (r?.text || '').trim(), segs?.[segs.length - 1]?.end,
+          segs, langOf(r?.language), requestId);
+      } catch (e) {
+        // A client timeout has an unknown server-side outcome: production evidence shows the CPU
+        // service can keep transcribing after fetch aborts. The per-bot cooldown prevents the next
+        // queued window from immediately overlapping that orphan and recreating the storm. Other
+        // failures had an observed response (or their own bounded retry policy) and release normally.
+        try { opts.onError?.(e); } catch { /* the original STT fault still must release the turn */ }
+        mgr.handleTranscriptionResult(speakerId, '', undefined, undefined, undefined, requestId);
+      }
+    })().finally(() => {
+      inflight.delete(p);
+      if (terminal) terminalInFlightSpeakers.delete(speakerId);
+      const remaining = (pendingBySpeaker.get(speakerId) ?? 1) - 1;
+      if (remaining > 0) pendingBySpeaker.set(speakerId, remaining);
+      else pendingBySpeaker.delete(speakerId);
+      releaseClosedTurn(speakerId);
+    });
     inflight.add(p);
-    void p.finally(() => inflight.delete(p));
   };
 
   mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang) => {
@@ -100,13 +238,25 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
     opts.sink.draft?.({ ...segOf(speakerName, speakerId, text, startMs, startMs, false, lang), confidence: 0 });
   };
 
-  const settle = async () => { while (inflight.size) await Promise.all([...inflight]); };
-  // Close a finished turn: final-submit + emit (name is fixed on the key, so the late
-  // transcribe can't be mislabeled), then free the stream after it has long settled.
-  const closeTurn = (key: string) => {
-    void mgr.flushSpeaker(key, true).catch(() => { /* nothing owed */ });
-    const t = setTimeout(() => mgr.removeSpeaker(key), 12000);
-    (t as { unref?: () => void }).unref?.();   // don't keep the process alive for cleanup
+  const settle = async () => {
+    while (closing.size || inflight.size) await Promise.all([...closing, ...inflight]);
+  };
+  // Close a finished turn: retain its stream until every queued/in-flight request (including a
+  // deferred final resubmit) has settled. STT's own request horizon is 30s, so a fixed 12s cleanup
+  // timer was a guaranteed data-loss race under ordinary CPU inference latency.
+  const closeTurn = (key: string, supersedeIncompleteRequest = false): void => {
+    if (closedTurns.has(key) && !supersedeIncompleteRequest) return;
+    closedTurns.add(key);
+    let p: Promise<void>;
+    p = mgr.flushSpeaker(key, true, undefined, supersedeIncompleteRequest)
+      .catch((e) => {
+        try { opts.onError?.(e); } catch { /* fault reporting must not reject pipeline disposal */ }
+      })
+      .finally(() => {
+        closing.delete(p);
+        releaseClosedTurn(key);
+      });
+    closing.add(p);
   };
 
   return {
@@ -137,11 +287,20 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
       mgr.feedAudio(st.key, pcm, tsMs);
     },
     flush: async () => { for (const st of chan.values()) await mgr.flushSpeaker(st.key, true); await settle(); },
-    dispose: async () => {
-      for (const st of chan.values()) await mgr.flushSpeaker(st.key, true);
-      await settle();
-      mgr.removeAll();
-      await opts.sink.finalize();
+    dispose: () => {
+      if (disposePromise) return disposePromise;
+      disposing = true;
+      requestDispose();
+      disposePromise = (async () => {
+        // Include turns already closed by a channel change: one may still own an incomplete live
+        // snapshot and must receive the same immediate terminal replacement at meeting teardown.
+        for (const key of mgr.getActiveSpeakers()) closeTurn(key, true);
+        await settle();
+        mgr.removeAll();
+        chan.clear();
+        await opts.sink.finalize();
+      })();
+      return disposePromise;
     },
   };
 }

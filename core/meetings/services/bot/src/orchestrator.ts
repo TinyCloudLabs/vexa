@@ -147,6 +147,8 @@ export interface RunOptions {
   recordingDrainMs?: number;
   /** Maximum time to wait for pipeline capture/engine teardown. Tests may shorten it. */
   pipelineStopMs?: number;
+  /** Signal-only pipeline deadline used when SIGTERM arrives during an ordinary drain. */
+  signalPipelineStopMs?: number;
   /** Maximum time to wait for the platform leave operation. Tests may shorten it. */
   platformLeaveMs?: number;
 }
@@ -154,8 +156,16 @@ export interface RunOptions {
 /** The live HTTP lifecycle adapter has an 8s terminal-callback horizon. These teardown caps reserve
  * 2s of scheduling/cleanup slack inside the 20s SIGTERM watchdog: 2s + 4s + 4s + 8s = 18s. */
 export const DEFAULT_PIPELINE_STOP_MS = 2_000;
+/** User/API-requested stops wait through one complete STT request horizon before publishing the
+ * terminal lifecycle event. Signal-triggered teardown keeps DEFAULT_PIPELINE_STOP_MS so the worker
+ * still exits inside Docker's 30s SIGTERM grace. */
+export const DEFAULT_TRANSCRIPT_DRAIN_MS = 35_000;
 export const DEFAULT_RECORDING_DRAIN_MS = 4_000;
 export const DEFAULT_PLATFORM_LEAVE_MS = 4_000;
+
+export function pipelineStopBudgetMs(fromSignal: boolean, override?: number): number {
+  return override ?? (fromSignal ? DEFAULT_PIPELINE_STOP_MS : DEFAULT_TRANSCRIPT_DRAIN_MS);
+}
 
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
@@ -248,6 +258,11 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   }
 
   let browserFault: { kind: BrowserFailure; timestamp: string } | undefined;
+  let signalBoundedTeardown = false;
+  let requestSignalBoundedTeardown: () => void = () => {};
+  const signalBoundedTeardownRequested = new Promise<void>((resolve) => {
+    requestSignalBoundedTeardown = resolve;
+  });
   let signalBrowserFailure: () => void = () => {};
   const browserFailed = new Promise<void>((resolve) => { signalBrowserFailure = resolve; });
   let stopFailure: () => void = () => {};
@@ -291,13 +306,29 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         if (timer) clearTimeout(timer);
       }
     };
-    const stopPipeline = (): Promise<void> => {
-      const budgetMs = opts.pipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
-      return settleWithin(
-        deps.pipeline.stop(),
-        budgetMs,
-        `[bot] pipeline: stop exceeded ${budgetMs}ms; continuing bounded teardown`,
-      );
+    const stopPipeline = async (): Promise<void> => {
+      const budgetMs = pipelineStopBudgetMs(signalBoundedTeardown, opts.pipelineStopMs);
+      const signalBudgetMs = opts.signalPipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
+      let normalTimer: ReturnType<typeof setTimeout> | undefined;
+      let signalTimer: ReturnType<typeof setTimeout> | undefined;
+      const operation = deps.pipeline.stop().then(() => true).catch(() => true);
+      const deadlines: Array<Promise<boolean>> = [
+        new Promise<boolean>((resolve) => { normalTimer = setTimeout(() => resolve(false), budgetMs); }),
+      ];
+      // If an ordinary leave is already draining when SIGTERM arrives, shorten the live wait from
+      // that moment. Snapshotting the 35s choice once would let the 20s signal watchdog win first.
+      if (!signalBoundedTeardown) {
+        deadlines.push(signalBoundedTeardownRequested.then(() => new Promise<boolean>((resolve) => {
+          signalTimer = setTimeout(() => resolve(false), signalBudgetMs);
+        })));
+      }
+      try {
+        const settled = await Promise.race([operation, ...deadlines]);
+        if (!settled) console.error(`[bot] pipeline: stop deadline reached; continuing bounded teardown`);
+      } finally {
+        if (normalTimer) clearTimeout(normalTimer);
+        if (signalTimer) clearTimeout(signalTimer);
+      }
     };
     const leavePlatform = (reason: string): Promise<void> => {
       const budgetMs = opts.platformLeaveMs ?? DEFAULT_PLATFORM_LEAVE_MS;
@@ -528,7 +559,11 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
    *  completed). If it is still PRE-ACTIVE (`joining`/`awaiting_admission`, blocked in the lobby),
    *  it instead aborts the join so `run()` WITHDRAWS the waiting-room request rather than being
    *  SIGKILLed into a lobby orphan (Bug 2). After the run ended both are no-ops (resolvers fired). */
-  function stop(reason: CompletionReason = 'stopped'): void {
+  function stop(reason: CompletionReason = 'stopped', fromSignal = false): void {
+    if (fromSignal) {
+      signalBoundedTeardown = true;
+      requestSignalBoundedTeardown();
+    }
     if (cur === 'active') {
       signalEnd?.(reason);
     } else {

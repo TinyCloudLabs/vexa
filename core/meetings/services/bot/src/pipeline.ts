@@ -153,21 +153,61 @@ function toBotSegment(seg: LaneSegment): TranscriptSegment {
  * The sink ADAPTER — the load-bearing reconciliation. The lane emits via `segment` (confirmed),
  * `draft` (live partial, completed:false), `finalize` (session end); the bot's port is a single
  * `publish(segment)`. We forward BOTH `segment` and `draft` to publish (the bot's transcript.v1
- * egress carries `completed` to distinguish confirmed from draft) and treat `finalize` as a
- * no-op at this seam (the bot signals end-of-session via lifecycle.v1, not the transcript stream).
- * publish() is async; the lane's sink methods are sync fire-and-forget, so we swallow + log a
- * rejection rather than letting it escape the lane's emit path.
+ * egress carries `completed` to distinguish confirmed from draft). `finalize` emits no extra wire
+ * message, but it does wait for these async deliveries before lifecycle.v1 announces completion.
+ * publish() is async; the lane's sink methods enqueue each delivery and finalize() drains those
+ * promises. A meeting cannot publish its terminal lifecycle event while its last transcript row is
+ * still merely queued for Redis. Rejections remain attributed without escaping the lane emit path.
  */
-function laneSink(publish: TranscriptSink['publish'], onError?: (e: unknown) => void): LaneTranscriptSink {
+export const DEFAULT_TRANSCRIPT_PUBLISH_DRAIN_MS = 4_000;
+
+function laneSink(
+  publish: TranscriptSink['publish'],
+  onError?: (e: unknown) => void,
+  drainMs = DEFAULT_TRANSCRIPT_PUBLISH_DRAIN_MS,
+): LaneTranscriptSink {
+  const pending = new Set<Promise<void>>();
   const forward = (seg: LaneSegment): void => {
-    void publish(toBotSegment(seg)).catch((e) => {
-      (onError ?? ((err) => console.error(`[bot] pipeline: transcript publish rejected: ${String(err)}`)))(e);
-    });
+    let delivery: Promise<void>;
+    delivery = Promise.resolve()
+      .then(() => publish(toBotSegment(seg)))
+      .catch((e) => {
+        try {
+          (onError ?? ((err) => console.error(`[bot] pipeline: transcript publish rejected: ${String(err)}`)))(e);
+        } catch { /* reporting a publish fault must not prevent the drain from settling */ }
+      })
+      .finally(() => pending.delete(delivery));
+    pending.add(delivery);
   };
   return {
     segment: forward,
     draft: forward,
-    finalize() { /* session end is a lifecycle.v1 concern, not a transcript.v1 segment */ },
+    async finalize() {
+      // A publish may synchronously cause another lane delivery, so observe until quiescent. Bound
+      // the wait because node-redis intentionally reconnects forever: durable delivery is preferred,
+      // but an unreachable Redis server must not make this disposable worker immortal.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const drain = (async () => {
+        while (pending.size > 0) await Promise.all([...pending]);
+        return true;
+      })();
+      try {
+        const drained = await Promise.race([
+          drain,
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), drainMs); }),
+        ]);
+        if (!drained) {
+          const fault = Object.assign(
+            new Error(`transcript publish drain exceeded ${drainMs}ms with ${pending.size} delivery(s) still pending`),
+            { source: 'transcript' },
+          );
+          console.error(`[bot] pipeline: ${fault.message}`);
+          try { onError?.(fault); } catch { /* fault reporting must not wedge teardown */ }
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
   };
 }
 
@@ -246,8 +286,9 @@ function createGmeetBotPipeline(
   sink: TranscriptSink,
   config?: SpeakerStreamManagerConfig,
   onError?: (e: unknown) => void,
+  publishDrainMs?: number,
 ): BotPipeline {
-  const lane = createGmeetPipeline({ transcribe, sink: laneSink(sink.publish, onError), config, onError });
+  const lane = createGmeetPipeline({ transcribe, sink: laneSink(sink.publish, onError, publishDrainMs), config, onError });
   return {
     async start() { /* lane is lazy — begins on the first fed frame */ },
     async stop() { await lane.dispose(); },
@@ -443,6 +484,8 @@ export function createBotPipeline(
     transcribe?: Transcribe;
     config?: SpeakerStreamManagerConfig;
     onError?: (e: unknown) => void;
+    /** Test/embedding override for the bounded final transcript-publish drain. */
+    publishDrainMs?: number;
     /** Mixed-lane transcriber seam — the real ChunkedTranscriber unless a test injects an observer
      *  (pins what reaches the transcriber: name, kind, tMs). Only consulted on the mixed lane. */
     createMixedTranscriber?: MixedTranscriberFactory;
@@ -469,7 +512,7 @@ export function createBotPipeline(
       inv.botName,
     );
   }
-  return createGmeetBotPipeline(transcribe, sink, opts.config, opts.onError);
+  return createGmeetBotPipeline(transcribe, sink, opts.config, opts.onError, opts.publishDrainMs);
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */

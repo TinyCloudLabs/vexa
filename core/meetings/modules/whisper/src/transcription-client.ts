@@ -136,7 +136,12 @@ export class TranscriptionClient {
         // thrown value is ALWAYS a TranscriptionError the consumer can attribute (P18).
         const fault: TranscriptionError = err instanceof TranscriptionError
           ? err
-          : new TranscriptionError(err?.name === 'AbortError' ? 'timeout' : 'unavailable', undefined, err?.message, true);
+          // A timeout has an unknown server-side outcome: the uploaded audio may still be using
+          // inference capacity after our AbortController fires. Retrying the POST duplicates that
+          // expensive work and can turn one slow window into a self-sustaining queue storm.
+          : err?.name === 'AbortError'
+            ? new TranscriptionError('timeout', undefined, err?.message, false)
+            : new TranscriptionError('unavailable', undefined, err?.message, true);
         if (fault.kind === 'bad_request' && this.responseFormat === 'verbose_json' && /verbose_json/i.test(fault.detail ?? '')) {
           log('[TranscriptionClient] backend rejected verbose_json; falling back to json for this and later requests');
           this.responseFormat = 'json';

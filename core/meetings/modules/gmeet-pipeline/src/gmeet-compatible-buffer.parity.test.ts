@@ -10,13 +10,14 @@ import { GmeetCompatibleBuffer } from '@vexa/transcribe-buffer';
 
 interface Segment { text: string; start: number; end: number }
 interface ManagerLike {
-  onSegmentReady: ((id: string, name: string, audio: Float32Array) => void) | null;
+  onSegmentReady: ((id: string, name: string, audio: Float32Array, ...metadata: unknown[]) => void) | null;
   onSegmentConfirmed: ((id: string, name: string, text: string, start: number, end: number, segmentId: string, language?: string) => void) | null;
   onSegmentPending: ((id: string, name: string, text: string, start: number, language?: string) => void) | null;
   addSpeaker(id: string, name: string): void;
   feedAudio(id: string, audio: Float32Array, atMs?: number): void;
-  handleTranscriptionResult(id: string, text: string, end?: number, segments?: Segment[], language?: string): boolean;
-  flushSpeaker(id: string, force?: boolean): Promise<void>;
+  handleTranscriptionResult(id: string, text: string, end?: number, segments?: Segment[], language?: string,
+    requestId?: number): boolean;
+  flushSpeaker(id: string, force?: boolean, trimAtMs?: number, supersedeIncompleteRequest?: boolean): Promise<void>;
   getLastConfirmedText(id: string): string;
   removeAll(): void;
 }
@@ -156,8 +157,72 @@ async function closeWhileInflight(factory: Factory): Promise<{ ready: number[]; 
   manager.feedAudio(SID, speech(2), 100_000);
   await callPrivate(manager, 'trySubmit');
   await manager.flushSpeaker(SID, true);
-  accepted.push(manager.handleTranscriptionResult(SID, 'stale draft response', 2, [seg('stale draft response', 0, 2)]));
   accepted.push(manager.handleTranscriptionResult(SID, 'owned final response', 2, [seg('owned final response', 0, 2)]));
+  manager.removeAll();
+  return { ready, confirmed, accepted };
+}
+
+async function closeWhileInflightWithTail(factory: Factory): Promise<{ ready: number[]; confirmed: string[]; accepted: boolean[] }> {
+  const manager = factory();
+  const ready: number[] = [];
+  const confirmed: string[] = [];
+  const accepted: boolean[] = [];
+  manager.onSegmentReady = (_id, _name, audio) => ready.push(audio.length);
+  manager.onSegmentConfirmed = (_id, _name, text) => confirmed.push(text);
+  manager.addSpeaker(SID, 'Continuous');
+  manager.feedAudio(SID, speech(2), 100_000);
+  await callPrivate(manager, 'trySubmit');
+  manager.feedAudio(SID, speech(1), 102_000);
+  await manager.flushSpeaker(SID, true);
+  accepted.push(manager.handleTranscriptionResult(SID, 'incomplete first response', 2, [seg('incomplete first response', 0, 2)]));
+  accepted.push(manager.handleTranscriptionResult(SID, 'complete three second response', 3, [seg('complete three second response', 0, 3)]));
+  manager.removeAll();
+  return { ready, confirmed, accepted };
+}
+
+async function terminalCloseWhileInflightWithTail(factory: Factory): Promise<{
+  ready: number[]; confirmed: string[]; accepted: boolean[];
+}> {
+  const manager = factory();
+  const ready: number[] = [];
+  const requestIds: number[] = [];
+  const confirmed: string[] = [];
+  const accepted: boolean[] = [];
+  manager.onSegmentReady = (_id, _name, audio, ...metadata) => {
+    ready.push(audio.length);
+    const requestId = metadata.find((value): value is number => typeof value === 'number');
+    if (requestId !== undefined) requestIds.push(requestId);
+  };
+  manager.onSegmentConfirmed = (_id, _name, text) => confirmed.push(text);
+  manager.addSpeaker(SID, 'Continuous');
+  manager.feedAudio(SID, speech(2), 100_000);
+  await callPrivate(manager, 'trySubmit');
+  manager.feedAudio(SID, speech(1), 102_000);
+  await manager.flushSpeaker(SID, true, undefined, true);
+  // The complete terminal request wins even when it settles first. The superseded draft's later
+  // completion is rejected by identity and cannot clear or overwrite the final result.
+  accepted.push(manager.handleTranscriptionResult(SID, 'complete three second response', 3,
+    [seg('complete three second response', 0, 3)], 'en', requestIds[1]));
+  accepted.push(manager.handleTranscriptionResult(SID, 'incomplete first response', 2,
+    [seg('incomplete first response', 0, 2)], 'en', requestIds[0]));
+  manager.removeAll();
+  return { ready, confirmed, accepted };
+}
+
+async function closeAfterResponseWithTail(factory: Factory): Promise<{ ready: number[]; confirmed: string[]; accepted: boolean[] }> {
+  const manager = factory();
+  const ready: number[] = [];
+  const confirmed: string[] = [];
+  const accepted: boolean[] = [];
+  manager.onSegmentReady = (_id, _name, audio) => ready.push(audio.length);
+  manager.onSegmentConfirmed = (_id, _name, text) => confirmed.push(text);
+  manager.addSpeaker(SID, 'Continuous');
+  manager.feedAudio(SID, speech(2), 100_000);
+  await callPrivate(manager, 'trySubmit');
+  accepted.push(manager.handleTranscriptionResult(SID, 'first two second draft', 2, [seg('first two second draft', 0, 2)]));
+  manager.feedAudio(SID, speech(1), 102_000);
+  await manager.flushSpeaker(SID, true);
+  accepted.push(manager.handleTranscriptionResult(SID, 'complete three second response', 3, [seg('complete three second response', 0, 3)]));
   manager.removeAll();
   return { ready, confirmed, accepted };
 }
@@ -192,7 +257,10 @@ for (const [name, scenario] of [
   ['pending finalization + final flush', finalFlush],
   ['near-silent submission gate', silenceGate],
   ['timestamped batch-input gap guard', timestampedInputGap],
-  ['close-while-inflight final resubmit', closeWhileInflight],
+  ['close-while-inflight final response', closeWhileInflight],
+  ['close-while-inflight with appended tail', closeWhileInflightWithTail],
+  ['terminal close supersedes in-flight appended tail', terminalCloseWhileInflightWithTail],
+  ['close-after-response with appended tail', closeAfterResponseWithTail],
   ['30-second hard-cap fallback', hardCap],
 ] as const) {
   const actual = await scenario(source as never);
@@ -203,6 +271,34 @@ for (const [name, scenario] of [
 const local = await localAgreement(shared);
 check('prompt feedback is the last confirmed prefix', local.promptAfterPrefix === 'one two', local);
 check('offset lifecycle submits only the remaining four seconds', local.readyLengths.at(-1) === 4 * SR, local.readyLengths);
+
+const closedInflight = await closeWhileInflight(source as never);
+check('ordinary close accepts its already-owned in-flight response without a duplicate STT request',
+  closedInflight.ready.length === 1 &&
+  closedInflight.confirmed.join(',') === 'owned final response' &&
+  closedInflight.accepted.join(',') === 'true',
+  closedInflight);
+
+const closedInflightWithTail = await closeWhileInflightWithTail(source as never);
+check('close resubmits when audio arrived after the in-flight request snapshot',
+  closedInflightWithTail.ready.join(',') === [2 * SR, 3 * SR].join(',') &&
+  closedInflightWithTail.confirmed.join(',') === 'complete three second response' &&
+  closedInflightWithTail.accepted.join(',') === 'false,true',
+  closedInflightWithTail);
+
+const terminalClosedInflightWithTail = await terminalCloseWhileInflightWithTail(source as never);
+check('terminal close starts the full-window replacement immediately and ignores the stale draft',
+  terminalClosedInflightWithTail.ready.join(',') === [2 * SR, 3 * SR].join(',') &&
+  terminalClosedInflightWithTail.confirmed.join(',') === 'complete three second response' &&
+  terminalClosedInflightWithTail.accepted.join(',') === 'true,false',
+  terminalClosedInflightWithTail);
+
+const closedAfterResponseWithTail = await closeAfterResponseWithTail(source as never);
+check('close resubmits when audio arrived after the latest completed request snapshot',
+  closedAfterResponseWithTail.ready.join(',') === [2 * SR, 3 * SR].join(',') &&
+  closedAfterResponseWithTail.confirmed.join(',') === 'complete three second response' &&
+  closedAfterResponseWithTail.accepted.join(',') === 'true,true',
+  closedAfterResponseWithTail);
 
 const teamsVisibleTail = new GmeetCompatibleBuffer({ publishTrailingDraftAfterPrefix: true });
 const teamsPending: string[] = [];

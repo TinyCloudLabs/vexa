@@ -437,7 +437,7 @@ redis:
 minio:
   enabled: true
   image:
-    repository: minio/minio
+    repository: quay.io/minio/minio
     tag: latest
   accessKey: vexa-access-key
   secretKey: vexa-secret-key
@@ -460,7 +460,7 @@ minio:
   # chart on it. It is a value now; pin it with `repository@sha256:...` in your
   # own values (or via the enterprise node baseline) when you need reproducibility.
   mcImage:
-    repository: minio/mc
+    repository: quay.io/minio/mc
     tag: latest
   # ...and the Job declared no resources at all, so a namespace LimitRange would
   # silently assign it whatever default it likes — the 64Mi-squeeze class.

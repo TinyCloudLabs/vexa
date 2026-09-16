@@ -59,6 +59,23 @@ async function run() {
     const f = await faultOf(() => client.transcribe(pcm, 'en'));
     check('unrelated 400 → bad_request without format fallback', f?.kind === 'bad_request' && calls() === 1, `calls=${calls()}`);
   }
+  // A client timeout has an UNKNOWN server-side outcome: the server may still be transcribing the
+  // uploaded audio. Retrying that POST duplicates expensive work and caused the production queue storm.
+  {
+    let calls = 0;
+    (globalThis as any).fetch = async () => {
+      calls++;
+      const error = new Error('request timed out');
+      error.name = 'AbortError';
+      throw error;
+    };
+    const client = new TranscriptionClient({ serviceUrl: 'http://stt.test', maxRetries: 3, retryDelayMs: 1 });
+    const f = await faultOf(() => client.transcribe(pcm, 'en'));
+    check('timeout → kind=timeout, non-retryable (server outcome is unknown)',
+      f?.kind === 'timeout' && f?.retryable === false,
+      JSON.stringify({ kind: f?.kind, retryable: f?.retryable }));
+    check('timeout → STT called exactly once (no duplicate compute storm)', calls === 1, `calls=${calls}`);
+  }
 
   (globalThis as any).fetch = realFetch;
   if (failed) { console.error(`\n❌ stt errors: ${failed} check(s) FAILED.`); process.exit(1); }
