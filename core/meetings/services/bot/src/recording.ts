@@ -38,13 +38,13 @@ import type { RecordingSink } from './ports.js';
  *  as they arrive from the page-side recorder. */
 export interface BotRecordingSink extends RecordingSink {
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
-  chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, speakerTimeline?: unknown): void;
+  chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void;
 }
 
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
  *  RecordingService.uploadChunk; tests inject a fake to assert per-chunk delivery without HTTP. */
 export type ChunkUploader = (
-  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, speakerTimeline?: unknown,
+  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array,
 ) => void | Promise<void>;
 
 export interface RecordingSinkOptions {
@@ -64,12 +64,12 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
   const sessionUid = inv.connectionId ?? '';
   const token = inv.internalSecret ?? '';
   const svc = new RecordingService(meetingId, sessionUid);
-  return async (seq, isFinal, format, bytes, speakerTimeline) => {
+  return async (seq, isFinal, format, bytes) => {
     if (!url) {
       log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
       return;
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format, speakerTimeline);
+    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
   };
 }
 
@@ -86,34 +86,19 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   let finalSent = false;                               // has an is_final chunk been sent? (fallback guard)
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
-  let pendingTimelineBytes = 0;
 
-  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, speakerTimeline?: unknown): void => {
-    let metadata: unknown;
-    let metadataBytes = 0;
-    if (speakerTimeline !== undefined) {
-      try {
-        const encoded = JSON.stringify(speakerTimeline);
-        const size = Buffer.byteLength(encoded);
-        if (size <= 65536 && pendingTimelineBytes + size <= 262144) {
-          metadata = speakerTimeline;
-          metadataBytes = size;
-          pendingTimelineBytes += size;
-        } else log(`recording: chunk ${seq} speaker timeline omitted (metadata backpressure); audio retained`);
-      } catch { log(`recording: chunk ${seq} invalid speaker timeline omitted; audio retained`); }
-    }
+  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void => {
     anyChunk = true;
     if (isFinal) finalSent = true;
     if (seq > maxSeq) maxSeq = seq;
     lastFormat = format;
     queue = queue
-      .then(() => upload(seq, isFinal, format, bytes, metadata))
-      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); })
-      .finally(() => { pendingTimelineBytes -= metadataBytes; });
+      .then(() => upload(seq, isFinal, format, bytes))
+      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); });
   };
 
   return {
-    chunk: (_key, seq, isFinal, format, bytes, speakerTimeline) => { enqueue(seq, isFinal, format, bytes, speakerTimeline); },
+    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session

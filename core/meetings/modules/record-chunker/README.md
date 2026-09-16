@@ -22,7 +22,6 @@ lane; the `MediaRecorder` loop is identical and lives here.
   immediately (even with ZERO audio-bearing elements on the page) and rescans every 2 s —
   mirroring the live mixed-lane rescan — so participants whose audio arrives AFTER the tap
   started land in the master, and ended/removed tracks detach without breaking the recording.
-  (TinyCloud fork change, branch `tinycloud`: upstream grabbed the elements once at start.)
 
 The mixer uses existing `srcObject` audio directly. Video-only streams are skipped without
 calling `captureStream()` on every rescan. For file-backed elements requiring that fallback,

@@ -52,12 +52,13 @@ class FakeSourceNode {
   connect(_dest: any) { connected.push(this); }
   disconnect() { this.disconnected = true; const i = connected.indexOf(this); if (i >= 0) connected.splice(i, 1); }
 }
+let sourcesCreated = 0;
 class FakeAudioContext {
   state = 'running';
   resume() { /* */ }
   close() { (this as any).state = 'closed'; }
   createMediaStreamDestination() { return { stream: new FakeMediaStream() }; }
-  createMediaStreamSource(s: any) { return new FakeSourceNode(s); }
+  createMediaStreamSource(s: any) { sourcesCreated++; return new FakeSourceNode(s); }
 }
 (globalThis as any).AudioContext = FakeAudioContext;
 
@@ -115,6 +116,13 @@ async function main() {
   bob.srcObject = bob2;
   await sleep(RESCAN * 3);
   check(connected.length === 1 && connected[0].stream === bob2, 'swap: new srcObject re-attached, old source disconnected');
+
+  bob.srcObject = null;
+  await sleep(RESCAN * 3);
+  check(connected.length === 0, 'srcObject cleared: stale attachment detached');
+  bob.srcObject = bob2;
+  await sleep(RESCAN * 3);
+  check(connected.length === 1 && connected[0].stream === bob2, 'srcObject restored: current stream attached once');
 
   // 4. TRACK REMOVAL — ended tracks detach without crashing; recorder keeps recording.
   bob2.endAll();
@@ -180,6 +188,20 @@ async function main() {
   mixer.scan();
   mixer.stop();
   check(remoteAudio.readyState === 'live', 'stop: meeting-owned audio track is untouched');
+
+  // Attach and detach must read liveness the SAME way. A host that does not expose
+  // readyState passes the attach probe; a detach probe that demanded readyState ===
+  // "live" then tore the SAME element down, so every rescan rebuilt the graph node.
+  // Counting source-node construction is what makes that churn visible — the attached
+  // set looks identical either way.
+  pageElements.length = 0;
+  pageElements.push(new FakeMediaElement(new FakeMediaStream([{ kind: 'audio' } as any])));
+  const steady = new DynamicElementMixer();
+  const sourcesBefore = sourcesCreated;
+  for (let i = 0; i < 6; i++) steady.scan();
+  check(sourcesCreated - sourcesBefore === 1 && steady.attachedCount === 1,
+    `readyState-less track: attached ONCE across 6 rescans (built ${sourcesCreated - sourcesBefore} source node(s))`);
+  steady.stop();
 
   if (failures) { console.error(`\n❌ dynamic-tap.smoke: ${failures} check(s) failed`); process.exit(1); }
   console.log('\n✅ dynamic-tap.smoke: the tap starts empty, attaches late joiners, survives removal, and stops clean.');

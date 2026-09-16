@@ -95,17 +95,21 @@ _MAX_BOT_TIME = (
     "max_bot_time_exceeded", "active",
 )
 
-_MATRIX = [
-    _NORMAL_STOPPED, _LEFT_ALONE, _JOIN_FAILURE,
-    _ADMISSION_REJECTED, _ADMISSION_TIMEOUT, _MAX_BOT_TIME,
-]
-
-_MATRIX.append((
-    "failed-browser-crash", [ACTIVE],
+_BROWSER_CRASH = (
+    "failed-browser-crash",
+    [ACTIVE],
+    # The bot reports the browser fault in `reason` and sends NO completion_reason: a crash mid-call
+    # is not one of the sealed enum's outcomes, and guessing one would misfile it as silence.
     {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
      "reason": "browser_crashed: the meeting browser became unavailable; capture ended unexpectedly"},
     None, "active",
-))
+)
+
+_MATRIX = [
+    _NORMAL_STOPPED, _LEFT_ALONE, _JOIN_FAILURE,
+    _ADMISSION_REJECTED, _ADMISSION_TIMEOUT, _MAX_BOT_TIME,
+    _BROWSER_CRASH,
+]
 
 
 @pytest.mark.parametrize("row", _MATRIX, ids=[r[0] for r in _MATRIX])

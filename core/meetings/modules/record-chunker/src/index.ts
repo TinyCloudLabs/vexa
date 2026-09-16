@@ -1,10 +1,8 @@
 /**
  * @vexa/record-chunker — the shared browser MediaRecorder driver.
  *
- * MODIFIED BY TINYCLOUD (fork branch `tinycloud`, github.com/TinyCloudLabs/vexa):
- * createRecordingTap's element combine is now DYNAMIC (DynamicElementMixer) — it
- * starts with whatever audio is present (or none) and keeps attaching media
- * elements that appear later, mirroring the live mixed-lane rescan.
+ * `createRecordingTap` owns a dynamic page-element mix: it begins with whatever
+ * audio is present (including none) and attaches media that arrives later.
  *
  * Runs in browser context. Wraps a MediaRecorder over a combined audio
  * MediaStream, encodes each timeslice to base64, and hands it to an injected
@@ -24,9 +22,6 @@
  */
 
 /** One recording chunk, ready for upload. Mirrors the recording.v1 wire shape. */
-export { createSpeakerTimeline } from './speaker-timeline.js';
-export type { SpeakerTimelineChunk, SpeakerInterval } from './speaker-timeline.js';
-
 export interface RecordingChunk {
   base64: string;
   chunkSeq: number;
@@ -260,13 +255,20 @@ const RESCAN_MS = 2000;
  * audio only via capture). Returns null when the element has no usable audio yet —
  * the rescan will probe it again later.
  */
+/** ONE liveness rule for attach and detach. A track whose host does not expose
+ *  `readyState` counts as live, so the same track cannot read live to the attach
+ *  pass and ended to the detach pass — that disagreement would attach and detach
+ *  the same element on every rescan. */
+function isLiveTrack(t: any): boolean {
+  return t?.readyState === undefined || t.readyState === "live";
+}
+
 /** True when the stream has at least one LIVE audio track. Liveness (not mere track
  *  presence) is required — otherwise an ended stream would detach and immediately
  *  re-attach on every rescan. */
 function hasLiveAudio(s: any): boolean {
   try {
-    return s instanceof MediaStream
-      && s.getAudioTracks().some((t: any) => t.readyState === undefined || t.readyState === "live");
+    return s instanceof MediaStream && s.getAudioTracks().some(isLiveTrack);
   } catch { return false; }
 }
 
@@ -274,6 +276,8 @@ interface ElementStream {
   stream: MediaStream;
   /** captureStream creates tracks we own; srcObject tracks belong to the meeting. */
   owned: boolean;
+  /** captureStream may return a fresh stream while srcObject stays null, unlike a direct source. */
+  fromSrcObject: boolean;
 }
 
 function stopTracks(stream: MediaStream): void {
@@ -286,7 +290,7 @@ function probeElementStream(el: any): ElementStream | null {
     // creates another live video track on every rescan, retaining browser media
     // resources even though this recorder never consumes video.
     if (el.srcObject instanceof MediaStream) {
-      return hasLiveAudio(el.srcObject) ? { stream: el.srcObject, owned: false } : null;
+      return hasLiveAudio(el.srcObject) ? { stream: el.srcObject, owned: false, fromSrcObject: true } : null;
     }
     const capture = el.captureStream ?? el.mozCaptureStream;
     if (typeof capture !== "function") return null;
@@ -297,7 +301,7 @@ function probeElementStream(el: any): ElementStream | null {
     for (const track of stream.getTracks()) {
       if (track.kind !== 'audio') { try { track.stop(); } catch { /* already gone */ } }
     }
-    return { stream, owned: true };
+    return { stream, owned: true, fromSrcObject: false };
   } catch { /* not probeable yet; the rescan retries */ }
   return null;
 }
@@ -348,10 +352,9 @@ export class DynamicElementMixer {
       // Detach: all tracks ended, element left the DOM, or srcObject was swapped
       // for a NEW stream (the swap re-attaches below under the new stream).
       for (const [el, a] of Array.from(this.attached.entries())) {
-        const tracksLive = a.stream.getAudioTracks().some((t: any) => t.readyState === "live");
+        const tracksLive = a.stream.getAudioTracks().some(isLiveTrack);
         const inDom = (document as any).contains ? (document as any).contains(el) : true;
-        const swapped = el.srcObject instanceof MediaStream && el.srcObject !== a.stream
-          && hasLiveAudio(el.srcObject);
+        const swapped = a.fromSrcObject && el.srcObject !== a.stream;
         if (tracksLive && inDom && !swapped) continue;
         try { a.source.disconnect(); } catch { /* already gone */ }
         if (a.owned) stopTracks(a.stream);

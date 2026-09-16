@@ -1,7 +1,7 @@
 # TinyCloud fork CI — build + push the forked Vexa bot image to GHCR.
 #
 # Runs on pushes to `tinycloud` and manual dispatches of candidate branches.
-# Produces :tc-<shortsha>; only `tinycloud` updates the rolling :tinycloud tag.
+# Produces and validates :tc-<shortsha>; only a validated `tinycloud` candidate updates :tinycloud.
 # (New package name: the old vexa-bot package was created private and cannot be
 # flipped; a fresh package inherits public visibility from the public source repo.)
 # The bot Dockerfile builds FROM vexa/meet-join-env:dev, which is itself built
@@ -32,12 +32,9 @@ permissions:
   packages: write
 
 jobs:
-  build-recording-services:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    uses: ./.github/workflows/tinycloud-meeting-api-image.yml
-
   build-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +57,7 @@ jobs:
             -t vexa/meet-join-env:dev \
             core/meetings/modules/join
 
-      - name: Build + push ghcr.io/tinycloudlabs/vexa/bot
+      - name: Build + push candidate ghcr.io/tinycloudlabs/vexa/bot
         run: |
           set -euo pipefail
           SHORT_SHA="$(git rev-parse --short HEAD)"
@@ -74,26 +71,39 @@ jobs:
             -t "${IMAGE}:tc-${SHORT_SHA}" \
             .
           docker push "${IMAGE}:tc-${SHORT_SHA}"
-          if [ "${GITHUB_REF}" = "refs/heads/tinycloud" ]; then
-            docker tag "${IMAGE}:tc-${SHORT_SHA}" "${IMAGE}:tinycloud"
-            docker push "${IMAGE}:tinycloud"
-          fi
-          echo "pushed ${IMAGE}:tc-${SHORT_SHA}"
+          echo "pushed candidate ${IMAGE}:tc-${SHORT_SHA}"
+
+  validate-candidate:
+    needs: build-bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # A tinycloud push always validates before it may promote. Manual candidates opt in to the
+    # validation they need without changing a rolling tag.
+    if: ${{ github.ref == 'refs/heads/tinycloud' || inputs.validate_candidate || inputs.crash_test_only }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate browser crash and close reporting on Linux
-        if: ${{ inputs.validate_candidate || inputs.crash_test_only }}
         timeout-minutes: 3
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/tinycloudlabs/vexa/bot:tc-$(git rev-parse --short HEAD)"
           PROBE_DIR="${RUNNER_TEMP}/vexa-memory-probe"
           mkdir -p "${PROBE_DIR}"
-          docker run --rm --init --memory=3g --memory-swap=3g \
+          docker pull "${IMAGE}"
+          docker run --rm --init --memory=3g --memory-swap=3g --shm-size=2g \
             -e NODE_OPTIONS=--import=tsx -e BOT_WORKER_ENTRY=src/browser-failure.boundary.test.ts "${IMAGE}" \
             2>&1 | tee "${PROBE_DIR}/browser-failure.log"
 
       - name: Validate 15-minute recording and memory on Linux (synthetic media only)
-        if: ${{ inputs.validate_candidate && !inputs.crash_test_only }}
+        if: ${{ !inputs.crash_test_only && (github.ref == 'refs/heads/tinycloud' || inputs.validate_candidate) }}
         timeout-minutes: 25
         run: |
           set -euo pipefail
@@ -111,16 +121,40 @@ jobs:
             2>&1 | tee "${PROBE_DIR}/probe.log"
 
       - name: Make synthetic validation evidence readable
-        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
+        if: ${{ always() }}
         run: |
           if [ -d "${RUNNER_TEMP}/vexa-memory-probe" ]; then
             sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/vexa-memory-probe"
           fi
 
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && (inputs.validate_candidate || inputs.crash_test_only) }}
+        if: ${{ always() }}
         with:
           name: linux-synthetic-memory-${{ github.sha }}
           path: ${{ runner.temp }}/vexa-memory-probe
           retention-days: 7
-          if-no-files-found: error
+          if-no-files-found: warn
+
+  promote-tinycloud:
+    needs: [build-bot, validate-candidate]
+    if: ${{ github.ref == 'refs/heads/tinycloud' && !inputs.crash_test_only && needs.build-bot.result == 'success' && needs.validate-candidate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote the validated candidate
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/tinycloudlabs/vexa/bot"
+          CANDIDATE="${IMAGE}:tc-$(git rev-parse --short HEAD)"
+          docker pull "${CANDIDATE}"
+          docker tag "${CANDIDATE}" "${IMAGE}:tinycloud"
+          docker push "${IMAGE}:tinycloud"

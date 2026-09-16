@@ -178,14 +178,6 @@
     },
     {
       "method": "GET",
-      "path": "/recordings/{recording_id}/speaker-timeline",
-      "scopes": [
-        "bot",
-        "tx"
-      ]
-    },
-    {
-      "method": "GET",
       "path": "/recordings/{recording_id}/master",
       "scopes": [
         "bot",

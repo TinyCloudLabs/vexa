@@ -21,8 +21,11 @@ import type { LifecycleSink, PrimaryReachability } from '../ports.js';
  *  inject a fake without pulling in DOM/undici types. */
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number }>;
+
+/** Terminal callback horizon used by the live adapter; paired with the orchestrator teardown caps. */
+export const DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS = 8_000;
 
 export interface HttpLifecycleSinkOptions {
   /** meeting-api's lifecycle.v1 callback URL (invocation.v1 `meetingApiCallbackUrl`). */
@@ -37,6 +40,8 @@ export interface HttpLifecycleSinkOptions {
   backoffMs?: number;
   /** Sleep impl (injected so the test runs instantly). Default real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /** Overall wall-clock cap for one emit, including requests and backoff. Default 8s. */
+  emitTimeoutMs?: number;
   /** Max attempts for the REACHABILITY probe (`emitReachable`, #530) — a longer bounded budget
    *  than a normal emit so it rides out transient CNI-programming lag, but capped WELL under the
    *  meeting-api `requested` grace. Default 6 (with `reachBackoffMs` 300 ⇒ ≤ ~9.3s total). */
@@ -60,6 +65,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     retries = 5,
     backoffMs = 500,
     sleep = realSleep,
+    emitTimeoutMs = DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS,
     reachRetries = 6,
     reachBackoffMs = 300,
   } = opts;
@@ -72,21 +78,33 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
 
   async function emit(event: LifecycleEvent): Promise<void> {
     const body = JSON.stringify(event);
+    const deadline = Date.now() + Math.max(1, emitTimeoutMs);
     let lastErr: string | undefined;
+    let attempted = 0;
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      attempted++;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), remainingMs);
       try {
-        const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body });
+        const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
         if (res.ok) return; // 2xx — delivered
         lastErr = `HTTP ${res.status}`;
       } catch (e) {
         lastErr = (e as Error)?.message ?? String(e);
+      } finally {
+        clearTimeout(timeout);
       }
-      // Bounded exponential backoff before the next attempt (none after the last).
-      if (attempt < attempts) await sleep(backoffMs * 2 ** (attempt - 1));
+      // Never sleep past the overall deadline. The next request receives whatever budget remains.
+      if (attempt < attempts) {
+        const delayMs = Math.min(backoffMs * 2 ** (attempt - 1), Math.max(0, deadline - Date.now()));
+        if (delayMs > 0) await sleep(delayMs);
+      }
     }
     // Give up — log, never throw (a lifecycle POST failure must not crash the bot, P14).
     console.error(
-      `[bot] lifecycle.v1 ${event.status} POST failed after ${attempts} attempt(s): ${lastErr ?? 'unknown'} (giving up)`,
+      `[bot] lifecycle.v1 ${event.status} POST failed after ${attempted} attempt(s) within ${emitTimeoutMs}ms: ${lastErr ?? 'timeout'} (giving up)`,
     );
   }
 

@@ -29,6 +29,11 @@ function modelPartOf(body: string): string | null {
   const m = body.match(/name="model"\r\n\r\n([^\r]*)\r\n/);
   return m ? m[1] : null;
 }
+/** The value of the `response_format` form part in a captured multipart body. */
+function responseFormatPartOf(body: string): string | null {
+  const m = body.match(/name="response_format"\r\n\r\n([^\r]*)\r\n/);
+  return m ? m[1] : null;
+}
 
 async function run() {
   const pcm = new Float32Array(1600).fill(0.05); // 0.1s of audio
@@ -47,9 +52,51 @@ async function run() {
     await client.transcribe(pcm, 'en');
     check('unconfigured → default whisper-1 (no behavior change)', modelPartOf(body()) === 'whisper-1', `got ${JSON.stringify(modelPartOf(body()))}`);
   }
+  // Backends such as Voxtral reject verbose_json but accept the same OpenAI endpoint with json.
+  {
+    const formats: Array<string | null> = [];
+    (globalThis as any).fetch = async (_url: unknown, init: { body: Buffer }) => {
+      formats.push(responseFormatPartOf(Buffer.from(init.body).toString('latin1')));
+      if (formats.length === 1) {
+        return new Response(JSON.stringify({ message: 'Currently do not support verbose_json for Voxtral' }), { status: 400 });
+      }
+      return new Response(JSON.stringify({ text: 'voxtral ok' }), { status: 200 });
+    };
+    const client = new TranscriptionClient({ serviceUrl: 'http://stt.test', model: 'voxtral', maxRetries: 0 });
+    const first = await client.transcribe(pcm, 'en');
+    await client.transcribe(pcm, 'en');
+    check('verbose_json rejection falls back once, then caches json',
+      JSON.stringify(formats) === JSON.stringify(['verbose_json', 'json', 'json']),
+      `formats=${JSON.stringify(formats)}`);
+    check('json-only response remains a valid transcription result', first.text === 'voxtral ok', `text=${JSON.stringify(first.text)}`);
+  }
+  // Tinfoil uses the same OpenAI transcription shape. This is a request-shape contract only:
+  // it does not contact a tenant account or claim a live meeting result.
+  {
+    let request: { url?: unknown; headers?: Record<string, string>; body?: string } = {};
+    (globalThis as any).fetch = async (url: unknown, init: { headers: Record<string, string>; body: Buffer }) => {
+      request = { url, headers: init.headers, body: Buffer.from(init.body).toString('latin1') };
+      return new Response(JSON.stringify({ text: 'private meeting text' }), { status: 200 });
+    };
+    const result = await new TranscriptionClient({
+      serviceUrl: 'https://inference.tinfoil.sh',
+      apiToken: 'test-tinfoil-token',
+      model: 'voxtral-small-24b',
+      maxRetries: 0,
+    }).transcribe(pcm, 'en', 'quarterly planning');
+    check('Tinfoil: exact OpenAI transcription URL', request.url === 'https://inference.tinfoil.sh/v1/audio/transcriptions', String(request.url));
+    check('Tinfoil: bearer token and Voxtral model reach the wire',
+      request.headers?.Authorization === 'Bearer test-tinfoil-token' && modelPartOf(request.body ?? '') === 'voxtral-small-24b');
+    check('Tinfoil: PCM WAV, language, and prompt reach the wire',
+      /name="file"; filename="audio.wav"/.test(request.body ?? '')
+      && /name="language"\r\n\r\nen\r\n/.test(request.body ?? '')
+      && /name="prompt"\r\n\r\nquarterly planning\r\n/.test(request.body ?? ''));
+    check('Tinfoil: text-only response is accepted without changing timing metadata',
+      result.text === 'private meeting text' && result.segments.length === 0 && result.duration === 0);
+  }
 
   (globalThis as any).fetch = realFetch;
   if (failed) { console.error(`\n❌ stt model: ${failed} check(s) FAILED.`); process.exit(1); }
-  console.log('\n✅ stt model (P5, #522): the wire carries the configured model id; unset stays whisper-1.');
+  console.log('\n✅ stt model (P5, #522): configured model ids reach the wire; json-only OpenAI-compatible backends negotiate once.');
 }
 run().catch((e) => { console.error(e); process.exit(1); });

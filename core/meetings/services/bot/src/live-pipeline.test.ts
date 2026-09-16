@@ -134,7 +134,59 @@ async function main(): Promise<void> {
     check('stop: no further engine attempts after stop (timer cancelled)', attempts === afterStart, `after=${afterStart} now=${attempts}`);
   }
 
-  // 7) serr: full-fidelity serialization — the A1 fix for the {isTrusted:true} fidelity loss.
+  // 7) stop() while capture attach is in flight tears down the late handle and never starts the
+  //    later recording/engine stages. This is the real browser-failure ordering in the orchestrator.
+  {
+    let captureEntered!: () => void;
+    const captureStarted = new Promise<void>((resolve) => { captureEntered = resolve; });
+    let finishCapture!: (stop: () => Promise<void>) => void;
+    let captureStops = 0;
+    let recordingStarts = 0;
+    const engine = fakeEngine();
+    const live = createLivePipeline({
+      startCapture: async () => {
+        captureEntered();
+        return new Promise<() => Promise<void>>((resolve) => { finishCapture = resolve; });
+      },
+      startRecording: async () => {
+        recordingStarts++;
+        return async () => {};
+      },
+      engine,
+      onFault: () => {},
+    });
+    const starting = live.start();
+    await captureStarted;
+    await live.stop();
+    finishCapture(async () => { captureStops++; });
+    await starting;
+    check('stop-during-capture: late capture handle is torn down exactly once', captureStops === 1, String(captureStops));
+    check('stop-during-capture: recording and engine never start after stop', recordingStarts === 0 && engine.starts === 0,
+      `recording=${recordingStarts} engine=${engine.starts}`);
+  }
+
+  // 8) stop() while engine.start() is in flight re-stops the engine after its late completion.
+  {
+    let engineEntered!: () => void;
+    const engineStarted = new Promise<void>((resolve) => { engineEntered = resolve; });
+    let finishEngine!: () => void;
+    const engine = fakeEngine(async () => {
+      engineEntered();
+      await new Promise<void>((resolve) => { finishEngine = resolve; });
+    });
+    const live = createLivePipeline({
+      startCapture: okThunk({ started: 0, stopped: 0 }), engine, onFault: () => {},
+    });
+    const starting = live.start();
+    await engineStarted;
+    await live.stop();
+    finishEngine();
+    await starting;
+    check('stop-during-engine: late engine completion is stopped again', engine.starts === 1 && engine.stops === 2,
+      `starts=${engine.starts} stops=${engine.stops}`);
+  }
+
+  // 9) serr: full-fidelity serialization — the A1 fix for the {isTrusted:true} fidelity loss.
   {
     const e = new Error('config.json not found');
     check('serr: Error → includes message', serr(e).includes('config.json not found'));

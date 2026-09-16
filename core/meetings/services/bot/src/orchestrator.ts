@@ -23,10 +23,12 @@ import {
   canTransition,
   isTerminal,
 } from './contracts.js';
+import { buildJoinEvidence } from './join-evidence.js';
 import type {
   JoinDriver,
   JoinOutcome,
   JoinResult,
+  JoinSignals,
   Pipeline,
   LifecycleSink,
   ActsSource,
@@ -90,6 +92,44 @@ function normalizeJoin(r: JoinOutcome | JoinResult): JoinResult {
   return typeof r === 'string' ? { outcome: r } : r;
 }
 
+/**
+ * The `join_evidence` block for a pre-active terminal (#1059, #1058) — WHAT failed, WHO it belongs
+ * to, the stage timings, and the platform's own signal.
+ *
+ * WRAPPED, not trusted. `buildJoinEvidence` is already total, and this wraps it again because the
+ * guarantee has to hold at the call site too: a fault in DESCRIBING a failed run must never change
+ * how that run ends. The worst case here is a terminal event without the evidence block — exactly
+ * what production emitted before this existed — and never a different terminal, a delayed one, or
+ * a throw out of an exit path.
+ */
+function joinEvidenceFor(
+  outcome: Exclude<JoinOutcome, 'admitted'> | 'stopped',
+  stage: 'requested' | 'joining' | 'awaiting_admission',
+  signals: JoinSignals | undefined,
+  detail: string | undefined,
+): Partial<LifecycleEvent> {
+  try {
+    const evidence = buildJoinEvidence(outcome, stage, {
+      ...(signals ?? {}),
+      ...(detail !== undefined ? { detail } : {}),
+    });
+    return evidence ? { join_evidence: evidence } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Ask the driver for the signals it gathered, on the paths where no `JoinResult` came back (a raw
+ *  throw, or a pre-active abort). Optional + best-effort: a driver without it, or one that throws
+ *  from it, simply yields a less precise classification. */
+function driverSignals(join: JoinDriver): JoinSignals | undefined {
+  try {
+    return join.lastSignals?.();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Map a non-admitted join verdict to the terminal completion_reason. */
 const OUTCOME_FAIL: Record<Exclude<JoinOutcome, 'admitted'>, CompletionReason> = {
   rejected: 'awaiting_admission_rejected',
@@ -103,7 +143,19 @@ export interface RunOptions {
   /** A hard cap on the active phase (ms). Resolves the run with max_bot_time_exceeded.
    *  Defaults to off (0) — the live composition root derives it from automaticLeave. */
   maxActiveMs?: number;
+  /** Maximum time reserved for queued recording delivery during teardown. Tests may shorten it. */
+  recordingDrainMs?: number;
+  /** Maximum time to wait for pipeline capture/engine teardown. Tests may shorten it. */
+  pipelineStopMs?: number;
+  /** Maximum time to wait for the platform leave operation. Tests may shorten it. */
+  platformLeaveMs?: number;
 }
+
+/** The live HTTP lifecycle adapter has an 8s terminal-callback horizon. These teardown caps reserve
+ * 2s of scheduling/cleanup slack inside the 20s SIGTERM watchdog: 2s + 4s + 4s + 8s = 18s. */
+export const DEFAULT_PIPELINE_STOP_MS = 2_000;
+export const DEFAULT_RECORDING_DRAIN_MS = 4_000;
+export const DEFAULT_PLATFORM_LEAVE_MS = 4_000;
 
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
@@ -223,6 +275,57 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   }
 
   async function runInner(opts: RunOptions): Promise<MeetingResult> {
+    const settleWithin = async (
+      operation: Promise<void>,
+      budgetMs: number,
+      timeoutMessage: string,
+    ): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const settled = await Promise.race([
+          operation.then(() => true).catch(() => true),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), budgetMs); }),
+        ]);
+        if (!settled) console.error(timeoutMessage);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const stopPipeline = (): Promise<void> => {
+      const budgetMs = opts.pipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
+      return settleWithin(
+        deps.pipeline.stop(),
+        budgetMs,
+        `[bot] pipeline: stop exceeded ${budgetMs}ms; continuing bounded teardown`,
+      );
+    };
+    const leavePlatform = (reason: string): Promise<void> => {
+      const budgetMs = opts.platformLeaveMs ?? DEFAULT_PLATFORM_LEAVE_MS;
+      return settleWithin(
+        deps.join.leave(reason),
+        budgetMs,
+        `[bot] platform: leave exceeded ${budgetMs}ms; continuing to terminal lifecycle`,
+      );
+    };
+    const closeRecording = async (): Promise<void> => {
+      if (!deps.recording) return;
+      const budgetMs = opts.recordingDrainMs ?? DEFAULT_RECORDING_DRAIN_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const drained = await Promise.race([
+          Promise.resolve(deps.recording.close(recordingKey)).then(() => true).catch((e) => {
+            console.error(`[bot] recording: close failed; completed chunks remain durable but queued chunks may be missing: ${String(e)}`);
+            return true;
+          }),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), budgetMs); }),
+        ]);
+        if (!drained) {
+          console.error(`[bot] recording: upload drain exceeded ${budgetMs}ms; completed chunks remain durable but queued chunks may be missing; continuing leave and terminal lifecycle`);
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
     // ── reachability gate (#530, P18) — the FIRST lifecycle emit is LOAD-BEARING ──
     // The `joining` event must be sent regardless; we consult its delivery verdict. Reachable ⇒
     // ZERO added latency (the secondary channel is never probed). Primary unreachable ⇒ probe the
@@ -242,6 +345,8 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         // best-effort and must not mask the exit.
         const unreachable = ['meeting_api_callback', 'redis'];
         cur = 'failed';
+        const unreachableDetail =
+          `${CONTROL_PLANE_UNREACHABLE}: control plane unreachable at boot (${unreachable.join(', ')}); refused to join`;
         await deps.lifecycle.emit({
           ...base,
           status: 'failed',
@@ -250,8 +355,12 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
           completion_reason: 'join_failure',
           infra_fault: CONTROL_PLANE_UNREACHABLE,
           unreachable_channels: unreachable,
-          reason: `${CONTROL_PLANE_UNREACHABLE}: control plane unreachable at boot (${unreachable.join(', ')}); refused to join`,
+          reason: unreachableDetail,
           exit_code: CONTROL_PLANE_UNREACHABLE_EXIT,
+          // Ours, unambiguously — the bot never reached the meeting page because OUR control plane
+          // was down. `control_plane_unreachable` is a navigation marker, so this classifies
+          // `navigation_failure` → `system_fault` and lands in the gate metric where it belongs.
+          ...joinEvidenceFor('error', 'requested', { reachedLobby: false }, unreachableDetail),
         }).catch(() => { /* the channel that would carry this is the one that is down */ });
         return { exitCode: CONTROL_PLANE_UNREACHABLE_EXIT, status: 'failed', completionReason: 'join_failure' };
       }
@@ -277,6 +386,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     const unsubscribe = deps.acts.subscribe(handle);
     let outcome: JoinOutcome;
     let joinReason: string | undefined;
+    let joinSignals: JoinSignals | undefined;
     try {
       // Race the (possibly long, lobby-blocked) join against a pre-active abort. A stop/SIGTERM in the
       // waiting room resolves `aborted` → we stop waiting, WITHDRAW the join request, and terminate —
@@ -298,20 +408,33 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
           new Promise<void>((resolve) => setTimeout(resolve, 8000)),
         ]);
         const stage = cur === 'awaiting_admission' ? 'awaiting_admission' : 'joining';
+        const abortDetail = 'stopped while awaiting admission (withdrew the join request)';
         await emit('failed', {
           failure_stage: stage, completion_reason: 'stopped',
-          reason: 'stopped while awaiting admission (withdrew the join request)', exit_code: 0,
+          reason: abortDetail, exit_code: 0,
+          // `stopped_while_joining` → attribution `user_action`. This row shares its `failed`
+          // status with real defects, and counting it as one is precisely how a raw failed-status
+          // rate stops meaning anything: the user ended this run themselves.
+          ...joinEvidenceFor('stopped', stage, driverSignals(deps.join), abortDetail),
         });
         unsubscribe();
         return { exitCode: 0, status: 'failed', completionReason: 'stopped' };
       }
       outcome = raced.result.outcome;
       joinReason = raced.result.reason;
+      joinSignals = raced.result.signals;
       await reportChain;   // flush in-flight reports before deciding admission
     } catch (e) {
       unsubscribe();
       if (browserFault) return browserFailureResult();
-      await emit('failed', { failure_stage: 'joining', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
+      // A raw throw out of the join (browser crash, navigation error, an unrecognised platform).
+      // The driver parked its measurements before re-raising, so even this path is evidenced —
+      // typically as `navigation_failure` (system_fault) off the transport marker in the message.
+      const crashDetail = String(e);
+      await emit('failed', {
+        failure_stage: 'joining', completion_reason: 'join_failure', reason: crashDetail, exit_code: 1,
+        ...joinEvidenceFor('error', 'joining', driverSignals(deps.join), crashDetail),
+      });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
     }
     if (outcome !== 'admitted') {
@@ -323,7 +446,16 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       // (the AdmissionError text — e.g. the Zoom "auth_required" / "host not started" cause); fall
       // back to a derived line so NO reasonless terminal can ever leave this branch.
       const reasonText = joinReason ?? `join ended without admission: ${outcome} → ${reason}`;
-      await emit('failed', { failure_stage: 'awaiting_admission', completion_reason: reason, reason: reasonText, exit_code: 1 });
+      // The stage is DERIVED from where the bot actually got to, not stamped `awaiting_admission`
+      // regardless (which it used to be, and which claims a lobby the bot may never have seen). The
+      // control plane re-derives it server-side anyway (FM-003), so a truthful payload simply stops
+      // the two from disagreeing — and it is the field the taxonomy reads to tell a lobby expiry
+      // from a bot that never got there, the exact conflation #1058 measured.
+      const stage = cur === 'awaiting_admission' || cur === 'needs_help' ? 'awaiting_admission' : 'joining';
+      await emit('failed', {
+        failure_stage: stage, completion_reason: reason, reason: reasonText, exit_code: 1,
+        ...joinEvidenceFor(outcome, stage, joinSignals, reasonText),
+      });
       return { exitCode: 1, status: 'failed', completionReason: reason };
     }
     if (cur !== 'active') await emit('active');   // the join driver may already have reported active
@@ -338,13 +470,20 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     } catch (e) {
       // Already admitted (the browser is seated in the meeting) → LEAVE before exiting, or we
       // strand a ghost participant. Best-effort; never masks the failure.
-      await deps.recording?.close(recordingKey);
       if (browserFault) {
+        // Browser loss can race a partially-started capture bridge. Detach its observer before
+        // cleanup, then stop it and close recording so its empty is_final fallback reaches the
+        // server before this terminal failure is emitted.
+        stopFailure();
+        await stopPipeline();
+        await closeRecording();
         unsubscribe();
         return browserFailureResult();
       }
       stopFailure();
-      await deps.join.leave('pipeline_start_failed').catch(() => { /* best-effort */ });
+      await stopPipeline();
+      await closeRecording();
+      await leavePlatform('pipeline_start_failed');
       unsubscribe();
       await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
@@ -362,17 +501,16 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     unsubscribe();
     stopAloneness();
     stopRemoval();
-    await deps.pipeline.stop().catch(() => { /* best-effort */ });
-    await deps.recording?.close(recordingKey);
+    // Deliberate pipeline/browser teardown can close the page. Detach first so teardown noise
+    // cannot rewrite the successful end already selected above.
     stopFailure();
+    await stopPipeline();
+    await closeRecording();
     if (browserFault) return browserFailureResult();
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
-    // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.
-    await Promise.race([
-      deps.join.leave(reason!).catch(() => { /* best-effort */ }),
-      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
-    ]);
+    // assembly + the `completed` callback flush. Best-effort and capped to preserve watchdog slack.
+    await leavePlatform(reason!);
 
     console.error(`[bot] orchestrator: emitting completed (reason=${reason}, from=${cur})`);
     try {

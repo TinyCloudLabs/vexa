@@ -16,8 +16,18 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, type MeetingResult } from './orchestrator.js';
+import {
+  createOrchestrator,
+  CONTROL_PLANE_UNREACHABLE,
+  CONTROL_PLANE_UNREACHABLE_EXIT,
+  DEFAULT_PIPELINE_STOP_MS,
+  DEFAULT_PLATFORM_LEAVE_MS,
+  DEFAULT_RECORDING_DRAIN_MS,
+  type MeetingResult,
+} from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
+import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
+import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
 import type { Invocation } from './config.js';
@@ -99,6 +109,67 @@ async function main(): Promise<void> {
     check(`browser crash during ${phase}: no false completion reason`, last(lc.events).completion_reason === undefined);
     check(`browser crash during ${phase}: listener detached`, detached);
   }
+  // A browser loss during pipeline.start must still close recording before the terminal callback:
+  // close() sends the server its empty is_final fallback if the browser lost the real final chunk.
+  {
+    const events: LifecycleEvent[] = [];
+    let fireFailure: (reason: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let captureEntered!: () => void;
+    const captureStarted = new Promise<void>((resolve) => { captureEntered = resolve; });
+    let finishCapture!: (stop: () => Promise<void>) => void;
+    let captureDetached = false;
+    let recordingStarted = 0;
+    let engineStarted = 0;
+    let engineStopped = 0;
+    let finalFallbackSent = false;
+    let terminalSawFinalFallback = false;
+    const driver: JoinDriver = {
+      ...mockJoin('admitted'),
+      onFailure(cb) { fireFailure = cb; return () => { detached = true; }; },
+    };
+    const pipeline = createLivePipeline({
+      startCapture: async () => {
+        captureEntered();
+        return new Promise<() => Promise<void>>((resolve) => { finishCapture = resolve; });
+      },
+      startRecording: async () => {
+        recordingStarted++;
+        return async () => {};
+      },
+      engine: {
+        async start() { engineStarted++; },
+        async stop() { engineStopped++; },
+      },
+      onFault: () => {},
+    });
+    const o = createOrchestrator(inv(), {
+      lifecycle: { async emit(event) {
+        if (event.status === 'failed') terminalSawFinalFallback = finalFallbackSent;
+        events.push(event);
+      } },
+      join: driver,
+      pipeline,
+      acts: noopActs(), aloneness: noopAloneness(),
+      recording: { async close() { finalFallbackSent = true; } },
+    });
+    const running = o.run();
+    await captureStarted;
+    fireFailure('browser_crashed');
+    while (engineStopped === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    finishCapture(async () => { captureDetached = true; });
+    const result = await running;
+    while (!captureDetached) await new Promise((resolve) => setTimeout(resolve, 0));
+    check('browser crash during pipeline start: exits failed', result.status === 'failed' && result.exitCode === 1);
+    check('browser crash during pipeline start: real pipeline tears down late capture and stays stopped',
+      detached && captureDetached && recordingStarted === 0 && engineStarted === 0,
+      `detached=${detached} captureDetached=${captureDetached} recordingStarted=${recordingStarted} engineStarted=${engineStarted}`);
+    check('browser crash during pipeline start: recording final fallback precedes failed callback',
+      finalFallbackSent && terminalSawFinalFallback && last(events).status === 'failed');
+  }
+  check('teardown defaults preserve slack under the 20s SIGTERM watchdog',
+    DEFAULT_PIPELINE_STOP_MS + DEFAULT_RECORDING_DRAIN_MS + DEFAULT_PLATFORM_LEAVE_MS + DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS
+      < DEFAULT_SIGTERM_GRACE_MS);
   // Browser failure must win over the silence timer and survive as an active-stage failure.
   {
     const lc = recordingSink();
@@ -253,6 +324,61 @@ async function main(): Promise<void> {
     check('pipeline-fail: failure_stage=active', last(lc.events).failure_stage === 'active');
     check('pipeline-fail: reached active first', seq(lc.events).includes('active'));
     check('pipeline-fail: events conform', allConform(lc.events));
+  }
+
+  // A serialized upload retry must not consume the 20s signal watchdog and hide the leave or
+  // terminal event. Deliberate leave closes the browser in this fixture, so it also proves the
+  // failure observer is detached before teardown noise can rewrite a successful meeting.
+  {
+    const lc = recordingSink();
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    let observedFailure: (kind: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let left = 0;
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      onFailure(cb) { observedFailure = (kind) => { if (!detached) cb(kind); }; return () => { detached = true; }; },
+      async leave() { left++; observedFailure('browser_closed'); }, async withdraw() {},
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join,
+      pipeline: { async start() {}, async stop() { return new Promise<void>(() => {}); } },
+      acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+      recording: { close() { return new Promise<void>(() => {}); } },
+    });
+    const started = Date.now();
+    const running = o.run({ pipelineStopMs: 5, recordingDrainMs: 5 });
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    const res = await running;
+    check('recording-drain: normal teardown is bounded and emits completed',
+      res.status === 'completed' && res.completionReason === 'stopped' && Date.now() - started < 500 && left === 1);
+    check('browser teardown noise: detached observer preserves completed terminal', detached && last(lc.events).status === 'completed');
+  }
+
+  // A partial pipeline start may have started recording. Its blocked delivery is bounded too, and
+  // the deliberate leave cannot relabel the real pipeline error as a browser failure.
+  {
+    const lc = recordingSink();
+    let observedFailure: (kind: 'browser_crashed' | 'browser_closed') => void = () => {};
+    let detached = false;
+    let left = 0;
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      onFailure(cb) { observedFailure = (kind) => { if (!detached) cb(kind); }; return () => { detached = true; }; },
+      async leave() { left++; observedFailure('browser_closed'); return new Promise<void>(() => {}); }, async withdraw() {},
+    };
+    const started = Date.now();
+    const res = await createOrchestrator(inv(), {
+      lifecycle: lc, join,
+      pipeline: { async start() { throw new Error('partial capture init failed'); }, async stop() { return new Promise<void>(() => {}); } },
+      acts: noopActs(), aloneness: noopAloneness(),
+      recording: { close() { return new Promise<void>(() => {}); } },
+    }).run({ pipelineStopMs: 5, recordingDrainMs: 5, platformLeaveMs: 5 });
+    check('recording-drain: pipeline-start failure is bounded and emits failed',
+      res.status === 'failed' && res.completionReason === 'join_failure' && Date.now() - started < 500 && left === 1);
+    check('pipeline teardown noise: detached observer retains pipeline failure', detached && last(lc.events).reason?.includes('partial capture init failed') === true);
   }
 
   // ── host removal while active → completed(evicted) ──

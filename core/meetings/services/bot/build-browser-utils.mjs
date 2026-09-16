@@ -78,7 +78,6 @@ import {
 } from ${JSON.stringify(MIXED)};
 import {
   createRecordingTap,
-  createSpeakerTimeline,
 } from ${JSON.stringify(RECORD)};
 import {
   createJitsiSpeakers,
@@ -91,6 +90,7 @@ import {
 } from ${JSON.stringify(TEAMS)};
 import {
   createZoomSpeakers,
+  createTrackNameResolver,
 } from ${JSON.stringify(ZOOM)};
 
 const VexaBrowserUtils = {
@@ -109,7 +109,6 @@ const VexaBrowserUtils = {
   createCsrcPoll,            // capture-bridge.ts: the transport sensor (RTP contributing sources → transitions)
   // ── recording (all platforms): MediaRecorder → recording.v1 chunks ──
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
-  createSpeakerTimeline,     // recording-clock participant metadata; no audio buffering
   // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
   createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
   createJitsiChat,           // capture-bridge.ts: w.VexaBrowserUtils.createJitsiChat
@@ -119,6 +118,7 @@ const VexaBrowserUtils = {
   createTeamsCaptions,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsCaptions (live CC → diagnostics)
   // ── zoom lane (active-speaker DOM watcher → 'dom-active' naming hints) ──
   createZoomSpeakers,        // capture-bridge.ts: w.VexaBrowserUtils.createZoomSpeakers
+  createTrackNameResolver,   // capture-bridge.ts setupPerTrack: the pure channel↔name correlator
 };
 
 (globalThis).VexaBrowserUtils = VexaBrowserUtils;
@@ -164,5 +164,5 @@ console.log('  - createGmeetCapture / createGmeetSpeakers / createGmeetCaptureV1
 console.log('  - GmeetChannelBinder / createPcmCaptureNode');
 console.log('  - createMixedAudioCapture / installRemoteAudioHook / selectTeamsMixStreams / createCsrcPoll');
 console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');
-console.log('  - createTeamsSpeakers / createTeamsCaptions / createZoomSpeakers');
+console.log('  - createTeamsSpeakers / createTeamsCaptions / createZoomSpeakers / createTrackNameResolver');
 console.log('  - window.performLeaveAction');

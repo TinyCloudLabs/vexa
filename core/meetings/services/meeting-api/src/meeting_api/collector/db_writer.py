@@ -37,6 +37,26 @@ Additions over the parent:
     from the persisted ``source_cursor``. Redis was the ONLY home of the processed doc before
     this — stopping the bot made the processed output unreachable over REST.
 
+RESTORED ON THIS RELEASE, AND WHY — read this before deleting it again. The drain was removed once
+with the justification "PRD decision 34 removed the producer: nothing writes that stream". On this
+candidate that sentence is FALSE, and it is checkable in three places, all of which
+``tests/test_db_writer.py::test_the_processed_notes_producer_is_still_here`` asserts from source:
+
+  * ``core/agent/control_plane/dispatch.py`` still stamps ``VEXA_TRANSCRIPT_STREAM`` on a meeting
+    dispatch, so the meeting worker still runs;
+  * ``core/agent/worker/engine.py`` still passes ``proc_stream=f"proc:meeting:{row_id}"`` into
+    ``serve_meeting`` — unconditionally, on that path;
+  * ``core/agent/worker/meeting.py`` still ``xadd``s each cleaned note onto it, and still emits the
+    ``view_end`` marker.
+
+The removal commit that made the claim true (``f95d4d5e0``) is NOT in this branch's ancestry; the
+docstring travelled here without the code it described. With the producer alive and the drain gone,
+``proc:meeting:{id}`` fills up in redis and ``data.processed.views[]`` is never written — so the
+terminal's durable notes pane and the schedule digest's ``notes`` flag are permanently empty the
+moment the bot stops. That is the exact bug the drain was written for. **If the producer is ever
+actually removed, delete the producer and this drain in ONE change** — the failure mode being
+avoided here is a half-applied removal, in either direction.
+
 The persisted processed shape is ADDRESSABLE and VERSIONED (multi-consumer, per the release DoD):
 ``data.processed = {"views": [{id, kind, params, doc, source_cursor, updated_at}]}`` — ``params``
 records the processing metadata APPLIED (provider/model/pipeline, stamped by the producing worker
@@ -65,6 +85,50 @@ log = logging.getLogger("meeting_api.collector.db_writer")
 
 ACTIVE_MEETINGS_KEY = "active_meetings"
 IMMUTABILITY_THRESHOLD = float(os.environ.get("IMMUTABILITY_THRESHOLD", "30"))
+
+# ── the hold is a per-LANE guarantee, not a global one (M21, 2026-08-13) ────────────────────────
+# WHAT THE 30 s IS FOR. A lane that REFINES A ROW IN PLACE — the gmeet lane — can publish a draft,
+# then republish the confirmed text under a DIFFERENT segment id (``speaker-streams.ts`` rotates
+# ``windowStartMs`` at :350/:364/:739) and withdraw the old draft by emitting EMPTY TEXT under the
+# old id. Empty text is never stored and never deletes an already-flushed row, so a draft that
+# reached postgres before its id rotated is orphaned there for good. The hold is what keeps those
+# drafts from ever becoming durable: they are superseded inside the window and dropped from the
+# hash. That guarantee is real and is NOT touched here.
+#
+# WHY THE TEAMS CSRC LANE DOES NOT NEED IT. Its drafts use disjoint ids and are actively
+# RETRACTED — ``transcript_retract`` → ``delete_segments`` deletes the durable row as well as the
+# hash field. A confirmed row is never withdrawn by empty text. The lane is identified without
+# widening the legacy Zoom/Jitsi blast radius: ``source: 'merged'`` plus the stable
+# ``speaker_key: 'csrc:<id>'`` emitted only by the Teams adapter. For a confirmed Teams row the
+# hold buys nothing and costs the customer the whole 30 s: measured on prod
+# meeting 26088, time-to-durable was 39.4 s median of which 36.2 s is this threshold plus the
+# writer's poll phase, against 2.0 s for the model to produce the text.
+#
+# Pendings keep the full hold in every lane, so a draft can never become a durable row that reads
+# back as final.
+IMMUTABILITY_THRESHOLD_TEAMS_CSRC_CONFIRMED = float(
+    os.environ.get("IMMUTABILITY_THRESHOLD_TEAMS_CSRC_CONFIRMED", "0")
+)
+
+
+def threshold_for(seg: dict, default_threshold: float) -> float:
+    """The hold this ONE segment must serve before it may become durable.
+
+    ``default_threshold`` is the caller's threshold (the global one, or 0 at finalize) and is
+    returned unchanged for every other lane. Only a CONFIRMED Teams CSRC segment — whose drafts
+    are explicitly retracted — is allowed the shorter hold, and never a longer one than the caller
+    asked for.
+    """
+    try:
+        is_teams_csrc = (
+            seg.get("source") == "merged"
+            and str(seg.get("speaker_key", "")).startswith("csrc:")
+        )
+        if seg.get("completed") is True and is_teams_csrc:
+            return min(default_threshold, IMMUTABILITY_THRESHOLD_TEAMS_CSRC_CONFIRMED)
+    except AttributeError:  # not a mapping — the caller's threshold stands
+        pass
+    return default_threshold
 
 # #527 C2: how long an ACKED transcription_segments entry is retained before it is eligible to be
 # trimmed. Retention NEVER trims an entry the collector group has not read (the 2026-04-26 data loss,
@@ -199,7 +263,6 @@ async def flush_meeting_segments(
             pass
         return 0
 
-    cutoff = now - timedelta(seconds=threshold)
     batch: list[dict] = []
     done_fields: list = []  # flushed OR discarded — removed only after a confirmed write
     for field, value in raw.items():
@@ -209,7 +272,8 @@ async def flush_meeting_segments(
             done_fields.append(field)  # unparseable — drop it (parent behavior)
             continue
         updated_at = _parse_updated_at(seg.get("updated_at"))
-        if threshold > 0 and updated_at is not None and updated_at >= cutoff:
+        seg_threshold = threshold_for(seg, threshold)
+        if seg_threshold > 0 and updated_at is not None and updated_at >= (now - timedelta(seconds=seg_threshold)):
             continue  # still mutable — leave in the hash for the next tick
         if not (seg.get("text") or "").strip():
             done_fields.append(field)  # empty text — never stored (parent behavior)

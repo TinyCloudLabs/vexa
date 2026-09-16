@@ -9,7 +9,7 @@
  *   • a permanent failure does NOT throw out of `emit` (the bot must not crash).
  * Run: npx tsx src/adapters/lifecycle-http.test.ts
  */
-import { createHttpLifecycleSink, type FetchLike } from './lifecycle-http.js';
+import { createHttpLifecycleSink, DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS, type FetchLike } from './lifecycle-http.js';
 import type { LifecycleEvent } from '../contracts.js';
 
 let failed = 0;
@@ -18,7 +18,7 @@ const check = (name: string, cond: boolean, detail = '') => {
   if (!cond) failed++;
 };
 
-interface Recorded { url: string; method: string; headers: Record<string, string>; body: string }
+interface Recorded { url: string; method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }
 const noSleep = async (): Promise<void> => {};
 
 const EVENT: LifecycleEvent = {
@@ -106,6 +106,23 @@ async function main(): Promise<void> {
     check('default horizon: 5 attempts', calls.length === 5, String(calls.length));
     check('default horizon: exponential from 500ms (500,1000,2000,4000)',
       JSON.stringify(sleeps) === JSON.stringify([500, 1000, 2000, 4000]), JSON.stringify(sleeps));
+  }
+
+  // A hung terminal callback is aborted at the overall wall-clock horizon. This is the final 8s
+  // leg of the orchestrator's 18s teardown budget; tests shorten it to keep the harness fast.
+  {
+    let aborted = false;
+    const fetchImpl: FetchLike = async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('aborted'));
+      }, { once: true });
+    });
+    const started = Date.now();
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, emitTimeoutMs: 5 });
+    await sink.emit(EVENT);
+    check('emit timeout: hung request is aborted and emit returns promptly', aborted && Date.now() - started < 500);
+    check('emit timeout: production default is the documented 8s cap', DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS === 8_000);
   }
 
   // ── #530 reachability gate: emitReachable reports channel reachability of the first emit ──
