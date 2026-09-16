@@ -142,9 +142,9 @@ up: preflight
 		docker run -d --name $(MINIO_CONTAINER) --network $(NETWORK) --restart unless-stopped \
 			-e MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) -e MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
 			-v vexa-lite-miniodata:/data \
-			minio/minio:latest server /data --console-address ":9001" > /dev/null; \
+			quay.io/minio/minio:latest server /data --console-address ":9001" > /dev/null; \
 		sleep 4; \
-		docker run --rm --network $(NETWORK) --entrypoint sh minio/mc:latest -c \
+		docker run --rm --network $(NETWORK) --entrypoint sh quay.io/minio/mc:latest -c \
 			"mc alias set vexa http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc mb --ignore-existing vexa/$(MINIO_BUCKET)" >/dev/null 2>&1 || true; \
 	fi; echo "  ✓ MinIO ready"; \
 	if [ -n "$(LOCAL_STT)" ]; then \
