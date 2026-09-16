@@ -21,8 +21,10 @@ import {
   CONTROL_PLANE_UNREACHABLE,
   CONTROL_PLANE_UNREACHABLE_EXIT,
   DEFAULT_PIPELINE_STOP_MS,
+  DEFAULT_TRANSCRIPT_DRAIN_MS,
   DEFAULT_PLATFORM_LEAVE_MS,
   DEFAULT_RECORDING_DRAIN_MS,
+  pipelineStopBudgetMs,
   type MeetingResult,
 } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
@@ -170,6 +172,10 @@ async function main(): Promise<void> {
   check('teardown defaults preserve slack under the 20s SIGTERM watchdog',
     DEFAULT_PIPELINE_STOP_MS + DEFAULT_RECORDING_DRAIN_MS + DEFAULT_PLATFORM_LEAVE_MS + DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS
       < DEFAULT_SIGTERM_GRACE_MS);
+  check('ordinary user stops reserve at least one complete 30s STT request horizon',
+    pipelineStopBudgetMs(false) === DEFAULT_TRANSCRIPT_DRAIN_MS && DEFAULT_TRANSCRIPT_DRAIN_MS > 30_000);
+  check('SIGTERM keeps the short pipeline budget inside its force-exit watchdog',
+    pipelineStopBudgetMs(true) === DEFAULT_PIPELINE_STOP_MS);
   // Browser failure must win over the silence timer and survive as an active-stage failure.
   {
     const lc = recordingSink();
@@ -356,6 +362,32 @@ async function main(): Promise<void> {
     check('browser teardown noise: detached observer preserves completed terminal', detached && last(lc.events).status === 'completed');
   }
 
+  // An ordinary Stop may already be inside its long transcript drain when Docker sends SIGTERM.
+  // The signal must shorten that existing wait; merely changing the budget for future calls leaves
+  // the 20s watchdog racing an already-snapshotted 35s timer.
+  {
+    const lc = recordingSink();
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    let pipelineStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => { pipelineStopStarted = resolve; });
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: mockJoin('admitted'),
+      pipeline: { async start() {}, async stop() { pipelineStopStarted(); return new Promise<void>(() => {}); } },
+      acts: noopActs((f) => { fireLeave = f; }),
+      aloneness: noopAloneness(),
+    });
+    const startedAt = Date.now();
+    const running = o.run({ pipelineStopMs: 100, signalPipelineStopMs: 5 });
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    await stopStarted;
+    o.stop('stopped', true);
+    const result = await running;
+    check('SIGTERM shortens an ordinary pipeline drain already in progress',
+      result.status === 'completed' && Date.now() - startedAt < 80,
+      `elapsed=${Date.now() - startedAt} status=${result.status}`);
+  }
+
   // A partial pipeline start may have started recording. Its blocked delivery is bounded too, and
   // the deliberate leave cannot relabel the real pipeline error as a browser failure.
   {
@@ -449,6 +481,38 @@ async function main(): Promise<void> {
     ajv2.addSchema(txSchema);
     const validateSeg = ajv2.compile({ $ref: `${txSchema.$id}#/$defs/TranscriptSegment` });
     check('transcript: segment conforms to transcript.v1', !!validateSeg(published[0]), ajv2.errorsText(validateSeg.errors));
+  }
+
+  // The terminal lifecycle callback is ordered after pipeline.stop(). The real Google Meet
+  // pipeline's stop now includes its async transcript-publish drain; this composition assertion
+  // prevents a future orchestrator change from announcing completion before that durability seam.
+  {
+    const lc = recordingSink();
+    let stopStarted!: () => void;
+    const stopping = new Promise<void>((resolve) => { stopStarted = resolve; });
+    let releaseStop!: () => void;
+    const released = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const pipe: Pipeline = {
+      async start() {},
+      async stop() { stopStarted(); await released; },
+    };
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    const runP = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: mockJoin('admitted'),
+      pipeline: pipe,
+      acts: noopActs((f) => { fireLeave = f; }),
+      aloneness: noopAloneness(),
+    }).run();
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    await stopping;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    check('terminal lifecycle waits for the pipeline transcript drain',
+      !lc.events.some((event) => event.status === 'completed'), JSON.stringify(seq(lc.events)));
+    releaseStop();
+    await runP;
+    check('terminal lifecycle emits after the pipeline transcript drain settles',
+      last(lc.events).status === 'completed', JSON.stringify(seq(lc.events)));
   }
 
   // ── REGRESSION (code-review): pipeline.start fails AFTER admission → LEAVE (no ghost bot) ──

@@ -33,6 +33,14 @@ interface SpeakerBuffer {
   /** Word-level prefix confirmation: words from previous Whisper submission */
   lastWords: string[];
   inFlight: boolean;
+  /** Monotonic request identity. A terminal close may supersede a still-running live draft;
+   *  only the newest request is allowed to mutate or publish this speaker buffer. */
+  nextRequestId: number;
+  activeRequestId: number;
+  terminalRequestId?: number;
+  /** totalSamples captured by the current in-flight request. Audio may continue arriving while
+   *  Whisper runs; a turn close may accept that response as final only when it covers all audio. */
+  submittedTotalSamples: number;
   /** Wall-clock time (ms) when the current unconfirmed window started */
   windowStartMs: number;
   /** Wall-clock time (ms) when the buffer first started (for segment timing) */
@@ -112,7 +120,8 @@ export class SpeakerStreamManager {
   private submitGeneration: Map<string, number> = new Map();
 
   /** Called when unconfirmed audio needs transcription. */
-  onSegmentReady: ((speakerId: string, speakerName: string, audioBuffer: Float32Array) => void) | null = null;
+  onSegmentReady: ((speakerId: string, speakerName: string, audioBuffer: Float32Array,
+    requestId?: number, terminal?: boolean) => void) | null = null;
 
   /** Called when a segment is confirmed and should be published. */
   onSegmentConfirmed: ((speakerId: string, speakerName: string, transcript: string, bufferStartMs: number, bufferEndMs: number, segmentId: string, language?: string) => void) | null = null;
@@ -147,6 +156,9 @@ export class SpeakerStreamManager {
       confirmCount: 0,
       lastWords: [],
       inFlight: false,
+      nextRequestId: 0,
+      activeRequestId: 0,
+      submittedTotalSamples: 0,
       windowStartMs: now,
       bufferStartMs: now,
       sequenceNumber: 0,
@@ -237,11 +249,21 @@ export class SpeakerStreamManager {
    *          draft for a rejected result — its text describes audio this
    *          buffer no longer owns.
    */
-  handleTranscriptionResult(speakerId: string, transcript: string, segmentEndSec?: number, segments?: WhisperSegment[], language?: string): boolean {
+  handleTranscriptionResult(speakerId: string, transcript: string, segmentEndSec?: number,
+    segments?: WhisperSegment[], language?: string, requestId?: number): boolean {
     const buffer = this.buffers.get(speakerId);
     if (!buffer) return false;
 
+    // A terminal close can start a complete-window request while the earlier live draft is still
+    // running. Its late completion must not clear `inFlight`, overwrite text, or publish a partial
+    // window after the terminal result. Callers predating request identities retain old behavior.
+    if (requestId !== undefined && requestId !== buffer.activeRequestId) return false;
+
     buffer.inFlight = false;
+    buffer.activeRequestId = 0;
+    if (requestId !== undefined && requestId === buffer.terminalRequestId) {
+      buffer.terminalRequestId = undefined;
+    }
 
     // Discard stale responses: if the buffer was reset (generation bumped)
     // while a Whisper request was in flight, this response is for audio that
@@ -461,8 +483,11 @@ export class SpeakerStreamManager {
    *                   belongs to the NEXT segment buffer (the pipeline re-feeds
    *                   it there) — drop it here so the same frames are never
    *                   transcribed under both segments.
+   * @param supersedeIncompleteRequest - teardown-only: if the active live snapshot no longer
+   *                   covers the owned window, start one identified terminal replacement now.
    */
-  async flushSpeaker(speakerId: string, force: boolean = false, trimAtMs?: number): Promise<void> {
+  async flushSpeaker(speakerId: string, force: boolean = false, trimAtMs?: number,
+    supersedeIncompleteRequest: boolean = false): Promise<void> {
     const buffer = this.buffers.get(speakerId);
     if (!buffer) return;
 
@@ -483,22 +508,42 @@ export class SpeakerStreamManager {
     // speaker's buffer start, which makes the speaker-mapper unable to attribute
     // carried words correctly. Direct submission preserves correct timing.
 
-    // Have transcript — emit and reset
-    if (buffer.lastTranscript) {
+    // Have a transcript covering every currently owned sample — emit and reset. If more audio
+    // arrived after that request snapshot, keep its text only as the empty-final fallback and
+    // submit the complete window below; otherwise the appended tail would be silently discarded.
+    if (buffer.lastTranscript && buffer.totalSamples === buffer.submittedTotalSamples) {
       this.emitSegment(buffer, buffer.lastTranscript);
       this.fullReset(buffer);
       return;
     }
 
-    // Have audio but no transcript — final Whisper submit
+    // Have audio without a transcript that covers the full owned window — final Whisper submit.
     if (this.unconfirmedSamples(buffer) > 0) {
       if (buffer.inFlight) {
-        // A draft request is in flight for the PRE-TRIM window. Discarding
-        // the buffer here loses the whole segment's audio (multi-second
-        // transcript holes). Instead: when the response lands, its text is
-        // discarded and the owned audio resubmitted as the final window.
-        buffer.pendingFinal = true;
-        log(`[SpeakerStreams] Close while in-flight for "${buffer.speakerName}" — finalize deferred to response (${unconfirmedSec.toFixed(1)}s audio held)`);
+        if (trimAtMs !== undefined || buffer.totalSamples !== buffer.submittedTotalSamples) {
+          if (supersedeIncompleteRequest) {
+            // Teardown has one request horizon, not two. Supersede the incomplete live snapshot
+            // immediately with exactly one full-window terminal request; request IDs make the old
+            // completion inert. The pipeline gives this terminal request its own bounded allowance.
+            if (buffer.terminalRequestId !== undefined) return;
+            buffer.pendingFinal = false;
+            buffer.idleSubmitted = true;
+            log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — starting terminal replacement (${unconfirmedSec.toFixed(1)}s audio held)`);
+            await this.submitBuffer(buffer, true);
+            return;
+          }
+          // A segmentation boundary changed the owned window, or more audio arrived after the
+          // outstanding request took its snapshot. That response is not the complete final turn,
+          // so discard it and resubmit the full owned window when it lands.
+          buffer.pendingFinal = true;
+          log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — final resubmit deferred (${unconfirmedSec.toFixed(1)}s audio held)`);
+        } else {
+          // An ordinary turn close did NOT change the owned audio. The outstanding response is
+          // already the correct final window: accept it as terminal instead of discarding it and
+          // doubling inference work at exactly the point teardown is waiting on.
+          buffer.idleSubmitted = true;
+          log(`[SpeakerStreams] Close while in-flight for "${buffer.speakerName}" — awaiting owned final response (${unconfirmedSec.toFixed(1)}s audio held)`);
+        }
         return;
       }
       buffer.idleSubmitted = true;
@@ -612,7 +657,7 @@ export class SpeakerStreamManager {
    * Near-silent windows (RMS < silenceRmsThreshold) are NOT submitted (#617) — silence yields
    * hallucinated boilerplate, so it never reaches Whisper.
    */
-  private async submitBuffer(buffer: SpeakerBuffer): Promise<void> {
+  private async submitBuffer(buffer: SpeakerBuffer, terminal: boolean = false): Promise<void> {
     const unconfirmed = this.unconfirmedSamples(buffer);
     if (unconfirmed === 0 || !this.onSegmentReady) return;
 
@@ -645,13 +690,20 @@ export class SpeakerStreamManager {
       return;
     }
 
+    const requestId = ++buffer.nextRequestId;
+    buffer.activeRequestId = requestId;
+    if (terminal) buffer.terminalRequestId = requestId;
     buffer.inFlight = true;
+    buffer.submittedTotalSamples = buffer.totalSamples;
     this.submitGeneration.set(buffer.speakerId, buffer.generation);
 
     try {
-      this.onSegmentReady(buffer.speakerId, buffer.speakerName, combined);
+      this.onSegmentReady(buffer.speakerId, buffer.speakerName, combined, requestId, terminal);
     } catch (err: any) {
       buffer.inFlight = false;
+      buffer.activeRequestId = 0;
+      if (terminal) buffer.terminalRequestId = undefined;
+      buffer.submittedTotalSamples = 0;
       // P18: surface the transcription submit failure with its typed kind — do not swallow it.
       log(`[SpeakerStreams] [STT-FAULT] ${err?.kind ?? 'error'} submitting for ` +
           `"${buffer.speakerName}": ${String(err?.message ?? err)}`);
@@ -824,6 +876,9 @@ export class SpeakerStreamManager {
     buffer.confirmCount = 0;
     buffer.lastWords = [];
     buffer.inFlight = false;
+    buffer.activeRequestId = 0;
+    buffer.terminalRequestId = undefined;
+    buffer.submittedTotalSamples = 0;
     buffer.windowStartMs = Date.now();
     buffer.bufferStartMs = Date.now();
     buffer.lastAudioTimestamp = Date.now();

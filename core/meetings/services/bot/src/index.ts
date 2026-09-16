@@ -25,7 +25,7 @@
 import { createClient } from 'redis';
 import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
-import { createOrchestrator } from './orchestrator.js';
+import { createOrchestrator, DEFAULT_PIPELINE_STOP_MS } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
 import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
 import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
@@ -330,7 +330,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // force-exit watchdog in signals.ts (<25s, inside the runtime's SIGTERM→SIGKILL stop grace) so
   // a wedged teardown can never ride a `docker stop` all the way to a silent 137 (the incident's
   // exit code on BOTH orphaned bots). Wire before run(); release the listeners after.
-  const releaseSignals = installSignalHandlers({ stop: (reason) => orchestrator.stop(reason) });
+  let signalStopRequested = false;
+  const releaseSignals = installSignalHandlers({ stop: (reason) => {
+    signalStopRequested = true;
+    orchestrator.stop(reason, true);
+  } });
   try {
     const result = await orchestrator.run({ maxActiveMs: deriveMaxActiveMs(inv, aloneSilenceWindowMs, env) });
     return result.exitCode;
@@ -341,7 +345,20 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // teardown failure must not change the exit code). The orchestrator already stopped the pipeline
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
-    await pipeline.stop().catch(() => { /* best-effort */ });
+    // The orchestrator already performed the primary bounded stop. This second idempotent stop also
+    // covers early exits, but must be bounded independently: a memoized STT/Redis drain may still be
+    // pending after the orchestrator's deadline and must not block Redis quit or process exit.
+    const finalStop = pipeline.stop().catch(() => { /* best-effort */ });
+    if (!signalStopRequested) {
+      let finalStopTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        finalStop,
+        new Promise<void>((resolve) => {
+          finalStopTimer = setTimeout(resolve, DEFAULT_PIPELINE_STOP_MS);
+        }),
+      ]);
+      if (finalStopTimer) clearTimeout(finalStopTimer);
+    }
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     // The two teardown sidecars, written BEFORE the upload reads the directory. Both are
     // best-effort by construction: a diagnostic that can change how a meeting ended is worse than

@@ -94,6 +94,63 @@ async function main(): Promise<void> {
       `${seg?.absolute_start_time} vs start=${seg?.start}`);
   }
 
+  // ── 1b) terminal drain: stop() does not resolve until the async transcript sink has durably
+  //     accepted the final row. The lane API is synchronous at emit time, so this specifically
+  //     protects the adapter seam that previously fire-and-forgot Redis publication. ──
+  {
+    let publishStarted!: () => void;
+    const started = new Promise<void>((resolve) => { publishStarted = resolve; });
+    let releasePublish!: () => void;
+    const released = new Promise<void>((resolve) => { releasePublish = resolve; });
+    const published: TranscriptSegment[] = [];
+    const sink: TranscriptSink = {
+      async publish(segment) {
+        published.push(segment);
+        publishStarted();
+        await released;
+      },
+    };
+    const text = 'durable final row';
+    const pipe = createBotPipeline(baseInv(), sink, {
+      config: FAST,
+      transcribe: async () => ({ text, language: 'en', duration: 0.2,
+        segments: [{ start: 0, end: 0.2, text }] }),
+    });
+    await pipe.start();
+    pipe.feedAudio(0, 'Alice', FRAME, 1_000);
+    let stopped = false;
+    const stopping = pipe.stop().then(() => { stopped = true; });
+    await started;
+    await sleep(0);
+    check('gmeet stop waits while the final async transcript publish is unresolved', !stopped);
+    releasePublish();
+    await stopping;
+    check('gmeet stop resolves after the final transcript publish settles',
+      stopped && published.some((segment) => segment.completed && segment.text === text),
+      JSON.stringify(published));
+  }
+
+  {
+    const faults: unknown[] = [];
+    const sink: TranscriptSink = { async publish() { return new Promise<void>(() => {}); } };
+    const text = 'redis never connected';
+    const pipe = createBotPipeline(baseInv(), sink, {
+      config: FAST,
+      publishDrainMs: 5,
+      onError: (fault) => faults.push(fault),
+      transcribe: async () => ({ text, language: 'en', duration: 0.2,
+        segments: [{ start: 0, end: 0.2, text }] }),
+    });
+    await pipe.start();
+    pipe.feedAudio(0, 'Alice', FRAME, 1_000);
+    const startedAt = Date.now();
+    await pipe.stop();
+    check('gmeet stop is bounded when Redis publish never settles', Date.now() - startedAt < 500);
+    check('gmeet stop reports the bounded transcript-publish timeout',
+      faults.some((fault) => (fault as { source?: string }).source === 'transcript'),
+      JSON.stringify(faults));
+  }
+
   // ── 2) two channels, overlapping turns: each transcribes independently, names stay bound ──
   {
     const transcribe = async (pcm: Float32Array): Promise<TranscriptionResult> => {

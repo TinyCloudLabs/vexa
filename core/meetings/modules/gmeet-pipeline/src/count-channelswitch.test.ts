@@ -20,6 +20,7 @@
  */
 import { createGmeetPipeline, type TranscriptSegment, type TranscriptSink } from "./index.js";
 import type { TranscriptionResult } from "@vexa/transcribe-whisper";
+import { setImmediate as eventLoopTurn } from "node:timers/promises";
 
 const SR = 16000;                 // 16 kHz, the lane's sample rate
 const N = 500;                    // count 1..500 (the user's spec)
@@ -106,6 +107,12 @@ async function runScenario(label: string, glowPolicy: "named" | "undefined") {
       // (We don't consume those numbers from the 1..N oracle; they ride a separate offset stream.)
       tsMs += FRAME_MS;
     }
+    // Browser capture delivers frames on separate event-loop turns. Yield once per simulated turn
+    // so this immediate mock STT can settle just as it does between live capture callbacks; a
+    // separate slow-STT regression deliberately withholds resolution to exercise the hard backlog
+    // circuit breaker. Without this yield the fixture creates 71 requests in one JavaScript stack,
+    // an impossible live cadence that cannot release even an already-resolved Promise.
+    await eventLoopTurn();
     turnIdx++;
   }
 
