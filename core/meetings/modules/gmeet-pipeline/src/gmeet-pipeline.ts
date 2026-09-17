@@ -34,12 +34,11 @@ export interface GmeetPipelineOptions {
   config?: SpeakerStreamManagerConfig;
   /** Silence gap (ms) on a channel that ends its turn (→ re-bind on the next onset). Default 1000. */
   onsetGapMs?: number;
-  /** Maximum STT requests this bot may execute concurrently. Default 3, matching the healthy
-   *  three-turn production witness while bounding the previously unbounded fan-out. */
+  /** Maximum STT requests this bot may execute concurrently. Default 1: the production CPU
+   *  worker loses throughput when one bot submits parallel inference jobs. */
   maxConcurrentTranscriptions?: number;
-  /** Maximum total STT requests retained by one bot (active + queued). Default 3. This is a
-   *  circuit breaker: once the CPU service falls behind, retaining an unbounded number of PCM
-   *  snapshots only turns service overload into a bot OOM and a much later silent failure. */
+  /** Maximum ordinary live-draft STT requests retained by one bot (active + queued). Default 3.
+   *  This budget may defer a replaceable live draft, but never a closed/final turn. */
   maxPendingTranscriptions?: number;
   /** Cooldown after a caller timeout before another request starts. Default 30s. The server can
    *  keep computing after fetch aborts, so immediate slot reuse would overlap orphaned inference. */
@@ -61,10 +60,10 @@ export interface GmeetPipeline {
 export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const UNKNOWN = opts.unknownLabel ?? 'Speaker';
   const ONSET_GAP = opts.onsetGapMs ?? 1000;
-  const requestedConcurrency = Math.floor(opts.maxConcurrentTranscriptions ?? 3);
+  const requestedConcurrency = Math.floor(opts.maxConcurrentTranscriptions ?? 1);
   const MAX_CONCURRENT_TRANSCRIPTIONS = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
     ? requestedConcurrency
-    : 3;
+    : 1;
   const requestedPending = Math.floor(opts.maxPendingTranscriptions ?? 3);
   const MAX_PENDING_TRANSCRIPTIONS = Math.max(
     MAX_CONCURRENT_TRANSCRIPTIONS,
@@ -203,11 +202,13 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
     let p: Promise<void>;
     p = (async () => {
       try {
-        // A teardown-only terminal replacement intentionally overlaps its superseded draft. It
-        // gets one separately bounded allowance per already-active speaker, so all final tails
-        // share the same 30-second request horizon instead of serializing into 60 seconds.
+        // A teardown-only terminal replacement intentionally overlaps its superseded draft. An
+        // ordinary closed/final turn still uses the bounded FIFO: final audio is lossless, but it
+        // must not recreate the parallel CPU-inference storm that caused production timeouts.
         const invoke = () => opts.transcribe(audio, mgr.getLastConfirmedText(speakerId) || undefined);
-        const r = terminal ? await invoke() : await withTranscriptionSlot(invoke);
+        const r = terminal && replacingSameSpeaker
+          ? await invoke()
+          : await withTranscriptionSlot(invoke);
         const segs = r?.segments;
         mgr.handleTranscriptionResult(speakerId, (r?.text || '').trim(), segs?.[segs.length - 1]?.end,
           segs, langOf(r?.language), requestId);

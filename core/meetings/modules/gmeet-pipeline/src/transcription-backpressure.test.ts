@@ -1,7 +1,7 @@
 /**
  * Regression gate for the production empty-transcript failure:
  *   - completed channel turns must outlive a slow STT response;
- *   - one bot must obey its configured STT concurrency and total-outstanding limits;
+ *   - one bot must obey its configured STT concurrency and live-draft budget;
  *   - dispose must wait for every queued turn and finalize exactly once.
  *
  * The old lane deleted a closed turn after a fixed 12 seconds while its request could
@@ -151,9 +151,8 @@ async function run() {
         JSON.stringify({ disposeElapsedMs, tailFinalized }));
     }
 
-    // Circuit breaker: preserve FIFO for accepted work, report overload loudly, and never retain
-    // more than the configured active+queued request budget. Most importantly, rejected closed
-    // turns must release their buffers so dispose cannot wedge behind work that was never queued.
+    // A live-draft budget must never become a closed-turn deletion policy. Even with room for only
+    // two ordinary snapshots, all four completed turns are durable FIFO work and must survive.
     {
       const backlog: PendingRequest[] = [];
       const started: number[] = [];
@@ -180,7 +179,7 @@ async function run() {
       breaker.feedAudio(0, 'Dana', oneSecond(4), 7_500);
       const breakerDispose = breaker.dispose();
 
-      for (let completed = 0; completed < 2; completed++) {
+      for (let completed = 0; completed < 4; completed++) {
         await waitFor(() => backlog.length > 0);
         const request = backlog.shift()!;
         const text = `kept marker ${request.marker}`;
@@ -190,47 +189,54 @@ async function run() {
       }
       await breakerDispose;
 
-      check('backlog circuit breaker starts only its two-request budget in FIFO order',
-        started.join(',') === '1,2', JSON.stringify(started));
-      check('backlog circuit breaker reports every refused turn as non-retryable overload',
-        faults.length === 2 && faults.every((fault) =>
-          (fault as { kind?: string }).kind === 'overloaded' &&
-          (fault as { retryable?: boolean }).retryable === false), JSON.stringify(faults));
-      check('backlog circuit breaker keeps accepted rows and dispose still finalizes',
-        kept.map((segment) => segment.text).join(',') === 'kept marker 1,kept marker 2' && breakerFinalized === 1,
+      check('closed turns ignore the live-draft budget and execute one at a time in FIFO order',
+        started.join(',') === '1,2,3,4', JSON.stringify(started));
+      check('ordinary closed-turn backlog is not reported as overload',
+        faults.length === 0, JSON.stringify(faults));
+      check('every closed turn is retained and dispose still finalizes',
+        kept.map((segment) => segment.text).join(',') ===
+          'kept marker 1,kept marker 2,kept marker 3,kept marker 4' && breakerFinalized === 1,
         JSON.stringify({ kept: kept.map((segment) => segment.text), breakerFinalized }));
     }
 
 
-    // The production defaults admit exactly the three healthy concurrent calls observed in the
-    // incident and no queue behind them. A fourth slow turn is refused loudly rather than retained
-    // past the 35-second teardown horizon.
+    // Production defaults serialize CPU Whisper work but retain a realistic burst of closed turns.
+    // Parallel requests reduce throughput on this deployment; queueing is the backpressure.
     {
       const pending: PendingRequest[] = [];
       const faults: unknown[] = [];
+      let active = 0;
+      let maxActive = 0;
       const defaultPipe = createGmeetPipeline({
-        transcribe: (pcm) => new Promise((resolve) => pending.push({
-          marker: Math.round(pcm[0] * 100), resolve,
-        })),
+        transcribe: (pcm) => {
+          active++;
+          maxActive = Math.max(maxActive, active);
+          return new Promise((resolve) => pending.push({
+            marker: Math.round(pcm[0] * 100),
+            resolve: (result) => { active--; resolve(result); },
+          }));
+        },
         sink: { segment: () => {}, finalize: () => {} },
         onError: (fault) => faults.push(fault),
       });
-      defaultPipe.feedAudio(0, 'Alice', oneSecond(1), 0);
-      defaultPipe.feedAudio(0, 'Bob', oneSecond(2), 2_500);
-      defaultPipe.feedAudio(0, 'Carol', oneSecond(3), 5_000);
-      defaultPipe.feedAudio(0, 'Dana', oneSecond(4), 7_500);
+      for (let marker = 1; marker <= 8; marker++) {
+        defaultPipe.feedAudio(0, `Speaker ${marker}`, oneSecond(marker), (marker - 1) * 2_500);
+      }
       const defaultDispose = defaultPipe.dispose();
-      await waitFor(() => pending.length === 3);
-      check('production defaults start three requests and retain no fourth waiter',
-        pending.map((request) => request.marker).join(',') === '1,2,3' &&
-        faults.filter((fault) => (fault as { kind?: string }).kind === 'overloaded').length === 1,
-        JSON.stringify({ pending: pending.map((request) => request.marker), faults: faults.length }));
-      for (const request of pending.splice(0)) {
+      const completed: number[] = [];
+      while (completed.length < 8) {
+        await waitFor(() => pending.length > 0);
+        const request = pending.shift()!;
+        completed.push(request.marker);
         const text = `default marker ${request.marker}`;
         request.resolve({ text, language: 'en', language_probability: 1, duration: 1,
           segments: [{ start: 0, end: 1, text }] });
+        await tick();
       }
       await defaultDispose;
+      check('production defaults serialize and preserve a closed-turn burst',
+        completed.join(',') === '1,2,3,4,5,6,7,8' && maxActive === 1 && faults.length === 0,
+        JSON.stringify({ completed, maxActive, faults: faults.length }));
     }
 
     // A timed-out HTTP client does not prove server-side inference stopped. Hold the scheduler for
