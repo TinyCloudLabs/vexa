@@ -289,7 +289,7 @@ export class SpeakerStreamManager {
       }
       buffer.idleSubmitted = true;
       log(`[SpeakerStreams] Final resubmit for "${buffer.speakerName}" after deferred close (${(this.unconfirmedSamples(buffer) / this.sampleRate).toFixed(1)}s audio)`);
-      void this.submitBuffer(buffer);
+      void this.submitBuffer(buffer, true);
       return false;
     }
 
@@ -548,7 +548,7 @@ export class SpeakerStreamManager {
       }
       buffer.idleSubmitted = true;
       log(`[SpeakerStreams] Flush-submit for "${buffer.speakerName}" (${unconfirmedSec.toFixed(1)}s audio, no transcript yet)`);
-      await this.submitBuffer(buffer);
+      await this.submitBuffer(buffer, true);
       return;
     }
 
@@ -616,7 +616,7 @@ export class SpeakerStreamManager {
       if (!buffer.idleSubmitted) {
         buffer.idleSubmitted = true;
         log(`[SpeakerStreams] Idle submit for "${buffer.speakerName}" (${(idleMs/1000).toFixed(1)}s idle, final submission)`);
-        await this.submitBuffer(buffer);
+        await this.submitBuffer(buffer, true);
         return;
       }
       if (!buffer.inFlight) {
