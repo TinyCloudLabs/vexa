@@ -116,6 +116,10 @@ export class MediaRecorderChunker implements RecordingTap {
   private fail(error: unknown): void {
     if (this.failure) return;
     this.failure = error instanceof Error ? error : new Error(String(error));
+    // Delivery already in progress owns its Blob until its promise settles, but no queued Blob
+    // can ever be delivered after a terminal failure. Drop those references immediately.
+    for (const item of this.pending) this.pendingBytes -= item.blob.size;
+    this.pending = [];
     blog(`[record-chunker] terminal failure: ${this.failure.message}`);
     const recorder = this.recorder;
     try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
