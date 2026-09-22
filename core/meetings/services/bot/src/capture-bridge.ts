@@ -710,6 +710,8 @@ export async function startCaptureBridge(
   const tee = makeTelemetryTap(lane, telemetry);
   const attributed = inv.platform === 'google_meet' && inv.attributedAudioEnabled
     ? createHttpAttributedAudioRecorder(inv) : undefined;
+  // Reconcile the durable ledger before the page is allowed to offer a new PCM frame.
+  await attributed?.ready;
   const observeRemoteAudio = makeRemoteAudioEnergyTap(activity);
 
   // ── Node-side frame sink: one capture.v1 frame crossing the Playwright boundary. ──

@@ -8,6 +8,7 @@ session-resolution seams behave.
 from __future__ import annotations
 
 import pytest
+import asyncio
 import hashlib
 import json
 from fastapi import FastAPI
@@ -76,7 +77,7 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
         "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
         "speaker_key": "gmeet:3", "speaker_name": "Alice", "channel": 3, "turn_generation": 1,
         "attribution": {"source": "glow-bound", "confidence": 1}, "clock_origin_ms": 1700000000000,
-        "start_ms": 0, "end_ms": 0.125,
+        "start_ms": 0, "end_ms": 0.125, "audio_duration_ms": 0.125,
         "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
         "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
     }
@@ -86,11 +87,13 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
         data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)},
         files={"file": ("range.pcm", body, "application/octet-stream")},
     )
+    reserve = lambda value=meta: client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"}, data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)})
+    assert reserve().status_code == 200
     first = request(); assert first.status_code == 200
     assert first.json()["path"] == "/meetings/1/attributed-audio/ranges/0"
     assert request().json() == first.json(), "same idempotency + checksum is a successful retry"
     altered = dict(meta); altered["sha256"] = hashlib.sha256(b"other").hexdigest(); altered["byte_count"] = 5
-    assert request(altered, b"other").status_code == 409
+    assert reserve(altered).status_code == 409
     closed = client.post("/internal/attributed-audio/close", headers={"authorization": f"Bearer {token}"},
                          data={"session_uid": SESSION_UID})
     assert closed.status_code == 200 and closed.json()["state"] == "closed"
@@ -131,10 +134,12 @@ def test_completed_artifact_delete_removes_attributed_pcm_and_manifest():
     meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
             "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
             "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
-            "start_ms": 0, "end_ms": .25, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
             "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
     token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
     client = _client_for(repo, storage)
+    assert client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"},
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 200
     response = client.post("/internal/attributed-audio/upload", headers={"authorization": f"Bearer {token}"},
                            data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
                            files={"file": ("range.pcm", pcm, "application/octet-stream")})
