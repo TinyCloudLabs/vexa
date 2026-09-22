@@ -74,8 +74,9 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     pcm = b"\x00\x00\x80?\x00\x00\x00@"
     meta = {
         "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
-        "speaker_key": "gmeet:3:Alice", "speaker_name": "Alice",
-        "attribution": {"source": "glow-bound", "confidence": 1}, "start_ms": 1000, "end_ms": 1000.25,
+        "speaker_key": "gmeet:3", "speaker_name": "Alice", "channel": 3, "turn_generation": 1,
+        "attribution": {"source": "glow-bound", "confidence": 1}, "clock_origin_ms": 1700000000000,
+        "start_ms": 0, "end_ms": 0.125,
         "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
         "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
     }
@@ -93,8 +94,12 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     closed = client.post("/internal/attributed-audio/close", headers={"authorization": f"Bearer {token}"},
                          data={"session_uid": SESSION_UID})
     assert closed.status_code == 200 and closed.json()["state"] == "closed"
-    assert closed.json()["clock_origin"] == "capture_epoch_ms"
+    assert closed.json()["clock_origin"] == "first_admitted_capture_epoch_ms"
+    detail = client.get("/meetings/1/attributed-audio", headers={"x-user-id": str(USER)})
+    assert detail.status_code == 200 and "storage_path" not in detail.text
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER)}).content == pcm
+    ranged = client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER), "range": "bytes=0-3"})
+    assert ranged.status_code == 206 and ranged.content == pcm[:4]
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
@@ -117,6 +122,28 @@ def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     assert deleted.json()["scope"] == "primary_object_storage"
     assert storage.blobs == {}
     assert asyncio.run(repo.get_recordings(MEETING_ID)) == []
+
+
+def test_completed_artifact_delete_removes_attributed_pcm_and_manifest():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    pcm = b"\x00\x00\x80?"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": .25, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    client = _client_for(repo, storage)
+    response = client.post("/internal/attributed-audio/upload", headers={"authorization": f"Bearer {token}"},
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+                           files={"file": ("range.pcm", pcm, "application/octet-stream")})
+    assert response.status_code == 200
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    assert client.delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)}).status_code == 200
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID].get("data", {})
+    assert not any(key.startswith("attributed-audio/") for key in storage.blobs)
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():

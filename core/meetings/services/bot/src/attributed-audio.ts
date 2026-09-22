@@ -25,8 +25,10 @@ export function createHttpAttributedAudioRecorder(inv: Invocation) {
       if (typeof receipt.path !== 'string') throw new Error('attributed-audio receipt omitted retrieval path');
       return { path: receipt.path };
     },
-    close: async () => {
+    close: async (manifest) => {
       const form = new FormData(); form.set('session_uid', inv.connectionId!);
+      // The server closes only against the client admission ledger, not merely the uploaded prefix.
+      form.set('admitted_sequences', JSON.stringify(manifest.ranges.map(range => range.sequence)));
       await request(upload.replace(/\/upload$/, '/close'), form);
     },
   };
