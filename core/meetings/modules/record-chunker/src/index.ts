@@ -119,7 +119,7 @@ export class MediaRecorderChunker implements RecordingTap {
     this.failure = error instanceof Error ? error : new Error(String(error));
     blog(`[record-chunker] terminal failure: ${this.failure.message}`);
     const recorder = this.recorder;
-    try { if (recorder?.state === 'recording') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
+    try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
   }
 
   private maybeResume(): void {
