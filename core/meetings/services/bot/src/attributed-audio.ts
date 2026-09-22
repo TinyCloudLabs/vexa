@@ -2,12 +2,17 @@
 import { createAttributedAudioRecorder, type AttributedAudioManifest, type AttributedAudioStore } from '@vexa/gmeet-pipeline';
 import type { Invocation } from './config.js';
 
-export function createHttpAttributedAudioRecorder(inv: Invocation) {
+export const ATTRIBUTED_AUDIO_HTTP_TIMEOUT_MS = 15_000;
+// Multipart construction owns another copy of a PCM buffer and fetch may retain a body copy until
+// the request settles. Reserve all three owners before admission, not merely the recorder queue.
+export const ATTRIBUTED_AUDIO_HTTP_PCM_BUDGET_BYTES = Math.floor((32 * 1024 * 1024) / 3);
+
+export function createHttpAttributedAudioRecorder(inv: Invocation, options: { requestTimeoutMs?: number } = {}) {
   const upload = inv.attributedAudioUploadUrl;
   if (!upload || !inv.connectionId) return undefined;
   const endpoint = (name: 'reserve' | 'upload' | 'fail' | 'close' | 'manifest') => upload.replace(/\/upload$/, `/${name}`);
   const request = async (url: string, method: 'GET' | 'POST', form?: FormData) => {
-    const response = await fetch(url, { method, body: form, headers: { Authorization: `Bearer ${inv.internalSecret ?? inv.token ?? ''}` } });
+    const response = await fetch(url, { method, body: form, signal: AbortSignal.timeout(options.requestTimeoutMs ?? ATTRIBUTED_AUDIO_HTTP_TIMEOUT_MS), headers: { Authorization: `Bearer ${inv.internalSecret ?? inv.token ?? ''}` } });
     if (!response.ok) throw new Error(`attributed-audio request failed (${response.status}): ${await response.text()}`);
     return response.json() as Promise<Record<string, unknown>>;
   };
@@ -25,5 +30,5 @@ export function createHttpAttributedAudioRecorder(inv: Invocation) {
     fail: async range => request(endpoint('fail'), 'POST', metadata(range)) as Promise<any>,
     close: async manifest => { const form = new FormData(); form.set('session_uid', inv.connectionId!); form.set('admitted_sequences', JSON.stringify(manifest.ranges.map(range => range.sequence))); await request(endpoint('close'), 'POST', form); },
   };
-  return createAttributedAudioRecorder(String(inv.meeting_id ?? ''), store);
+  return createAttributedAudioRecorder(String(inv.meeting_id ?? ''), store, { budgetBytes: ATTRIBUTED_AUDIO_HTTP_PCM_BUDGET_BYTES });
 }

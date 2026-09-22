@@ -600,13 +600,19 @@ def build_router(
                 )
 
             recordings = list(plan.get("recordings") or [])
-            if recordings and artifact_object_deleter is None:
+            attributed_manifest = plan.get("attributed_audio_manifest")
+            if (recordings or attributed_manifest) and artifact_object_deleter is None:
                 raise HTTPException(status_code=503, detail="Artifact storage deletion unavailable")
             deleted_objects = 0
             for recording in recordings:
                 # Storage FIRST. Any exception deliberately aborts before DB paths/transcripts are
                 # scrubbed, so the same owner-scoped request can retry with the original keys.
                 deleted_objects += len(await artifact_object_deleter(recording))
+            if attributed_manifest:
+                deleted_objects += len(await artifact_object_deleter({
+                    "attributed_audio_manifest": attributed_manifest,
+                    "user_id": user_id, "meeting_id": meeting_id,
+                }))
 
             finalized = await store.finalize_completed_artifact_deletion(user_id, meeting_id)
             if finalized is None:

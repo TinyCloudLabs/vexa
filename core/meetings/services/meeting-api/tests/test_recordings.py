@@ -106,6 +106,35 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
+def test_attributed_fences_late_upload_and_uses_sample_clock_with_jitter():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    pcm = b"\0" * (4096 * 2 * 4)
+    meta = {
+        "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "jitter",
+        "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+        "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1000,
+        # Two 4096/16k callbacks at 1000 and 1250ms span 506ms while sample time is 512ms.
+        "start_ms": 0, "end_ms": 506, "audio_duration_ms": 512,
+        "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
+        "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+    }
+    headers = {"authorization": f"Bearer {token}"}
+    post = lambda route, value=meta, body=None: client.post(route, headers=headers, data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)}, files={} if body is None else {"file": ("range.pcm", body, "application/octet-stream")})
+    assert post("/internal/attributed-audio/reserve").status_code == 200
+    assert post("/internal/attributed-audio/fail").status_code == 200
+    assert client.post("/internal/attributed-audio/close", headers=headers, data={"session_uid": SESSION_UID}).status_code == 200
+    # A closed failed ledger cannot be resurrected by a delayed multipart request.
+    assert post("/internal/attributed-audio/upload", body=pcm).status_code == 409
+    stored = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+    assert stored["state"] == "closed" and stored["ranges"][0]["state"] == "failed"
+
+    gap = dict(meta, idempotency_key="real-gap", sequence=1, end_ms=800)
+    # A genuine gap cannot be smuggled through the HTTP endpoint as one stretched range.
+    assert post("/internal/attributed-audio/reserve", gap).status_code == 409
+
+
 def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     repo, storage = _seeded()
     repo._meetings[MEETING_ID]["status"] = "completed"

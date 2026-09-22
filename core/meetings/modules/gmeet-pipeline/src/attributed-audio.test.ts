@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createAttributedAudioRecorder, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
+import { createAttributedAudioRecorder, createAttributedAudioSink, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
 
 const row = (range: any, state: AttributedAudioRange['state']) => ({ ...range, state });
 function memoryStore(stall?: Promise<void>): AttributedAudioStore & { rows: AttributedAudioRange[]; uploaded: Uint8Array[] } {
@@ -39,4 +39,44 @@ const restart = memoryStore(); restart.load = async () => structuredClone(recove
 const recreated = createAttributedAudioRecorder('m3', restart, { cadenceMs: 5_000 }); await recreated.ready;
 recreated.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array([1]), capture_ms: 9, sample_rate: 1000 });
 const closed = await recreated.stop(); assert.deepEqual(closed.ranges.map(value => [value.sequence, value.state]), [[4, 'failed'], [5, 'uploaded']]);
+
+// Historical rows are evidence, not a concurrency budget. 65 five-second ranges and a
+// three-hour-equivalent ledger must both close without a silent tail drop.
+for (const count of [65, 3 * 60 * 60 / 5]) {
+  const historyStore = memoryStore();
+  const history = createAttributedAudioSink(`history-${count}`, historyStore, 64 * 1024);
+  for (let sequence = 0; sequence < count; sequence++) {
+    await history.seal({ speaker_key: 'channel:0', speaker_name: '', channel: 0, turn_generation: sequence + 1,
+      attribution: { source: 'unresolved', confidence: 0 }, start_ms: sequence * 5_000, end_ms: (sequence + 1) * 5_000,
+      codec: 'pcm_f32le', sample_rate: 250, channels: 1 }, [new Float32Array(1_250)]);
+  }
+  const historyManifest = await history.close();
+  assert.equal(historyManifest.ranges.length, count);
+  assert.deepEqual(historyManifest.ranges.map(range => range.sequence), Array.from({ length: count }, (_, index) => index));
+}
+
+// A callback clock commonly jitters by a few milliseconds. Sample duration remains authoritative:
+// 4096 @16kHz twice is 512ms audio even though its wall span is 506ms.
+const jitter = createAttributedAudioRecorder('jitter', memoryStore(), { cadenceMs: 5_000 });
+await jitter.ready;
+jitter.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(4096), capture_ms: 1_000, sample_rate: 16_000 });
+jitter.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(4096), capture_ms: 1_250, sample_rate: 16_000 });
+const jitterManifest = await jitter.stop();
+assert.equal(jitterManifest.ranges[0].audio_duration_ms, 512);
+assert.equal(jitterManifest.ranges[0].end_ms, 506);
+
+// Rejected audio is split into valid durable missing rows instead of creating one metadata body
+// too large for the server validator (4 MiB + 4 MiB + two samples with a four-byte PCM budget).
+const missingStore = memoryStore();
+const missing = createAttributedAudioRecorder('missing', missingStore, { cadenceMs: 5_000, budgetBytes: 4 });
+await missing.ready;
+let missingClock = 1_000;
+for (const samples of [4_194_304, 4_194_304, 2]) {
+  missing.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(samples), capture_ms: missingClock, sample_rate: 16_000 });
+  missingClock += samples / 16;
+}
+const missingManifest = await missing.stop();
+assert.ok(missingManifest.ranges.every(range => range.byte_count <= 32 * 1024 * 1024));
+assert.ok(missingManifest.ranges.every(range => range.state === 'failed'), JSON.stringify(missingManifest.ranges));
+assert.equal(missingManifest.state, 'closed');
 console.log('attributed-audio capture ledger passes');

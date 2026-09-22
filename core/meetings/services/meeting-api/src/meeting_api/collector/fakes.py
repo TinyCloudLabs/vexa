@@ -729,6 +729,7 @@ class InMemoryTranscriptStore:
         return {
             "meeting_id": meeting_id,
             "recordings": list(data.get("recordings") or []),
+            "attributed_audio_manifest": data.get("attributed_audio_manifest"),
             "already_deleted": already_deleted,
         }
 
@@ -742,7 +743,7 @@ class InMemoryTranscriptStore:
             return False
         m["segments"] = {}
         data = dict(m.get("data") or {})
-        for key in ("recordings", "processed", "notes", "share_grants", "transcript_viewers"):
+        for key in ("recordings", "attributed_audio_manifest", "processed", "notes", "share_grants", "transcript_viewers"):
             data.pop(key, None)
         data["artifact_deletion"] = {
             "state": "completed",
