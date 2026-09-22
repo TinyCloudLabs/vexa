@@ -29,9 +29,10 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type Snapshot = {
   streams: number;
-  resources: { contexts: number; sources: number; worklets: number; tracks: number };
+  resources: { contexts: number; sources: number; worklets: number; tracks: number; references: number };
   channels: number[];
   frames: number;
+  framesByChannel: Record<number, number>;
   logs: string[];
 };
 
@@ -83,6 +84,7 @@ async function main(): Promise<void> {
 
       const first = await makeElement('first', firstDestination.stream);
       const channels = new Set();
+      const framesByChannel = {};
       const logs = [];
       let frames = 0;
       const capture = globalThis.VexaBrowserUtils.createGmeetCapture({
@@ -91,12 +93,12 @@ async function main(): Promise<void> {
         findDelayMs: 1,
         silenceThreshold: 0,
         log(message) { logs.push(String(message)); },
-        onAudio(channel) { channels.add(channel); frames++; },
+        onAudio(channel) { channels.add(channel); frames++; framesByChannel[channel] = (framesByChannel[channel] || 0) + 1; },
       });
       await capture.start();
       globalThis.__dedupFixture = {
         capture, fixtureContext, firstOscillator, firstDestination, first, replacement: null, mirror: null,
-        channels, logs, get frames() { return frames; }, replacementOscillator: null,
+        channels, framesByChannel, logs, get frames() { return frames; }, replacementOscillator: null,
       };
     })()`);
     await sleep(400);
@@ -108,6 +110,7 @@ async function main(): Promise<void> {
         resources: fixture.capture.resourceCounts(),
         channels: Array.from(fixture.channels).sort((a, b) => a - b),
         frames: fixture.frames,
+        framesByChannel: fixture.framesByChannel,
         logs: fixture.logs,
       };
     })()`);
@@ -115,10 +118,10 @@ async function main(): Promise<void> {
     const mirrored = await snapshot();
     check('one live element has one capture owner',
       mirrored.streams === 1 && mirrored.resources.sources === 1 &&
-      mirrored.resources.worklets === 1 && mirrored.resources.tracks === 1,
+      mirrored.resources.worklets === 1 && mirrored.resources.tracks === 1 && mirrored.resources.references === 1,
       JSON.stringify(mirrored));
     check('initial stream emits channel zero',
-      mirrored.frames > 0 && mirrored.channels.length === 1,
+      mirrored.frames > 0 && mirrored.channels.length === 1 && mirrored.channels[0] === 0,
       JSON.stringify(mirrored));
 
     // Meet can append/play a replacement with the same srcObject and remove the old element
@@ -139,7 +142,7 @@ async function main(): Promise<void> {
     const handedOver = await snapshot();
     check('same-track DOM handover keeps one owner and channel zero PCM',
       handedOver.streams === 1 && handedOver.resources.sources === 1 &&
-      handedOver.resources.worklets === 1 && handedOver.resources.tracks === 1 &&
+      handedOver.resources.worklets === 1 && handedOver.resources.tracks === 1 && handedOver.resources.references === 1 &&
       handedOver.frames > mirrored.frames && handedOver.channels.length === 1 && handedOver.channels[0] === 0,
       JSON.stringify(handedOver));
 
@@ -163,11 +166,20 @@ async function main(): Promise<void> {
       fixture.replacement.srcObject = destination.stream;
       await fixture.replacement.play();
     })()`);
-    await sleep(150);
+    await sleep(400);
     const replaced = await snapshot();
-    check('mirror preserves original owner while replacement adds one owner',
+    check('mirror preserves channel zero PCM while replacement adds exactly channel one',
       replaced.streams === 2 && replaced.resources.sources === 2 &&
-      replaced.resources.worklets === 2 && replaced.resources.tracks === 2,
+      replaced.resources.worklets === 2 && replaced.resources.tracks === 2 && replaced.resources.references === 2 &&
+      JSON.stringify(replaced.channels) === JSON.stringify([0, 1]) &&
+      (replaced.framesByChannel[0] || 0) > (handedOver.framesByChannel[0] || 0) &&
+      (replaced.framesByChannel[1] || 0) > 0,
+      JSON.stringify(replaced));
+    check('repurposing an earlier element never transiently reconnects the mirrored owner',
+      replaced.logs.filter((message) => message.startsWith('stream ') && message.includes(' connected ')).length === 2 &&
+      replaced.logs.filter((message) => message.startsWith('stream 0 connected ')).length === 1 &&
+      replaced.logs.filter((message) => message.startsWith('stream 1 connected ')).length === 1 &&
+      !replaced.logs.some((message) => message.startsWith('stream 2 connected ')),
       JSON.stringify(replaced));
 
     await page.evaluate(`globalThis.__dedupFixture.mirror.remove()`);
@@ -175,7 +187,7 @@ async function main(): Promise<void> {
     const originalRemoved = await snapshot();
     check('removing the last original mirror releases only the original owner',
       originalRemoved.streams === 1 && originalRemoved.resources.sources === 1 &&
-      originalRemoved.resources.worklets === 1 && originalRemoved.resources.tracks === 1,
+      originalRemoved.resources.worklets === 1 && originalRemoved.resources.tracks === 1 && originalRemoved.resources.references === 1,
       JSON.stringify(originalRemoved));
 
     await page.evaluate(`globalThis.__dedupFixture.replacement.remove()`);
@@ -183,7 +195,7 @@ async function main(): Promise<void> {
     const allRemoved = await snapshot();
     check('removing every element releases every capture resource',
       allRemoved.streams === 0 && allRemoved.resources.sources === 0 &&
-      allRemoved.resources.worklets === 0 && allRemoved.resources.tracks === 0,
+      allRemoved.resources.worklets === 0 && allRemoved.resources.tracks === 0 && allRemoved.resources.references === 0,
       JSON.stringify(allRemoved));
 
     await page.evaluate(`(async () => {
@@ -196,7 +208,7 @@ async function main(): Promise<void> {
     const stopped = await snapshot();
     check('stop closes the shared capture context and leaves zero resources',
       stopped.resources.contexts === 0 && stopped.resources.sources === 0 &&
-      stopped.resources.worklets === 0 && stopped.resources.tracks === 0,
+      stopped.resources.worklets === 0 && stopped.resources.tracks === 0 && stopped.resources.references === 0,
       JSON.stringify(stopped));
   } finally {
     await context.close().catch(() => { /* best-effort */ });

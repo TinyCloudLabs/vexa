@@ -467,7 +467,7 @@ try {
       () => (window as any).probeCaptureStreams,
     );
     const captureResources = await page.evaluate(
-      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
+      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0, references: 0 },
     );
     const heapUsage = await cdp.send("Runtime.getHeapUsage");
     if (nativeSampling && Date.now() >= nextNativeSampleAt) {
@@ -526,8 +526,8 @@ try {
   await page.evaluate(() => clearInterval((window as any).fixture?.churnTimer)).catch(() => {});
   const postStop = {
     capture: await page.evaluate(
-      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
-    ).catch(() => ({ contexts: -1, sources: -1, worklets: -1, tracks: -1 })),
+      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0, references: 0 },
+    ).catch(() => ({ contexts: -1, sources: -1, worklets: -1, tracks: -1, references: -1 })),
     recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
     liveStt: readLiveSttMeasurement(),
   };
@@ -536,7 +536,7 @@ try {
     assert(sawRetainedSttPcm, 'enabled STT positive control observed retained PCM before stop');
     assert.equal(postStop.liveStt.retainedBytes, 0, 'production live-STT PCM owner releases bytes after stop');
   }
-  assert.deepEqual(postStop.capture, { contexts: 0, sources: 0, worklets: 0, tracks: 0 }, 'capture contexts, sources, worklets and tracks are released after stop');
+  assert.deepEqual(postStop.capture, { contexts: 0, sources: 0, worklets: 0, tracks: 0, references: 0 }, 'capture contexts, sources, worklets, tracks and references are released after stop');
   if (mode !== "recording" && mode !== "idle") {
     if (liveMeetUrl) {
       assert(frames > 0, "live Meet delivered captured audio frames");
