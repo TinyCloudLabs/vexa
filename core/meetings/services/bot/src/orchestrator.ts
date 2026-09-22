@@ -363,7 +363,15 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // secondary (redis); BOTH down ⇒ refuse to join BEFORE any meeting navigation and terminate
     // with the dedicated infra signal — rather than proceeding toward a human meeting the bot can
     // never report about (the 2026-07-09 fresh-node signature: opaque join_failure / stuck-requested).
-    const joiningExtra: Partial<LifecycleEvent> = base.container_id ? { container_id: base.container_id } : {};
+    const capability = inv.attributedAudioRequiredVersion === undefined ? undefined : {
+      requested_version: inv.attributedAudioRequiredVersion,
+      supported_version: 1,
+      status: inv.attributedAudioRequiredVersion === 1 ? 'supported' as const : 'unsupported' as const,
+    };
+    const joiningExtra: Partial<LifecycleEvent> = {
+      ...(base.container_id ? { container_id: base.container_id } : {}),
+      ...(capability ? { attributed_audio_capability: capability } : {}),
+    };
     const primaryReachable = await emitJoining(joiningExtra);
     if (!primaryReachable) {
       // Either-channel rule: EITHER channel up ⇒ the bot can still report ⇒ proceed. Absent probe

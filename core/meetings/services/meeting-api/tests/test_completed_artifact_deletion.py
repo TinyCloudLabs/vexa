@@ -108,7 +108,10 @@ def test_non_owner_gets_indistinguishable_404_and_cannot_delete_any_artifact():
         f"/meetings/{MEETING_ID}", headers={"x-user-id": str(OTHER)}
     )
     assert response.status_code == 404
-    assert sorted(storage.blobs) == [f"{PREFIX}000000.wav", f"{PREFIX}master.wav"]
+    assert sorted(storage.blobs) == [
+        f"attributed-audio/{OWNER}/{MEETING_ID}/sess-41/000000-a.pcm",
+        f"{PREFIX}000000.wav", f"{PREFIX}master.wav",
+    ]
     assert store._meetings[MEETING_ID]["segments"]["s1"]["text"] == "confidential"
 
 

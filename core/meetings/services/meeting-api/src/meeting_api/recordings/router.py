@@ -304,6 +304,7 @@ def build_router(
     @router.get("/internal/attributed-audio/manifest", include_in_schema=False)
     async def internal_attributed_audio_manifest(session_uid: str, authorization: Optional[str] = Header(default=None)):
         try: return JSONResponse(content=await attributed_manifest_for_session(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid))
+        except AttributedConflict as e: raise HTTPException(status_code=409, detail=str(e))
         except SessionNotFound as e: raise HTTPException(status_code=404, detail=str(e))
 
     @router.post("/internal/attributed-audio/reserve", include_in_schema=False)

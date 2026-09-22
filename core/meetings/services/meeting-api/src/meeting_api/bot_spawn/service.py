@@ -683,6 +683,8 @@ async def request_bot(
                 "transcribe_enabled": transcribe_enabled,
                 "recording_enabled": recording_enabled,
                 "attributed_audio_enabled": attributed_audio_enabled,
+                "attributed_audio_capability": ({"requested_version": 1, "status": "pending"}
+                                                 if attributed_audio_enabled and platform == "google_meet" else None),
                 "transcription_provider": transcription_provider,
                 "service_authority": authority_record,
             },
@@ -694,6 +696,10 @@ async def request_bot(
         meeting_data["transcribe_enabled"] = transcribe_enabled
         meeting_data["recording_enabled"] = recording_enabled
         meeting_data["attributed_audio_enabled"] = attributed_audio_enabled
+        if attributed_audio_enabled and platform == "google_meet":
+            # Pending is deliberately distinct from supported: only the bot's lifecycle callback
+            # can replace it with an acknowledgement, so a mixed fleet cannot be mistaken for one.
+            meeting_data["attributed_audio_capability"] = {"requested_version": 1, "status": "pending"}
         if transcription_provider is not None:
             meeting_data["transcription_provider"] = transcription_provider
         meeting_data["service_authority"] = authority_record
@@ -772,6 +778,7 @@ async def request_bot(
         attributed_audio_enabled=attributed_audio_enabled if platform == "google_meet" else None,
         attributed_audio_upload_url=(f"{meeting_api_url}/internal/attributed-audio/upload"
                                      if attributed_audio_enabled and platform == "google_meet" else None),
+        attributed_audio_required_version=(1 if attributed_audio_enabled and platform == "google_meet" else None),
         recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
         authenticated=True if authenticated else None,
         userdata_s3_path=auth_userdata_path,

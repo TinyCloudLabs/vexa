@@ -79,4 +79,19 @@ const missingManifest = await missing.stop();
 assert.ok(missingManifest.ranges.every(range => range.byte_count <= 32 * 1024 * 1024));
 assert.ok(missingManifest.ranges.every(range => range.state === 'failed'), JSON.stringify(missingManifest.ranges));
 assert.equal(missingManifest.state, 'closed');
+
+// Same-key retries compare before sequence allocation: pending and completed retries receive the
+// exact original promise/receipt, while a changed immutable payload is rejected.
+let openGate!: () => void; const pendingGate = new Promise<void>(resolve => { openGate = resolve; });
+const idemStore = memoryStore(pendingGate), idem = createAttributedAudioSink('idem', idemStore);
+const idemInput = { idempotency_key: 'same', speaker_key: 'channel:0', speaker_name: '', channel: 0, turn_generation: 1,
+  attribution: { source: 'unresolved' as const, confidence: 0 }, start_ms: 0, end_ms: 1, codec: 'pcm_f32le' as const, sample_rate: 1_000, channels: 1 as const };
+const first = idem.seal(idemInput, [new Float32Array([1])]);
+const pendingRetry = idem.seal(idemInput, [new Float32Array([1])]);
+assert.equal(first, pendingRetry); assert.equal(idem.manifest().ranges[0].sequence, 0);
+assert.throws(() => idem.seal({ ...idemInput, end_ms: 2 }, [new Float32Array([1])]), /conflicts/);
+openGate(); await first;
+const completeRetry = await idem.seal(idemInput, [new Float32Array([1])]);
+assert.equal(completeRetry.sequence, 0); assert.equal(idem.manifest().ranges.length, 1);
+assert.throws(() => idem.seal({ ...idemInput, speaker_key: 'changed' }, [new Float32Array([1])]), /conflicts/);
 console.log('attributed-audio capture ledger passes');

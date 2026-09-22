@@ -294,6 +294,8 @@ class MeetingRecord:
     #: `join_evidence.JoinFailureReason` plus the stage, the stage timings, and the platform's own
     #: signal. Set on a `failed` terminal only; see `data` below for how it lands in the JSONB.
     join_evidence: Optional[Dict[str, Any]] = None
+    #: Bot-emitted acknowledgement of the requested attributed-audio producer contract.
+    attributed_audio_capability: Optional[Dict[str, Any]] = None
     # User intent (parent's `meeting.data.stop_requested`) — set by the DELETE/stop path, read
     # first by the exit classifier so a user stop is never mis-attributed as a failure.
     stop_requested: bool = False
@@ -350,6 +352,8 @@ class MeetingRecord:
             d["stop_requested"] = True
         if self.stt_fault is not None:
             d["stt_fault"] = dict(self.stt_fault)
+        if self.attributed_audio_capability is not None:
+            d["attributed_audio_capability"] = dict(self.attributed_audio_capability)
         return d
 
 
@@ -555,6 +559,16 @@ class LifecycleSink:
             rec.exit_code = event["exit_code"]
         if event.get("error_details") is not None:
             rec.error_details = str(event["error_details"])
+        capability = event.get("attributed_audio_capability")
+        if isinstance(capability, dict):
+            requested = capability.get("requested_version")
+            supported = capability.get("supported_version")
+            status = capability.get("status")
+            if (isinstance(requested, int) and requested >= 1 and isinstance(supported, int)
+                    and supported >= 1 and status in ("supported", "unsupported")):
+                # This is an acknowledgement emitted by the bot binary, not a reflection of the
+                # spawn request.  Missing/old images leave the requested state pending.
+                rec.attributed_audio_capability = dict(capability)
 
         if to is BotStatus.COMPLETED:
             rec.completion_reason = self._terminal_reason(rec, event)

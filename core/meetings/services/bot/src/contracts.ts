@@ -58,6 +58,13 @@ export interface LifecycleEvent {
   /** The control-plane channels found unreachable when `infra_fault` is set (e.g. the
    *  meeting-api callback and/or redis). Additive; same liberal-ingestion rationale. */
   unreachable_channels?: string[];
+  /** Explicit producer acknowledgement.  A requested flag is not proof that a mixed image
+   * understood it; PTX reads this durable lifecycle result before relying on the contract. */
+  attributed_audio_capability?: {
+    requested_version: number;
+    supported_version: number;
+    status: 'supported' | 'unsupported';
+  };
   /** TYPED join-failure evidence on a pre-active `failed` terminal (#1059, #1058): what happened,
    *  who it belongs to, the stage timings, and the platform's own signal. See `join-evidence.ts`.
    *  Additive on lifecycle.v1 exactly as `infra_fault`/`stt_fault` are — the sealed contract

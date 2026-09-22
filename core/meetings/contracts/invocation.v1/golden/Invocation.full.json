@@ -20,6 +20,7 @@
   "captureSignalEnabled": true,
   "attributedAudioEnabled": true,
   "attributedAudioUploadUrl": "http://meeting-api:8080/internal/attributed-audio/upload",
+  "attributedAudioRequiredVersion": 1,
   "recordingUploadUrl": "https://s3.example.com/recordings/42",
   "automaticLeave": { "waitingRoomTimeout": 300000, "noOneJoinedTimeout": 600000, "everyoneLeftTimeout": 120000 },
   "voiceAgentEnabled": true,

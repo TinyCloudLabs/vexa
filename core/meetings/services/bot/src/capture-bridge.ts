@@ -45,6 +45,43 @@ import type { RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
 import { createHttpAttributedAudioRecorder } from './attributed-audio.js';
 
+// The Playwright binding is asynchronous but the AudioWorklet callback is not.  Bound the page
+// queue BEFORE Array.from()/protocol serialization can retain unbounded PCM in Chromium.
+export const PAGE_ATTRIBUTED_AUDIO_MAX_BYTES = 8 * 1024 * 1024;
+export const PAGE_ATTRIBUTED_AUDIO_MAX_CALLS = 512;
+
+/** Installed inside Chromium, before its exposed Playwright bindings are called.  Kept exported so
+ * the exact synchronous-callback admission logic is exercised without a browser fixture. */
+export function installPageAttributedAudioAdmission({ maxBytes, maxCalls }: { maxBytes: number; maxCalls: number }): void {
+  const w = globalThis as any;
+  if (w.__vexaAttributedAdmissionInstalled) return;
+  w.__vexaAttributedAdmissionInstalled = true;
+  let bytes = 0, calls = 0, stopped = false;
+  const stop = (channel: number, name: string | undefined, ts: number) => {
+    if (stopped) return;
+    stopped = true;
+    Promise.resolve(w.__vexaAttributedBoundaryOverflow?.(channel, name, ts)).catch(() => undefined)
+      .finally(() => { try { w.__vexaGmeetCapture?.stop?.(); } catch { /* page teardown is best effort */ } });
+  };
+  const wrap = (bound: any, named: boolean) => (channel: number, nameOrSamples: string | number[], samplesOrTs?: number[] | number, maybeTs?: number) => {
+    const samples = (named ? samplesOrTs : nameOrSamples) as number[];
+    const name = named ? nameOrSamples as string : undefined;
+    const candidateTs = named ? maybeTs : samplesOrTs;
+    const ts = (typeof candidateTs === 'number' ? candidateTs : undefined) ?? Date.now();
+    const size = Array.isArray(samples) ? samples.length * 4 : 0;
+    if (stopped || !Array.isArray(samples) || size > maxBytes || calls >= maxCalls || bytes + size > maxBytes) {
+      stop(channel, name, ts);
+      return Promise.resolve();
+    }
+    calls++; bytes += size;
+    const args = named ? [channel, name, samples, ts] : [channel, samples, ts];
+    return Promise.resolve(bound(...args)).finally(() => { calls--; bytes -= size; });
+  };
+  w.__vexaPerSpeakerAudioData = wrap(w.__vexaPerSpeakerAudioData, false);
+  w.__vexaNamedAudioData = wrap(w.__vexaNamedAudioData, true);
+  w.__vexaAttributedAdmissionStats = () => ({ bytes, calls, stopped });
+}
+
 /** Float32 PCM → base64 of its little-endian bytes — the EXACT codec wire payload, so a stored
  *  captured-signal.v1 frame round-trips through @vexa/capture-codec (encode→decode→same PCM). */
 export function pcmToBase64(pcm: Float32Array): string {
@@ -749,6 +786,17 @@ export async function startCaptureBridge(
     }
     pipeline.feedAudio(channel, glowName, pcm, ts);
   };
+  const onAttributedBoundaryOverflow = async (channel: number, glowName: string | undefined, tsMs?: number): Promise<void> => {
+    if (!attributed) return;
+    const ts = tsMs ?? Date.now();
+    // The page stopped before this callback's PCM crossed the bridge.  This is not a successful
+    // partial capture: persist a terminal missing outcome and let stop() drain it observably.
+    await attributed.incomplete({
+      channel, speaker_name: glowName ?? '', speaker_key: glowName ? `gmeet:${channel}:${glowName}` : `gmeet:channel:${channel}`,
+      attribution: glowName ? { source: 'glow-bound', confidence: 1 } : { source: 'unresolved', confidence: 0 },
+      capture_ms: ts, sample_rate: 16000,
+    });
+  };
   // mixed lane "who is lit" hint (Zoom/Teams active-speaker → the namer's time window).
   // Epoch-clock-guarded + counted; see makeSpeakerHintSink for the clock contract.
   const { sink: onSpeakerHint, crossed: hintsBridgeCrossed } = makeSpeakerHintSink(pipeline, undefined, telemetry);
@@ -790,6 +838,9 @@ export async function startCaptureBridge(
     if (!String(e.message).includes('already registered')) throw e;
   });
   await page.exposeFunction('__vexaNamedAudioData', onNamedAudio).catch(() => { /* optional */ });
+  await page.exposeFunction('__vexaAttributedBoundaryOverflow', onAttributedBoundaryOverflow).catch((e: Error) => {
+    if (!String(e.message).includes('already registered')) throw e;
+  });
   await page.exposeFunction('__vexaSpeakerHint', onSpeakerHint).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaTeamsCaption', onTeamsCaption).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaCsrc', onCsrc).catch(() => { /* optional */ });
@@ -808,6 +859,15 @@ export async function startCaptureBridge(
   await page.exposeFunction('__vexaChatMessage', (sender: string, text: string): void => {
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
   }).catch(() => { /* optional */ });
+
+  if (attributed) {
+    // This wrapper lives at the producer boundary.  It admits both call count and PCM bytes before
+    // Node/Playwright receives an array, releases each reservation when the binding settles, and
+    // turns the first refusal into one durable incomplete range before stopping capture.
+    await page.evaluate(installPageAttributedAudioAdmission, {
+      maxBytes: PAGE_ATTRIBUTED_AUDIO_MAX_BYTES, maxCalls: PAGE_ATTRIBUTED_AUDIO_MAX_CALLS,
+    });
+  }
 
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
