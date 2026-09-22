@@ -109,6 +109,11 @@ class InMemoryRecordingRepo:
         data = dict(meeting.get("data") or {})
         next_data, result = mutator(data)
         meeting["data"] = dict(next_data)
+        # Production stores recordings in this same JSONB document. Older focused fixtures keep a
+        # convenient top-level mirror, so retain that mirror when a complete-data mutation changes
+        # the durable recordings list.
+        if "recordings" in next_data:
+            meeting["recordings"] = list(next_data["recordings"])
         return result
 
     async def attributed_manifest_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:

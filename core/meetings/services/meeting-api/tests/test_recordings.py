@@ -135,6 +135,43 @@ def test_attributed_fences_late_upload_and_uses_sample_clock_with_jitter():
     assert post("/internal/attributed-audio/reserve", gap).status_code == 409
 
 
+def test_attributed_route_closes_the_published_callback_gap_controls():
+    """The Python route admits the same 250ms merge boundary as the TS recorder."""
+    pcm = b"\0" * (100 * 2 * 4)
+    for capture_ms, expected_rows in ((1250, 1), (1300, 1), (1600, 2)):
+        repo, storage = _seeded()
+        client = _client_for(repo, storage)
+        token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+        headers = {"authorization": f"Bearer {token}"}
+        rows = [{
+            "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": f"gap-{capture_ms}-0",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1000,
+            "start_ms": 0, "end_ms": capture_ms - 1000 + 100, "audio_duration_ms": 200,
+            "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+        }]
+        if capture_ms == 1600:
+            rows = [
+                {**rows[0], "end_ms": 100, "audio_duration_ms": 100, "byte_count": len(pcm) // 2,
+                 "sha256": hashlib.sha256(pcm[:len(pcm) // 2]).hexdigest()},
+                {**rows[0], "sequence": 1, "idempotency_key": f"gap-{capture_ms}-1", "turn_generation": 2,
+                 "start_ms": 600, "end_ms": 700, "audio_duration_ms": 100, "byte_count": len(pcm) // 2,
+                 "sha256": hashlib.sha256(pcm[len(pcm) // 2:]).hexdigest()},
+            ]
+        for row in rows:
+            response = client.post("/internal/attributed-audio/reserve", headers=headers,
+                                   data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert response.status_code == 200
+            response = client.post("/internal/attributed-audio/fail", headers=headers,
+                                   data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert response.status_code == 200
+        closed = client.post("/internal/attributed-audio/close", headers=headers,
+                             data={"session_uid": SESSION_UID,
+                                   "admitted_sequences": json.dumps(list(range(expected_rows)))})
+        assert closed.status_code == 200 and closed.json()["state"] == "closed"
+
+
 def test_attributed_deletion_fences_reservation_upload_and_empty_close_clock():
     repo, storage = _seeded()
     client = _client_for(repo, storage)
@@ -187,6 +224,29 @@ def test_attributed_reservation_persists_key_and_late_ack_deletes_object():
     assert racing.blobs == {}, "an upload whose acknowledgement loses to deletion cannot orphan PCM"
 
 
+def test_restart_failure_retains_reservation_key_until_legacy_delete_cleans_put_crash():
+    """reserve -> PUT crash -> restart fail -> close -> DELETE leaves no deterministic object."""
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "put-crash",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import close_attributed_manifest, fail_reserved_attributed_range, reserve_attributed_range
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    asyncio.run(storage.upload(reserved["storage_path"], pcm, content_type="application/octet-stream"))
+    failed = asyncio.run(fail_reserved_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    assert failed["storage_path"] == reserved["storage_path"]
+    asyncio.run(close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID))
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    response = _client_for(repo, storage).delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200
+    assert reserved["storage_path"] not in storage.blobs
+
+
 def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     repo, storage = _seeded()
     repo._meetings[MEETING_ID]["status"] = "completed"
@@ -230,6 +290,86 @@ def test_completed_artifact_delete_removes_attributed_pcm_and_manifest():
     assert client.delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)}).status_code == 200
     assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID].get("data", {})
     assert not any(key.startswith("attributed-audio/") for key in storage.blobs)
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+    # The stale token cannot recreate an artifact after this legacy endpoint's durable tombstone.
+    assert client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"},
+                       data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 409
+
+
+def test_legacy_delete_fences_old_token_before_its_first_object_delete():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "stale-token",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": 4, "sha256": hashlib.sha256(b"\0\0\0\0").hexdigest()}
+
+    class FenceProbeStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.probed = False
+
+        async def delete(self, key):
+            if not self.probed:
+                self.probed = True
+                assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+                from meeting_api.recordings.attributed import AttributedConflict, reserve_attributed_range
+                with pytest.raises(AttributedConflict):
+                    await reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta)
+            await super().delete(key)
+
+    probe = FenceProbeStorage(); probe.blobs.update(storage.blobs)
+    response = _client_for(repo, probe).delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200 and probe.probed
+
+
+def test_late_ack_cleanup_failure_retains_ledger_until_legacy_delete_retries_it():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    record = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                      data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "cleanup-retry",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+
+    class CleanupFailsOnce(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.fail_cleanup = True
+
+        async def upload(self, key, data, content_type=None):
+            await super().upload(key, data, content_type=content_type)
+            if key.startswith("attributed-audio/"):
+                repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+
+        async def delete(self, key):
+            if self.fail_cleanup and key.startswith("attributed-audio/"):
+                self.fail_cleanup = False
+                raise RuntimeError("compensating delete failed")
+            await super().delete(key)
+
+    retrying = CleanupFailsOnce(); retrying.blobs.update(storage.blobs)
+    from meeting_api.recordings.attributed import AttributedConflict, reserve_attributed_range, upload_reserved_attributed_range
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    with pytest.raises(AttributedConflict):
+        asyncio.run(upload_reserved_attributed_range(repo, retrying, token_meeting_id=MEETING_ID,
+                    session_uid=SESSION_UID, range_data=meta, data=pcm))
+    manifest = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+    assert manifest["ranges"][0]["state"] == "sealed"
+    assert manifest["ranges"][0]["storage_path"] == reserved["storage_path"]
+    assert reserved["storage_path"] in retrying.blobs
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+    deleted = _client_for(repo, retrying).delete(f"/recordings/{record['recording_id']}", headers={"x-user-id": str(USER)})
+    assert deleted.status_code == 200
+    assert reserved["storage_path"] not in retrying.blobs
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():

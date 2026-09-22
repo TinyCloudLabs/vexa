@@ -65,6 +65,18 @@ const jitterManifest = await jitter.stop();
 assert.equal(jitterManifest.ranges[0].audio_duration_ms, 512);
 assert.equal(jitterManifest.ranges[0].end_ms, 506);
 
+// The published 250ms callback-gap contract is shared with the route validator.  1250 and 1300
+// remain one truthful range; 1600 is a real gap and must become a second range before upload.
+for (const [captureMs, expected] of [[1_250, [[0, 350, 200]]], [1_300, [[0, 400, 200]]], [1_600, [[0, 100, 100], [600, 700, 100]]]] as const) {
+  const control = createAttributedAudioRecorder(`gap-${captureMs}`, memoryStore(), { cadenceMs: 5_000 });
+  await control.ready;
+  control.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms: 1_000, sample_rate: 1_000 });
+  control.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms: captureMs, sample_rate: 1_000 });
+  const controlManifest = await control.stop();
+  assert.deepEqual(controlManifest.ranges.map(range => [range.start_ms, range.end_ms, range.audio_duration_ms]), expected);
+  assert.equal(controlManifest.state, 'closed');
+}
+
 // Rejected audio is split into valid durable missing rows instead of creating one metadata body
 // too large for the server validator (4 MiB + 4 MiB + two samples with a four-byte PCM budget).
 const missingStore = memoryStore();
