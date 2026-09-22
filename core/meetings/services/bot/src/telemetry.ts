@@ -335,6 +335,11 @@ export function resolveMaxTapeBytes(
   return n;
 }
 
+/** Production diagnostic gate: identity's typed opt-in AND a positive operator cap are required. */
+export function captureSignalEnabled(inv: Pick<Invocation, 'captureSignalEnabled'>, rawCap?: string): boolean {
+  return inv.captureSignalEnabled === true && resolveMaxTapeBytes(rawCap) > 0;
+}
+
 /** Build the captured-signal.v1 SessionHeader for this invocation. */
 export function sessionHeader(inv: Invocation, startedAt: number): Record<string, unknown> {
   const header: Record<string, unknown> = {

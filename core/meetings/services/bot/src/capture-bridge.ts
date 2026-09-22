@@ -1494,10 +1494,17 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
-    await page.evaluate(async () => {
+    try {
+      await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
-      try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
-    }).catch(() => { /* page already gone */ });
+        await w.__vexaRecordingTap?.stop?.();
+      });
+    } catch (error) {
+      // The page producer, not the recording sink, knows that capture was incomplete. Carry that
+      // fact across the bridge before teardown so close() cannot add an is_final success marker.
+      recording.abort(error);
+      throw error;
+    }
   };
 }
 

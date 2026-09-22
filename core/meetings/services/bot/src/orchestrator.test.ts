@@ -225,6 +225,27 @@ async function main(): Promise<void> {
   // ── producer-owned event time: admission/runtime billing survives callback delay ──
   {
     const lc = recordingSink();
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join: mockJoin('admitted'),
+      pipeline: { async start() {}, async stop() { throw new Error('MediaRecorder stop timed out'); } },
+      acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+      recording: { async close() { throw new Error('recording producer overflow'); } },
+    });
+    const running = o.run();
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    const result = await running;
+    check('capture/recording teardown failure is failed, never completed', result.status === 'failed' && result.exitCode === 1);
+    check('capture/recording teardown failure remains observable on lifecycle',
+      last(lc.events).status === 'failed' && last(lc.events).failure_stage === 'active'
+        && last(lc.events).reason?.includes('recording/capture teardown failed') === true,
+      JSON.stringify(last(lc.events)));
+    check('capture/recording teardown failure never synthesizes a completed terminal', !seq(lc.events).includes('completed'));
+  }
+
+  // ── producer-owned event time: admission/runtime billing survives callback delay ──
+  {
+    const lc = recordingSink();
     const timestamps = [
       '2026-07-28T10:00:00.000Z',
       '2026-07-28T10:00:05.000Z',
@@ -332,9 +353,9 @@ async function main(): Promise<void> {
     check('pipeline-fail: events conform', allConform(lc.events));
   }
 
-  // A serialized upload retry must not consume the 20s signal watchdog and hide the leave or
-  // terminal event. Deliberate leave closes the browser in this fixture, so it also proves the
-  // failure observer is detached before teardown noise can rewrite a successful meeting.
+  // A stalled capture/recording teardown must not consume the watchdog or claim a completed
+  // recording. Deliberate leave closes the browser in this fixture, so it also proves the failure
+  // observer is detached before teardown noise can rewrite the attributable failed terminal.
   {
     const lc = recordingSink();
     let fireLeave: (a: { action: 'leave' }) => void = () => {};
@@ -357,9 +378,9 @@ async function main(): Promise<void> {
     const running = o.run({ pipelineStopMs: 5, recordingDrainMs: 5 });
     setTimeout(() => fireLeave({ action: 'leave' }), 5);
     const res = await running;
-    check('recording-drain: normal teardown is bounded and emits completed',
-      res.status === 'completed' && res.completionReason === 'stopped' && Date.now() - started < 500 && left === 1);
-    check('browser teardown noise: detached observer preserves completed terminal', detached && last(lc.events).status === 'completed');
+    check('recording-drain: incomplete teardown is bounded and emits failed',
+      res.status === 'failed' && Date.now() - started < 500 && left === 1);
+    check('browser teardown noise: detached observer preserves failed terminal', detached && last(lc.events).status === 'failed');
   }
 
   // An ordinary Stop may already be inside its long transcript drain when Docker sends SIGTERM.
@@ -383,8 +404,8 @@ async function main(): Promise<void> {
     await stopStarted;
     o.stop('stopped', true);
     const result = await running;
-    check('SIGTERM shortens an ordinary pipeline drain already in progress',
-      result.status === 'completed' && Date.now() - startedAt < 80,
+    check('SIGTERM shortens an incomplete pipeline drain and reports failure',
+      result.status === 'failed' && Date.now() - startedAt < 80,
       `elapsed=${Date.now() - startedAt} status=${result.status}`);
   }
 

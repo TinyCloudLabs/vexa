@@ -9,7 +9,7 @@ export function createResourceMonitor(opts: {
   nodeRss?: () => number;
   log?: (message: string) => void;
   intervalMs?: number;
-  retained?: () => Record<string, number | boolean>;
+  retained?: () => Record<string, number | boolean | string>;
 } = {}) {
   const read = opts.read ?? ((path: string) => readFileSync(path, 'utf8'));
   const contents = (path: string): string | undefined => {

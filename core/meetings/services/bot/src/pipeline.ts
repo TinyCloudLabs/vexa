@@ -85,7 +85,7 @@ export type TeamsTranscriber = Pick<
   | 'recordRosterName'
   | 'recordRosterCoverage'
   | 'dispose'
->;
+> & Partial<Pick<TeamsCsrcGmeetPipeline, 'resourceCounts'>>;
 export type TeamsTranscriberFactory = (options: TeamsCsrcGmeetPipelineOptions) => TeamsTranscriber;
 
 /** The Pipeline port extended with the capture entry the bridge pumps frames into. The
@@ -116,6 +116,8 @@ export interface BotPipeline extends Pipeline {
   recordRosterCoverage?(named: number, participants: number, tMs?: number): void;
   /** Mixed lane only: the cumulative hint-hop counters (undefined on the gmeet lane). */
   readonly hintCounters?: HintCounters;
+  /** Present only where the selected live-STT pipeline exposes an owned PCM measurement. */
+  resourceCounts?(): { retainedPcmBytes: number };
 }
 
 /** Recording-only meetings still capture page audio, but have no business creating turn timers,
@@ -309,6 +311,7 @@ function createGmeetBotPipeline(
     feedAudio: (channel, glowName, pcm, tsMs) => lane.feedAudio(channel, glowName, pcm, tsMs),
     feedMixedAudio() { /* not the gmeet lane */ },
     recordHint() { /* not the gmeet lane */ },
+    resourceCounts: () => lane.resourceCounts(),
   };
 }
 
@@ -357,6 +360,7 @@ function createTeamsBotPipeline(
     recordRosterName: (name, tMs) => transcriber.recordRosterName(name, tMs),
     recordRosterCoverage: (named, participants, tMs) => transcriber.recordRosterCoverage(named, participants, tMs),
     hintCounters,
+    ...(transcriber.resourceCounts ? { resourceCounts: () => transcriber.resourceCounts!() } : {}),
   };
 }
 
@@ -634,8 +638,18 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       const sc = stopCapture; stopCapture = null;
       if (sc) await sc().catch((e) => { onFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;
-      if (sr) await sr().catch(() => { /* best-effort — flush the final chunk → master assembly */ });
+      let recordingFailure: unknown;
+      if (sr) {
+        try { await sr(); }
+        catch (error) {
+          recordingFailure = error;
+          onFault('recording-start', error);
+        }
+      }
       await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
+      // An incomplete MediaRecorder delivery is not a degraded successful meeting. The
+      // orchestrator converts this to a failed terminal lifecycle event after all cleanup.
+      if (recordingFailure) throw recordingFailure;
     },
   };
 }

@@ -38,10 +38,11 @@ class FakeMediaRecorder {
   ondataavailable: ((e: any) => void) | null = null;
   onstop: (() => void) | null = null;
   state: 'inactive' | 'recording' | 'paused' = 'inactive';
+  pauseCalls = 0;
   mimeType: string;
   constructor(_stream: any, opts?: { mimeType?: string }) { this.mimeType = opts?.mimeType ?? ''; }
   start(_timeslice?: number) { this.state = 'recording'; this.onstart?.(); }
-  pause() { if (this.state === 'recording') this.state = 'paused'; }
+  pause() { this.pauseCalls++; if (this.state === 'recording') this.state = 'paused'; }
   resume() { if (this.state === 'paused') this.state = 'recording'; }
   stop() { this.state = 'inactive'; this.onstop?.(); }
   /** test helper — deliver a timeslice blob */
@@ -102,7 +103,8 @@ async function main() {
   }
 
   // A stalled bridge cannot turn MediaRecorder events into an unbounded promise chain. The first
-  // 12-byte blob owns the whole 16-byte budget; a forced second browser event fails terminally
+  // 8-byte blob is admitted and a following 17-byte browser Blob exceeds the 16-byte budget,
+  // failing terminally rather than dropping either admitted data or later claiming a final marker.
   // rather than dropping either admitted data or later claiming a final marker.
   let release: () => void = () => {};
   const stalled = new Promise<void>((resolve) => { release = resolve; });
@@ -113,8 +115,8 @@ async function main() {
   });
   await bounded.start();
   const boundedRecorder = bounded.getMediaRecorder() as unknown as FakeMediaRecorder;
-  boundedRecorder.emit(new Uint8Array(12));
-  boundedRecorder.emit(new Uint8Array(12)); // a UA event racing pause(): overflow is explicit
+  boundedRecorder.emit(new Uint8Array(8));
+  boundedRecorder.emit(new Uint8Array(17));
   await new Promise((resolve) => setTimeout(resolve, 0));
   const boundedCounts = bounded.resourceCounts();
   let overflowRejected = false;
@@ -122,6 +124,40 @@ async function main() {
   release();
   if (!boundedCounts.failed || boundedCounts.retainedBytes > 16 || !overflowRejected)
     fails.push(`stalled bridge was not terminally bounded (${JSON.stringify(boundedCounts)}, rejected=${overflowRejected})`);
+
+  // Delayed acknowledgements must not turn each successful upload into a MediaRecorder pause.
+  // Four 1-second content markers stand for a continuous four-second source; all are delivered
+  // after the delayed bridge ACKs, proving the recording did not silently lose the paused gaps.
+  const delayed: RecordingChunk[] = [];
+  const continuous = new MediaRecorderChunker({
+    stream: {} as any, maxPendingBytes: 128,
+    onChunk: async (chunk) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      delayed.push(chunk);
+      return true;
+    },
+  });
+  await continuous.start();
+  const continuousRecorder = continuous.getMediaRecorder() as unknown as FakeMediaRecorder;
+  for (let second = 0; second < 4; second++) continuousRecorder.emit(new Uint8Array([second, 0x55]));
+  await continuous.stop();
+  const capturedSeconds = delayed.filter((chunk) => !chunk.isFinal).length;
+  const contentPreserved = delayed.filter((chunk) => !chunk.isFinal)
+    .every((chunk, i) => decode(chunk.base64)[0] === i && decode(chunk.base64)[1] === 0x55);
+  if (continuousRecorder.pauseCalls !== 0 || capturedSeconds !== 4 || !contentPreserved)
+    fails.push(`delayed ACK broke continuous capture (pause=${continuousRecorder.pauseCalls}, seconds=${capturedSeconds}, content=${contentPreserved})`);
+
+  // A false acknowledgement of the completion signal is a producer failure, never a completed
+  // recording. The page bridge uses this exact false return for a rejected final upload.
+  const finalRejected = new MediaRecorderChunker({
+    stream: {} as any,
+    onChunk: async (chunk) => !chunk.isFinal,
+  });
+  await finalRejected.start();
+  let finalRejectObserved = false;
+  try { await finalRejected.stop(); } catch { finalRejectObserved = true; }
+  if (!finalRejectObserved || !finalRejected.resourceCounts().failed)
+    fails.push('false final acknowledgement did not fail the recording producer');
 
   console.log(`chunks: ${JSON.stringify(got.map((c) => ({ seq: c.chunkSeq, final: c.isFinal, bytes: decode(c.base64).length })))}`);
   if (fails.length) {

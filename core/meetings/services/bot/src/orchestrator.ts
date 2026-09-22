@@ -306,12 +306,20 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         if (timer) clearTimeout(timer);
       }
     };
+    let teardownFailure: Error | undefined;
+    const rememberTeardownFailure = (error: unknown): void => {
+      if (!teardownFailure) teardownFailure = error instanceof Error ? error : new Error(String(error));
+    };
     const stopPipeline = async (): Promise<void> => {
       const budgetMs = pipelineStopBudgetMs(signalBoundedTeardown, opts.pipelineStopMs);
       const signalBudgetMs = opts.signalPipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
       let normalTimer: ReturnType<typeof setTimeout> | undefined;
       let signalTimer: ReturnType<typeof setTimeout> | undefined;
-      const operation = deps.pipeline.stop().then(() => true).catch(() => true);
+      const operation = deps.pipeline.stop().then(() => true).catch((error) => {
+        console.error(`[bot] pipeline: stop failed: ${String(error)}`);
+        rememberTeardownFailure(error);
+        return true;
+      });
       const deadlines: Array<Promise<boolean>> = [
         new Promise<boolean>((resolve) => { normalTimer = setTimeout(() => resolve(false), budgetMs); }),
       ];
@@ -324,7 +332,11 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       }
       try {
         const settled = await Promise.race([operation, ...deadlines]);
-        if (!settled) console.error(`[bot] pipeline: stop deadline reached; continuing bounded teardown`);
+        if (!settled) {
+          const error = new Error(`pipeline stop deadline reached after ${budgetMs}ms`);
+          console.error(`[bot] ${error.message}; continuing bounded teardown`);
+          rememberTeardownFailure(error);
+        }
       } finally {
         if (normalTimer) clearTimeout(normalTimer);
         if (signalTimer) clearTimeout(signalTimer);
@@ -345,13 +357,16 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       try {
         const drained = await Promise.race([
           Promise.resolve(deps.recording.close(recordingKey)).then(() => true).catch((e) => {
-            console.error(`[bot] recording: close failed; completed chunks remain durable but queued chunks may be missing: ${String(e)}`);
+            console.error(`[bot] recording: close failed; recording remains incomplete: ${String(e)}`);
+            rememberTeardownFailure(e);
             return true;
           }),
           new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), budgetMs); }),
         ]);
         if (!drained) {
-          console.error(`[bot] recording: upload drain exceeded ${budgetMs}ms; completed chunks remain durable but queued chunks may be missing; continuing leave and terminal lifecycle`);
+          const error = new Error(`recording upload drain exceeded ${budgetMs}ms`);
+          console.error(`[bot] ${error.message}; recording remains incomplete`);
+          rememberTeardownFailure(error);
         }
       } finally {
         if (timer) clearTimeout(timer);
@@ -550,6 +565,15 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
     // assembly + the `completed` callback flush. Best-effort and capped to preserve watchdog slack.
     await leavePlatform(reason!);
+
+    if (teardownFailure) {
+      const failureReason = `recording/capture teardown failed: ${teardownFailure.message}`;
+      console.error(`[bot] orchestrator: ${failureReason}`);
+      await emit('failed', {
+        failure_stage: 'active', completion_reason: 'join_failure', reason: failureReason, exit_code: 1,
+      });
+      return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
+    }
 
     console.error(`[bot] orchestrator: emitting completed (reason=${reason}, from=${cur})`);
     try {

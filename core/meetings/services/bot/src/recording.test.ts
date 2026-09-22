@@ -184,6 +184,21 @@ async function main(): Promise<void> {
     check('empty session: close is a no-op (no upload)', seen.length === 0, String(seen.length));
   }
 
+  // ── 6b) page producer failure is terminal: close must not manufacture a final marker ─────────
+  {
+    const { seen, upload } = fakeUploader();
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: upload, maxRetainedBytes: 16 });
+    await sink.chunk('google_meet/overflow', 0, false, 'webm', new Uint8Array(8));
+    // Mirrors the real browser boundary: a following 17-byte Blob cannot fit the 16-byte budget.
+    sink.abort(new Error('recording producer overflow: 17B event exceeds 16B pending budget'));
+    let rejected = false;
+    try { await sink.close('google_meet/overflow'); } catch { rejected = true; }
+    check('producer overflow: bridge/sink close rejects truthfully', rejected && sink.resourceCounts().failed,
+      JSON.stringify(sink.resourceCounts()));
+    check('producer overflow: no synthetic successful final marker follows the accepted seq0',
+      seen.length === 1 && !seen[0].isFinal && seen[0].len === 8, JSON.stringify(seen));
+  }
+
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
     interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number }
