@@ -37,10 +37,12 @@ class FakeMediaRecorder {
   onstart: (() => void) | null = null;
   ondataavailable: ((e: any) => void) | null = null;
   onstop: (() => void) | null = null;
-  state: 'inactive' | 'recording' = 'inactive';
+  state: 'inactive' | 'recording' | 'paused' = 'inactive';
   mimeType: string;
   constructor(_stream: any, opts?: { mimeType?: string }) { this.mimeType = opts?.mimeType ?? ''; }
   start(_timeslice?: number) { this.state = 'recording'; this.onstart?.(); }
+  pause() { if (this.state === 'recording') this.state = 'paused'; }
+  resume() { if (this.state === 'paused') this.state = 'recording'; }
   stop() { this.state = 'inactive'; this.onstop?.(); }
   /** test helper — deliver a timeslice blob */
   emit(bytes: Uint8Array, delayMs = 0) { this.ondataavailable?.({ data: new FakeBlob(bytes, delayMs) }); }
@@ -98,6 +100,28 @@ async function main() {
     if (!cF.isFinal) fails.push('final chunk isFinal=false (want true)');
     if (cF.base64 !== '') fails.push(`final chunk body=${JSON.stringify(cF.base64)} (want empty)`);
   }
+
+  // A stalled bridge cannot turn MediaRecorder events into an unbounded promise chain. The first
+  // 12-byte blob owns the whole 16-byte budget; a forced second browser event fails terminally
+  // rather than dropping either admitted data or later claiming a final marker.
+  let release: () => void = () => {};
+  const stalled = new Promise<void>((resolve) => { release = resolve; });
+  const bounded = new MediaRecorderChunker({
+    stream: {} as any,
+    maxPendingBytes: 16,
+    onChunk: async () => { await stalled; return true; },
+  });
+  await bounded.start();
+  const boundedRecorder = bounded.getMediaRecorder() as unknown as FakeMediaRecorder;
+  boundedRecorder.emit(new Uint8Array(12));
+  boundedRecorder.emit(new Uint8Array(12)); // a UA event racing pause(): overflow is explicit
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const boundedCounts = bounded.resourceCounts();
+  let overflowRejected = false;
+  try { await bounded.stop(); } catch { overflowRejected = true; }
+  release();
+  if (!boundedCounts.failed || boundedCounts.retainedBytes > 16 || !overflowRejected)
+    fails.push(`stalled bridge was not terminally bounded (${JSON.stringify(boundedCounts)}, rejected=${overflowRejected})`);
 
   console.log(`chunks: ${JSON.stringify(got.map((c) => ({ seq: c.chunkSeq, final: c.isFinal, bytes: decode(c.base64).length })))}`);
   if (fails.length) {
