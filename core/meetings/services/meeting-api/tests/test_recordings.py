@@ -8,6 +8,12 @@ session-resolution seams behave.
 from __future__ import annotations
 
 import pytest
+import asyncio
+import hashlib
+import httpx
+import json
+from pathlib import Path
+import subprocess
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -65,6 +71,235 @@ def _client_for(repo, storage):
     return TestClient(app)
 
 
+def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
+    """The actual HTTP bot/store/read path, not a disconnected sink fake."""
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    pcm = b"\x00\x00\x80?\x00\x00\x00@"
+    meta = {
+        "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
+        "speaker_key": "gmeet:3", "speaker_name": "Alice", "channel": 3, "turn_generation": 1,
+        "attribution": {"source": "glow-bound", "confidence": 1}, "clock_origin_ms": 1700000000000,
+        "start_ms": 0, "end_ms": 0.125, "audio_duration_ms": 0.125,
+        "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
+        "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+    }
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    request = lambda value=meta, body=pcm: client.post(
+        "/internal/attributed-audio/upload", headers={"authorization": f"Bearer {token}"},
+        data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)},
+        files={"file": ("range.pcm", body, "application/octet-stream")},
+    )
+    reserve = lambda value=meta: client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"}, data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)})
+    assert reserve().status_code == 200
+    first = request(); assert first.status_code == 200
+    assert first.json()["path"] == "/meetings/1/attributed-audio/ranges/0"
+    assert request().json() == first.json(), "same idempotency + checksum is a successful retry"
+    altered = dict(meta); altered["sha256"] = hashlib.sha256(b"other").hexdigest(); altered["byte_count"] = 5
+    assert reserve(altered).status_code == 409
+    closed = client.post("/internal/attributed-audio/close", headers={"authorization": f"Bearer {token}"},
+                         data={"session_uid": SESSION_UID})
+    assert closed.status_code == 200 and closed.json()["state"] == "closed"
+    assert closed.json()["clock_origin"] == "first_admitted_capture_epoch_ms"
+    detail = client.get("/meetings/1/attributed-audio", headers={"x-user-id": str(USER)})
+    assert detail.status_code == 200 and "storage_path" not in detail.text
+    assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER)}).content == pcm
+    ranged = client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER), "range": "bytes=0-3"})
+    assert ranged.status_code == 206 and ranged.content == pcm[:4]
+    assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
+
+
+def test_attributed_fences_late_upload_and_uses_sample_clock_with_jitter():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    pcm = b"\0" * (4096 * 2 * 4)
+    meta = {
+        "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "jitter",
+        "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+        "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1000,
+        # Two 4096/16k callbacks at 1000 and 1250ms span 506ms while sample time is 512ms.
+        "start_ms": 0, "end_ms": 506, "audio_duration_ms": 512,
+        "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
+        "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+    }
+    headers = {"authorization": f"Bearer {token}"}
+    post = lambda route, value=meta, body=None: client.post(route, headers=headers, data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)}, files={} if body is None else {"file": ("range.pcm", body, "application/octet-stream")})
+    assert post("/internal/attributed-audio/reserve").status_code == 200
+    assert post("/internal/attributed-audio/fail").status_code == 200
+    assert client.post("/internal/attributed-audio/close", headers=headers, data={"session_uid": SESSION_UID}).status_code == 200
+    # A closed failed ledger cannot be resurrected by a delayed multipart request.
+    assert post("/internal/attributed-audio/upload", body=pcm).status_code == 409
+    stored = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+    assert stored["state"] == "closed" and stored["ranges"][0]["state"] == "failed"
+
+    gap = dict(meta, idempotency_key="real-gap", sequence=1, end_ms=800)
+    # A genuine gap cannot be smuggled through the HTTP endpoint as one stretched range.
+    assert post("/internal/attributed-audio/reserve", gap).status_code == 409
+
+
+def test_attributed_route_closes_the_published_callback_gap_controls():
+    """The Python route admits the same 250ms merge boundary as the TS recorder."""
+    pcm = b"\0" * (100 * 2 * 4)
+    for capture_ms, expected_rows in ((1250, 1), (1300, 1), (1600, 2)):
+        repo, storage = _seeded()
+        client = _client_for(repo, storage)
+        token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+        headers = {"authorization": f"Bearer {token}"}
+        rows = [{
+            "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": f"gap-{capture_ms}-0",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1000,
+            "start_ms": 0, "end_ms": capture_ms - 1000 + 100, "audio_duration_ms": 200,
+            "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+        }]
+        if capture_ms == 1600:
+            rows = [
+                {**rows[0], "end_ms": 100, "audio_duration_ms": 100, "byte_count": len(pcm) // 2,
+                 "sha256": hashlib.sha256(pcm[:len(pcm) // 2]).hexdigest()},
+                {**rows[0], "sequence": 1, "idempotency_key": f"gap-{capture_ms}-1", "turn_generation": 2,
+                 "start_ms": 600, "end_ms": 700, "audio_duration_ms": 100, "byte_count": len(pcm) // 2,
+                 "sha256": hashlib.sha256(pcm[len(pcm) // 2:]).hexdigest()},
+            ]
+        for row in rows:
+            response = client.post("/internal/attributed-audio/reserve", headers=headers,
+                                   data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert response.status_code == 200
+            response = client.post("/internal/attributed-audio/fail", headers=headers,
+                                   data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert response.status_code == 200
+        closed = client.post("/internal/attributed-audio/close", headers=headers,
+                             data={"session_uid": SESSION_UID,
+                                   "admitted_sequences": json.dumps(list(range(expected_rows)))})
+        assert closed.status_code == 200 and closed.json()["state"] == "closed"
+
+
+def test_python_routes_accept_exact_ts_recorder_metadata_for_cumulative_callback_gaps():
+    """Drive the real recorder's rows over the Python reserve/fail/close HTTP protocol."""
+    script = """
+import { createAttributedAudioRecorder } from './src/attributed-audio.ts';
+void (async () => {
+  const controls = [[1000, 1250], [1000, 1300], [1000, 1600], [1000, 1300, 1600, 1900, 2200]];
+  const output = [];
+  for (const times of controls) {
+    const rows = [];
+    const store = {
+      reserve: async range => { rows.push(structuredClone(range)); return { ...range, state: 'sealed' }; },
+      upload: async range => ({ path: `/meetings/1/attributed-audio/ranges/${range.sequence}` }),
+      fail: async range => ({ ...range, state: 'failed' }),
+      close: async () => {},
+    };
+    const recorder = createAttributedAudioRecorder('1', store, { cadenceMs: 5000 });
+    await recorder.ready;
+    for (const capture_ms of times) recorder.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms, sample_rate: 1000 });
+    await recorder.stop();
+    output.push(rows);
+  }
+  console.log(JSON.stringify(output));
+})();
+"""
+    root = Path(__file__).resolve().parents[5]
+    generated = subprocess.run(
+        ["pnpm", "--filter", "@vexa/gmeet-pipeline", "exec", "tsx", "--eval", script],
+        cwd=root, check=True, capture_output=True, text=True,
+    )
+    controls = json.loads(generated.stdout)
+    assert [len(rows) for rows in controls] == [1, 1, 2, 3]
+
+    for rows in controls:
+        repo, storage = _seeded()
+        client = _client_for(repo, storage)
+        token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+        headers = {"authorization": f"Bearer {token}"}
+        for row in rows:
+            reserve = client.post("/internal/attributed-audio/reserve", headers=headers,
+                                  data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert reserve.status_code == 200, reserve.text
+            failed = client.post("/internal/attributed-audio/fail", headers=headers,
+                                 data={"session_uid": SESSION_UID, "range_metadata": json.dumps(row)})
+            assert failed.status_code == 200, failed.text
+        closed = client.post("/internal/attributed-audio/close", headers=headers,
+                             data={"session_uid": SESSION_UID,
+                                   "admitted_sequences": json.dumps([row["sequence"] for row in rows])})
+        assert closed.status_code == 200, closed.text
+
+
+def test_attributed_deletion_fences_reservation_upload_and_empty_close_clock():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    headers = {"authorization": f"Bearer {token}"}
+    # A silent close is still schema-valid: numeric 0 explicitly means no capture was admitted.
+    empty = client.post("/internal/attributed-audio/close", headers=headers, data={"session_uid": SESSION_UID})
+    assert empty.status_code == 200 and empty.json()["clock_origin_ms"] == 0
+    import jsonschema
+    schema_path = __file__.split("/core/meetings/")[0] + "/core/meetings/contracts/attributed-audio.v1/attributed-audio.schema.json"
+    jsonschema.Draft202012Validator(json.load(open(schema_path))).validate(empty.json())
+
+    # A deletion tombstone is a write fence, including a missing manifest (which must not be
+    # recreated by a delayed bot/restart request).
+    repo, storage = _seeded(); client = _client_for(repo, storage)
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "fenced",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+    response = client.post("/internal/attributed-audio/reserve", headers=headers,
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)})
+    assert response.status_code == 409
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
+
+
+def test_attributed_reservation_persists_key_and_late_ack_deletes_object():
+    repo, storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "late-ack",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import reserve_attributed_range, upload_reserved_attributed_range, AttributedConflict
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    assert reserved["storage_path"].startswith(f"attributed-audio/{USER}/{MEETING_ID}/")
+
+    class DeleteDuringUpload(InMemoryStorage):
+        async def upload(self, key, data, content_type=None):
+            await super().upload(key, data, content_type=content_type)
+            repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+
+    racing = DeleteDuringUpload()
+    with pytest.raises(AttributedConflict):
+        asyncio.run(upload_reserved_attributed_range(repo, racing, token_meeting_id=MEETING_ID,
+                    session_uid=SESSION_UID, range_data=meta, data=pcm))
+    assert racing.blobs == {}, "an upload whose acknowledgement loses to deletion cannot orphan PCM"
+
+
+def test_restart_failure_retains_reservation_key_until_legacy_delete_cleans_put_crash():
+    """reserve -> PUT crash -> restart fail -> close -> DELETE leaves no deterministic object."""
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "put-crash",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import close_attributed_manifest, fail_reserved_attributed_range, reserve_attributed_range
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    asyncio.run(storage.upload(reserved["storage_path"], pcm, content_type="application/octet-stream"))
+    failed = asyncio.run(fail_reserved_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    assert failed["storage_path"] == reserved["storage_path"]
+    asyncio.run(close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID))
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    response = _client_for(repo, storage).delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200
+    assert reserved["storage_path"] not in storage.blobs
+
+
 def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     repo, storage = _seeded()
     repo._meetings[MEETING_ID]["status"] = "completed"
@@ -84,6 +319,259 @@ def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     assert deleted.json()["scope"] == "primary_object_storage"
     assert storage.blobs == {}
     assert asyncio.run(repo.get_recordings(MEETING_ID)) == []
+
+
+def test_completed_artifact_delete_removes_attributed_pcm_and_manifest():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    pcm = b"\x00\x00\x80?"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    client = _client_for(repo, storage)
+    assert client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"},
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 200
+    response = client.post("/internal/attributed-audio/upload", headers={"authorization": f"Bearer {token}"},
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+                           files={"file": ("range.pcm", pcm, "application/octet-stream")})
+    assert response.status_code == 200
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    assert client.delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)}).status_code == 200
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID].get("data", {})
+    assert not any(key.startswith("attributed-audio/") for key in storage.blobs)
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+    # The stale token cannot recreate an artifact after this legacy endpoint's durable tombstone.
+    assert client.post("/internal/attributed-audio/reserve", headers={"authorization": f"Bearer {token}"},
+                       data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 409
+
+
+def test_legacy_delete_fences_old_token_before_its_first_object_delete():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    receipt = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                       data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "stale-token",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": 4, "sha256": hashlib.sha256(b"\0\0\0\0").hexdigest()}
+
+    class FenceProbeStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.probed = False
+
+        async def delete(self, key):
+            if not self.probed:
+                self.probed = True
+                assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+                from meeting_api.recordings.attributed import AttributedConflict, reserve_attributed_range
+                with pytest.raises(AttributedConflict):
+                    await reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta)
+            await super().delete(key)
+
+    probe = FenceProbeStorage(); probe.blobs.update(storage.blobs)
+    response = _client_for(repo, probe).delete(f"/recordings/{receipt['recording_id']}", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200 and probe.probed
+
+
+def test_late_ack_cleanup_failure_retains_ledger_until_legacy_delete_retries_it():
+    repo, storage = _seeded()
+    repo._meetings[MEETING_ID]["status"] = "completed"
+    record = asyncio.run(upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                                      data=_wav(), media_format="wav", chunk_seq=0, is_final=True))
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "cleanup-retry",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+
+    class CleanupFailsOnce(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.fail_cleanup = True
+
+        async def upload(self, key, data, content_type=None):
+            await super().upload(key, data, content_type=content_type)
+            if key.startswith("attributed-audio/"):
+                repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+
+        async def delete(self, key):
+            if self.fail_cleanup and key.startswith("attributed-audio/"):
+                self.fail_cleanup = False
+                raise RuntimeError("compensating delete failed")
+            await super().delete(key)
+
+    retrying = CleanupFailsOnce(); retrying.blobs.update(storage.blobs)
+    from meeting_api.recordings.attributed import AttributedConflict, reserve_attributed_range, upload_reserved_attributed_range
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    with pytest.raises(AttributedConflict):
+        asyncio.run(upload_reserved_attributed_range(repo, retrying, token_meeting_id=MEETING_ID,
+                    session_uid=SESSION_UID, range_data=meta, data=pcm))
+    manifest = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+    assert manifest["ranges"][0]["state"] == "sealed"
+    assert manifest["ranges"][0]["storage_path"] == reserved["storage_path"]
+    assert reserved["storage_path"] in retrying.blobs
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+    deleted = _client_for(repo, retrying).delete(f"/recordings/{record['recording_id']}", headers={"x-user-id": str(USER)})
+    assert deleted.status_code == 200
+    assert reserved["storage_path"] not in retrying.blobs
+    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
+
+
+async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_retry():
+    """Public deletes retain a late rejected PUT's ledger until their retry deletes its object."""
+    from meeting_api import create_app
+    from meeting_api.collector.fakes import InMemoryTranscriptStore
+
+    class SharedRepo(InMemoryTranscriptStore):
+        def __init__(self):
+            super().__init__()
+            self.sessions = {SESSION_UID: MEETING_ID}
+            self.finalization_reached = asyncio.Event()
+            self.release_finalization = asyncio.Event()
+
+        async def find_session(self, session_uid):
+            meeting_id = self.sessions.get(session_uid)
+            return None if meeting_id is None else {"meeting_id": meeting_id, "session_uid": session_uid}
+
+        async def owner_of(self, meeting_id):
+            meeting = self._meetings.get(meeting_id)
+            return meeting.get("user_id") if meeting else None
+
+        async def mutate_meeting_data(self, meeting_id, mutator):
+            meeting = self._meetings[meeting_id]
+            next_data, result = mutator(dict(meeting.get("data") or {}))
+            meeting["data"] = dict(next_data)
+            return result
+
+        async def prepare_recording_deletion(self, user_id, recording_id):
+            meeting = self._meetings.get(MEETING_ID)
+            if not meeting or meeting["user_id"] != user_id:
+                return None
+            if meeting["status"] not in ("completed", "failed"):
+                return {"error": "conflict"}
+            recordings = list(meeting["data"].get("recordings") or [])
+            recording = next((row for row in recordings if row.get("id") == recording_id), None)
+            if recording is None:
+                return None
+            prepared = {**recording, "deletion_pending": True, "meeting_id": MEETING_ID}
+            meeting["data"] = {**meeting["data"], "recordings": [
+                prepared if row.get("id") == recording_id else row for row in recordings
+            ]}
+            return prepared
+
+        async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None):
+            self.finalization_reached.set()
+            await self.release_finalization.wait()
+            return await super().finalize_completed_artifact_deletion(
+                user_id, meeting_id, cleanup_plan
+            )
+
+    class SuspendedPutStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.before_write = asyncio.Event()
+            self.release_write = asyncio.Event()
+            self.before_compensation = asyncio.Event()
+            self.release_compensation = asyncio.Event()
+            self.fail_compensation = True
+
+        async def upload(self, key, data, content_type=None):
+            if key.startswith("attributed-audio/"):
+                self.before_write.set()
+                await self.release_write.wait()
+            await super().upload(key, data, content_type=content_type)
+
+        async def delete(self, key):
+            # The legacy delete sees no object before the PUT releases. Pause its rejected
+            # acknowledgement's compensating delete until the meeting delete has snapshotted.
+            if key.startswith("attributed-audio/") and key in self.blobs and self.fail_compensation:
+                self.before_compensation.set()
+                await self.release_compensation.wait()
+                self.fail_compensation = False
+                raise RuntimeError("first compensating delete failed")
+            await super().delete(key)
+
+    recording_id = 9001
+    repo, storage = SharedRepo(), SuspendedPutStorage()
+    repo.seed_meeting(
+        meeting_id=MEETING_ID, user_id=USER, platform="google_meet", native_meeting_id="abc-defg-hij",
+        status="completed", data={"recordings": [{"id": recording_id, "user_id": USER,
+        "meeting_id": MEETING_ID, "session_uid": SESSION_UID, "media_files": []}]},
+    )
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "completed-race",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
+            "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    app = create_app(transcript_store=repo, recording_repo=repo, storage=storage, token_secret=SECRET)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    bot_headers = {"authorization": f"Bearer {token}"}
+    owner_headers = {"x-user-id": str(USER)}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        reserved = await client.post(
+            "/internal/attributed-audio/reserve", headers=bot_headers,
+            data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+        )
+        assert reserved.status_code == 200
+        key = reserved.json()["storage_path"]
+
+        put = asyncio.create_task(client.post(
+            "/internal/attributed-audio/upload", headers=bot_headers,
+            data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+            files={"file": ("range.pcm", pcm, "application/octet-stream")},
+        ))
+        deleting_meeting = None
+        try:
+            await asyncio.wait_for(storage.before_write.wait(), timeout=1)
+            # Exact public legacy route: it completes before the delayed PUT writes any object.
+            assert (await client.delete(
+                f"/recordings/{recording_id}", headers=owner_headers
+            )).status_code == 200
+            storage.release_write.set()
+            await asyncio.wait_for(storage.before_compensation.wait(), timeout=1)
+            # Exact public completed-meeting route snapshots the now-empty plan and reaches finalization.
+            deleting_meeting = asyncio.create_task(client.delete(
+                f"/meetings/{MEETING_ID}", headers=owner_headers
+            ))
+            await asyncio.wait_for(repo.finalization_reached.wait(), timeout=1)
+            storage.release_compensation.set()
+            put_response = await asyncio.wait_for(put, timeout=1)
+        finally:
+            storage.release_write.set()
+            storage.release_compensation.set()
+            repo.release_finalization.set()
+
+        assert deleting_meeting is not None
+        meeting_response = await asyncio.wait_for(deleting_meeting, timeout=1)
+
+        assert put_response.status_code == 409, put_response.text
+        assert meeting_response.status_code == 204, meeting_response.text
+
+        retained = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+        assert retained["state"] == "closed"
+        assert retained["ranges"][0]["storage_path"] == key
+        assert key in storage.blobs
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+
+        # The public retry sees that durable evidence, removes the late object and ledger, and remains
+        # idempotent without allowing either to reappear.
+        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
+        assert key not in storage.blobs
+        assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
+        assert key not in storage.blobs
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():

@@ -193,6 +193,33 @@ class SqlAlchemyRecordingRepo:
             await db.commit()
             return result
 
+    async def mutate_meeting_data(self, meeting_id, mutator):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        async with self._session_factory() as db:
+            m = await self._meeting(db, meeting_id)
+            if m is None:
+                raise KeyError(meeting_id)
+            data = dict(m.data) if isinstance(m.data, dict) else {}
+            next_data, result = mutator(data)
+            m.data = dict(next_data)
+            flag_modified(m, "data")
+            await db.commit()
+            return result
+
+    async def attributed_manifest_for_owner(self, user_id, meeting_id):
+        from sqlalchemy import select
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            m = (await db.execute(select(Meeting).where(
+                Meeting.id == meeting_id, Meeting.user_id == user_id
+            ))).scalars().first()
+            if m is None or not isinstance(m.data, dict):
+                return None
+            value = m.data.get("attributed_audio_manifest")
+            return dict(value) if isinstance(value, dict) else None
+
     async def owner_of(self, meeting_id):
         from sqlalchemy import select
 

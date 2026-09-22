@@ -16,4 +16,6 @@ export { SpeakerStreamManager } from './speaker-streams.js';
 export type { SpeakerStreamManagerConfig } from './speaker-streams.js';
 export { isHallucination } from './hallucination-filter.js';
 export { setLogger } from './log.js';
+export { createAttributedAudioSink, createAttributedAudioRecorder, ATTRIBUTED_AUDIO_VERSION, DEFAULT_PCM_BUDGET_BYTES, ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS } from './attributed-audio.js';
+export type { AttributedAudioManifest, AttributedAudioRange, AttributedAudioStore, AttributedAudioFrame } from './attributed-audio.js';
 export type { TranscriptSegment, TranscriptSink, TimestampedWord, TranscriptMeta, Source } from './contracts/transcript-v1.js';

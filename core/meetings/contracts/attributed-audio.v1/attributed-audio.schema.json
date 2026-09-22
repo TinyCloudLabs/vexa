@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/attributed-audio.v1",
+  "title": "attributed-audio.v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["version", "meeting_id", "clock_origin", "clock_origin_ms", "state", "ranges"],
+  "properties": {
+    "version": {"const": 1}, "meeting_id": {"type": "string"},
+    "clock_origin": {"const": "first_admitted_capture_epoch_ms", "description": "Epoch of the first admitted capture; a closed manifest with no admitted capture uses numeric 0."},
+    "clock_origin_ms": {"type": "number", "minimum": 0, "description": "0 is the deterministic no-capture origin for a silent closed manifest."},
+    "state": {"enum": ["open", "closed"]}, "ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}}
+  },
+  "$defs": {"range": {"type": "object", "additionalProperties": false,
+    "required": ["version", "meeting_id", "sequence", "idempotency_key", "speaker_key", "speaker_name", "channel", "turn_generation", "attribution", "clock_origin_ms", "start_ms", "end_ms", "audio_duration_ms", "codec", "sample_rate", "channels", "byte_count", "sha256", "state"],
+    "properties": {
+      "version": {"const": 1}, "meeting_id": {"type": "string"}, "sequence": {"type": "integer", "minimum": 0}, "idempotency_key": {"type": "string", "minLength": 1},
+      "speaker_key": {"type": "string", "minLength": 1}, "speaker_name": {"type": "string"}, "channel": {"type": "integer", "minimum": 0}, "turn_generation": {"type": "integer", "minimum": 1},
+      "attribution": {"type": "object", "additionalProperties": false, "required": ["source", "confidence"], "properties": {"source": {"enum": ["glow-bound", "provisional", "unresolved"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}}},
+      "clock_origin_ms": {"type": "number", "minimum": 0}, "start_ms": {"type": "number", "minimum": 0}, "end_ms": {"type": "number", "minimum": 0}, "audio_duration_ms": {"type": "number", "minimum": 0},
+      "codec": {"const": "pcm_f32le"}, "sample_rate": {"type": "integer", "minimum": 1}, "channels": {"const": 1}, "byte_count": {"type": "integer", "minimum": 0},
+      "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "state": {"enum": ["sealed", "uploaded", "failed"]}, "path": {"type": "string", "pattern": "^/meetings/[0-9]+/attributed-audio/ranges/[0-9]+$"}
+    }
+  }}
+}

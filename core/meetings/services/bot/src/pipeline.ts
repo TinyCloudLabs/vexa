@@ -516,7 +516,7 @@ export function createBotPipeline(
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */
-export type LiveStage = 'capture-start' | 'recording-start' | 'engine-start';
+export type LiveStage = 'capture-start' | 'capture-stop' | 'recording-start' | 'engine-start';
 
 /**
  * Serialize a thrown value for a LOG LINE (#593 A1). Prefer the stack (names the throwing frame),
@@ -617,7 +617,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       const sc = stopCapture; stopCapture = null;
-      if (sc) await sc().catch(() => { /* best-effort — page may be closing */ });
+      if (sc) await sc().catch((e) => { onFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;
       if (sr) await sr().catch(() => { /* best-effort — flush the final chunk → master assembly */ });
       await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });

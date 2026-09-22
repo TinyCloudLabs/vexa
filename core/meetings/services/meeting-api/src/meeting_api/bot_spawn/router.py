@@ -107,6 +107,15 @@ def _resolve_transcribe_enabled(value: Optional[object]) -> bool:
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _resolve_attributed_audio_enabled(value: Optional[object]) -> bool:
+    """Explicit, opt-in canonical capture capability; it never inherits STT state."""
+    try:
+        return resolve_spawn_flag("ATTRIBUTED_AUDIO_ENABLED", value, default=False,
+                                  field="attributed_audio_enabled")
+    except InvalidFlagValue as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 def _resolve_automatic_leave(value: Optional[object]) -> dict:
     """Translate the public snake_case timeout names into invocation.v1's camelCase shape.
 
@@ -469,6 +478,7 @@ def build_router(
                 transcription_tier=body.get("transcription_tier", "realtime"),
                 recording_enabled=_resolve_recording_enabled(body.get("recording_enabled")),
                 transcribe_enabled=transcribe_enabled,
+                attributed_audio_enabled=_resolve_attributed_audio_enabled(body.get("attributed_audio_enabled")),
                 automatic_leave=_resolve_automatic_leave(body.get("automatic_leave")),
                 # P3c — continue_meeting is accepted off the OPEN api.v1 request body (MeetingCreate
                 # has no additionalProperties:false), so the wire is not rejected; documenting it as

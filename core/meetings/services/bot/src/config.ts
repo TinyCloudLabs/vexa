@@ -81,6 +81,9 @@ export interface Invocation {
   // ── recording ──
   recordingEnabled?: boolean;
   captureSignalEnabled?: boolean;
+  attributedAudioEnabled?: boolean;
+  attributedAudioUploadUrl?: string;
+  attributedAudioRequiredVersion?: number;
   captureModes?: string[];
   recordingUploadUrl?: string;
   // ── lifecycle timeouts ──

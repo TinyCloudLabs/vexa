@@ -29,6 +29,28 @@ from .service import (
     upload_chunk,
     upload_signal_tape,
 )
+from .attributed import (
+    AttributedConflict, attributed_manifest_for_owner, attributed_range_for_owner, close_attributed_manifest,
+    attributed_manifest_for_session, fail_reserved_attributed_range, reserve_attributed_range,
+    upload_reserved_attributed_range,
+)
+
+MAX_ATTRIBUTED_AUDIO_REQUEST_BYTES = 32 * 1024 * 1024
+
+
+async def _read_attributed_body(file: UploadFile) -> bytes:
+    """Bound multipart payload while it is read, before an application-owned full body exists."""
+    parts: list[bytes] = []
+    total = 0
+    while True:
+        part = await file.read(64 * 1024)
+        if not part:
+            break
+        total += len(part)
+        if total > MAX_ATTRIBUTED_AUDIO_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="attributed PCM body exceeds 32 MiB")
+        parts.append(part)
+    return b"".join(parts)
 
 
 #: Default page size for ``GET /recordings``. The route used to have none: it answered with every
@@ -265,6 +287,104 @@ def build_router(
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
         return JSONResponse(content=receipt)
+
+    async def _attributed_auth(authorization: Optional[str]) -> Optional[int]:
+        bearer = _bearer_token(authorization)
+        internal_secret = os.getenv("INTERNAL_API_SECRET")
+        if internal_secret and bearer == internal_secret: return None
+        try: return int(_verify_meeting_token(bearer, secret=token_secret)["meeting_id"])
+        except ValueError as e: raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+
+    def _attributed_metadata(range_metadata: str) -> dict:
+        try: range_data = json.loads(range_metadata)
+        except (ValueError, TypeError): raise HTTPException(status_code=422, detail="range_metadata must be JSON")
+        if not isinstance(range_data, dict): raise HTTPException(status_code=422, detail="range_metadata must be an object")
+        return range_data
+
+    @router.get("/internal/attributed-audio/manifest", include_in_schema=False)
+    async def internal_attributed_audio_manifest(session_uid: str, authorization: Optional[str] = Header(default=None)):
+        try: return JSONResponse(content=await attributed_manifest_for_session(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid))
+        except AttributedConflict as e: raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e: raise HTTPException(status_code=404, detail=str(e))
+
+    @router.post("/internal/attributed-audio/reserve", include_in_schema=False)
+    async def internal_reserve_attributed_audio(
+        session_uid: str = Form(...),
+        range_metadata: str = Form(...),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        try:
+            receipt = await reserve_attributed_range(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata))
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/upload", include_in_schema=False)
+    async def internal_upload_attributed_audio(file: UploadFile = File(...), session_uid: str = Form(...), range_metadata: str = Form(...), authorization: Optional[str] = Header(default=None)):
+        try:
+            receipt = await upload_reserved_attributed_range(repo, storage, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata), data=await _read_attributed_body(file))
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"attributed PCM upload failed: {e}")
+        return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/fail", include_in_schema=False)
+    async def internal_fail_attributed_audio(session_uid: str = Form(...), range_metadata: str = Form(...), authorization: Optional[str] = Header(default=None)):
+        try: return JSONResponse(content=await fail_reserved_attributed_range(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata)))
+        except AttributedConflict as e: raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e: raise HTTPException(status_code=404, detail=str(e))
+
+    @router.post("/internal/attributed-audio/close", include_in_schema=False)
+    async def internal_close_attributed_audio(
+        session_uid: str = Form(...),
+        admitted_sequences: Optional[str] = Form(None),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        try:
+            expected = json.loads(admitted_sequences) if admitted_sequences else []
+            if not isinstance(expected, list):
+                raise AttributedConflict("admitted_sequences must be a JSON array")
+            return JSONResponse(content=await close_attributed_manifest(
+                repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, expected_sequences=expected,
+            ))
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @router.get("/meetings/{meeting_id}/attributed-audio")
+    async def get_attributed_audio_manifest(
+        meeting_id: int, x_user_id: Optional[str] = Header(default=None),
+    ):
+        try:
+            return JSONResponse(content=await attributed_manifest_for_owner(
+                repo, user_id=_resolve_user_id(x_user_id), meeting_id=meeting_id,
+            ))
+        except SessionNotFound:
+            raise HTTPException(status_code=404, detail="attributed audio manifest not found")
+
+    @router.get("/meetings/{meeting_id}/attributed-audio/ranges/{sequence}")
+    async def get_attributed_audio_range(
+        meeting_id: int, sequence: int, request: Request, x_user_id: Optional[str] = Header(default=None),
+    ):
+        try:
+            data = await attributed_range_for_owner(
+                repo, storage, user_id=_resolve_user_id(x_user_id), meeting_id=meeting_id, sequence=sequence,
+            )
+        except SessionNotFound:
+            raise HTTPException(status_code=404, detail="attributed audio range not found")
+        rng = _parse_range(request.headers.get("range"), len(data))
+        if rng is None:
+            return Response(content=data, media_type="application/octet-stream", headers={"Accept-Ranges": "bytes"})
+        start, end = rng
+        return Response(content=data[start:end + 1], status_code=206, media_type="application/octet-stream", headers={
+            "Accept-Ranges": "bytes", "Content-Range": f"bytes {start}-{end}/{len(data)}",
+        })
 
     @router.get("/recordings")
     async def list_recordings(
