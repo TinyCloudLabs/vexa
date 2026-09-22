@@ -102,28 +102,36 @@ async function main() {
     if (cF.base64 !== '') fails.push(`final chunk body=${JSON.stringify(cF.base64)} (want empty)`);
   }
 
-  // A stalled bridge cannot turn MediaRecorder events into an unbounded promise chain. The first
-  // 8-byte blob is admitted and a following 17-byte browser Blob exceeds the 16-byte budget,
-  // failing terminally rather than dropping either admitted data or later claiming a final marker.
-  // rather than dropping either admitted data or later claiming a final marker.
+  // A stalled bridge cannot turn MediaRecorder events into an unbounded promise chain. With a
+  // 16-byte budget, one 8-byte blob is in flight, one is queued, and a third 1-byte blob overflows.
+  // Terminal failure immediately releases the queued Blob while the active delivery may settle.
   let release: () => void = () => {};
   const stalled = new Promise<void>((resolve) => { release = resolve; });
+  const boundedChunks: RecordingChunk[] = [];
   const bounded = new MediaRecorderChunker({
     stream: {} as any,
     maxPendingBytes: 16,
-    onChunk: async () => { await stalled; return true; },
+    onChunk: async (chunk) => { boundedChunks.push(chunk); await stalled; return true; },
   });
   await bounded.start();
   const boundedRecorder = bounded.getMediaRecorder() as unknown as FakeMediaRecorder;
   boundedRecorder.emit(new Uint8Array(8));
-  boundedRecorder.emit(new Uint8Array(17));
   await new Promise((resolve) => setTimeout(resolve, 0));
-  const boundedCounts = bounded.resourceCounts();
+  boundedRecorder.emit(new Uint8Array(8));
+  boundedRecorder.emit(new Uint8Array(1));
+  const boundedDuringFailure = bounded.resourceCounts();
   let overflowRejected = false;
   try { await bounded.stop(); } catch { overflowRejected = true; }
   release();
-  if (!boundedCounts.failed || boundedCounts.retainedBytes > 16 || !overflowRejected)
-    fails.push(`stalled bridge was not terminally bounded (${JSON.stringify(boundedCounts)}, rejected=${overflowRejected})`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const boundedAfterSettled = bounded.resourceCounts();
+  if (!overflowRejected ||
+    boundedDuringFailure.retainedBytes !== 8 || boundedDuringFailure.queuedChunks !== 0 ||
+    !boundedDuringFailure.processing || !boundedDuringFailure.failed ||
+    boundedAfterSettled.retainedBytes !== 0 || boundedAfterSettled.queuedChunks !== 0 ||
+    boundedAfterSettled.processing || !boundedAfterSettled.failed ||
+    boundedChunks.some((chunk) => chunk.isFinal))
+    fails.push(`overflow did not release queued Blobs atomically (${JSON.stringify({ boundedDuringFailure, boundedAfterSettled, chunks: boundedChunks.map((chunk) => ({ seq: chunk.chunkSeq, final: chunk.isFinal })), overflowRejected })})`);
 
   // Delayed acknowledgements must not turn each successful upload into a MediaRecorder pause.
   // Four 1-second content markers stand for a continuous four-second source; all are delivered

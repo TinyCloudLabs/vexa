@@ -62,7 +62,9 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
   // Capture resources belong to the audio track, not to a DOM element. Meet can
   // temporarily mirror one MediaStream through several elements while recycling
   // tiles; element-keyed ownership would capture identical PCM more than once.
-  const connections = new Map<MediaStreamTrack, Connection>();
+  // Chromium may return a new JS MediaStreamTrack wrapper on a later scan, so use
+  // its stable browser id rather than wrapper identity for this owner registry.
+  const connections = new Map<string, Connection>();
   const bindings = new Map<HTMLMediaElement, ElementBinding>();
   let context: AudioContext | null = null;
   let nextIndex = 0;
@@ -80,8 +82,8 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     // Remove the listener before disconnecting so a stop/close cascade cannot retain this
     // connection through the track. Every path (end, detach, replacement, failed init, stop)
     // comes through here; it is deliberately idempotent.
-    if (connections.get(connection.track) !== connection) return;
-    connections.delete(connection.track);
+    if (connections.get(connection.track.id) !== connection) return;
+    connections.delete(connection.track.id);
     for (const el of connection.elements.keys()) {
       if (bindings.get(el)?.connection === connection) bindings.delete(el);
     }
@@ -119,10 +121,10 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       if (!stream || stream.getAudioTracks().length === 0) return false;
       const track = stream.getAudioTracks()[0];
       const existing = bindings.get(el);
-      if (existing?.stream === stream && existing.connection.track === track) return false;
+      if (existing?.stream === stream && existing.connection.track.id === track.id) return false;
       if (existing) detachElement(el, existing, 'replacement');
 
-      const shared = connections.get(track);
+      const shared = connections.get(track.id);
       if (shared) {
         shared.elements.set(el, stream);
         bindings.set(el, { stream, connection: shared });
@@ -140,11 +142,11 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         stream, track, elements: new Map([[el, stream]]), source, node: null,
         onEnded: () => release(connection, 'track ended'),
       };
-      connections.set(track, connection);
+      connections.set(track.id, connection);
       bindings.set(el, { stream, connection });
       track.addEventListener('ended', connection.onEnded);
       createPcmCaptureNode(ctx, (data) => {
-        if (!running || connections.get(track) !== connection) return;
+        if (!running || connections.get(track.id) !== connection) return;
         seen++;
         let maxVal = 0;
         for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxVal) maxVal = a; }
@@ -152,7 +154,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         else if (seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${maxVal.toFixed(4)} ctx=${ctx.state}`);
       }).then((node) => {
         // stop/replacement can happen while addModule() is pending. Never attach a late node.
-        if (!running || connections.get(track) !== connection) {
+        if (!running || connections.get(track.id) !== connection) {
           try { node.port.close(); node.disconnect(); } catch { /* */ }
           return;
         }
@@ -192,7 +194,12 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
 
       rescanTimer = setInterval(() => {
         if (!running) return;
-        // Release first: a removed element or swapped srcObject must not pin its old source.
+        // Register current elements before detaching stale bindings. Meet can append and play a
+        // replacement for a live track, then remove the old element between scans. Reconciling
+        // the replacement first keeps the track owner (and its stable channel) alive.
+        for (const el of findMediaElements()) if (connectElement(el, nextIndex)) nextIndex++;
+        // A removed element or swapped srcObject must not pin its old source once all surviving
+        // references have been reconciled.
         for (const [el, binding] of Array.from(bindings.entries())) {
           const connection = binding.connection;
           const inDom = typeof document.contains !== 'function' || document.contains(el);
@@ -200,7 +207,6 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
           if (!inDom || !live || (el as any).srcObject !== binding.stream)
             detachElement(el, binding, !inDom ? 'element removed' : !live ? 'track ended' : 'replacement');
         }
-        for (const el of findMediaElements()) if (connectElement(el, nextIndex)) nextIndex++;
       }, RESCAN);
 
       log(`capture started with ${connections.size} stream(s)`);

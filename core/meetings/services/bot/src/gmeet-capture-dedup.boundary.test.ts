@@ -82,7 +82,6 @@ async function main(): Promise<void> {
       };
 
       const first = await makeElement('first', firstDestination.stream);
-      const mirror = await makeElement('mirror', firstDestination.stream);
       const channels = new Set();
       const logs = [];
       let frames = 0;
@@ -96,7 +95,7 @@ async function main(): Promise<void> {
       });
       await capture.start();
       globalThis.__dedupFixture = {
-        capture, fixtureContext, firstOscillator, firstDestination, first, mirror,
+        capture, fixtureContext, firstOscillator, firstDestination, first, replacement: null, mirror: null,
         channels, logs, get frames() { return frames; }, replacementOscillator: null,
       };
     })()`);
@@ -114,29 +113,59 @@ async function main(): Promise<void> {
     })()`);
 
     const mirrored = await snapshot();
-    check('two elements sharing one MediaStream have one capture owner',
+    check('one live element has one capture owner',
       mirrored.streams === 1 && mirrored.resources.sources === 1 &&
       mirrored.resources.worklets === 1 && mirrored.resources.tracks === 1,
       JSON.stringify(mirrored));
-    check('mirrored stream emits one stable channel',
+    check('initial stream emits channel zero',
       mirrored.frames > 0 && mirrored.channels.length === 1,
       JSON.stringify(mirrored));
 
-    // Replace one mirror while the other still references the original stream.
+    // Meet can append/play a replacement with the same srcObject and remove the old element
+    // before the next scan. This must hand over the existing owner, not create channel 1.
     await page.evaluate(`(async () => {
       const fixture = globalThis.__dedupFixture;
+      fixture.replacement = await (async () => {
+        const element = document.createElement('audio');
+        element.autoplay = true;
+        element.srcObject = fixture.firstDestination.stream;
+        document.body.appendChild(element);
+        await element.play();
+        return element;
+      })();
+      fixture.first.remove();
+    })()`);
+    await sleep(200);
+    const handedOver = await snapshot();
+    check('same-track DOM handover keeps one owner and channel zero PCM',
+      handedOver.streams === 1 && handedOver.resources.sources === 1 &&
+      handedOver.resources.worklets === 1 && handedOver.resources.tracks === 1 &&
+      handedOver.frames > mirrored.frames && handedOver.channels.length === 1 && handedOver.channels[0] === 0,
+      JSON.stringify(handedOver));
+
+    // A mirror retains the original owner while the handover element is repurposed to a new track.
+    await page.evaluate(`(async () => {
+      const fixture = globalThis.__dedupFixture;
+      fixture.mirror = await (async () => {
+        const element = document.createElement('audio');
+        element.autoplay = true;
+        element.srcObject = fixture.firstDestination.stream;
+        document.body.appendChild(element);
+        await element.play();
+        return element;
+      })();
       const oscillator = fixture.fixtureContext.createOscillator();
       oscillator.frequency.value = 880;
       const destination = fixture.fixtureContext.createMediaStreamDestination();
       oscillator.connect(destination);
       oscillator.start();
       fixture.replacementOscillator = oscillator;
-      fixture.first.srcObject = destination.stream;
-      await fixture.first.play();
+      fixture.replacement.srcObject = destination.stream;
+      await fixture.replacement.play();
     })()`);
-    await sleep(200);
+    await sleep(150);
     const replaced = await snapshot();
-    check('replacing one mirror preserves the original owner and adds only the replacement owner',
+    check('mirror preserves original owner while replacement adds one owner',
       replaced.streams === 2 && replaced.resources.sources === 2 &&
       replaced.resources.worklets === 2 && replaced.resources.tracks === 2,
       JSON.stringify(replaced));
@@ -149,7 +178,7 @@ async function main(): Promise<void> {
       originalRemoved.resources.worklets === 1 && originalRemoved.resources.tracks === 1,
       JSON.stringify(originalRemoved));
 
-    await page.evaluate(`globalThis.__dedupFixture.first.remove()`);
+    await page.evaluate(`globalThis.__dedupFixture.replacement.remove()`);
     await sleep(150);
     const allRemoved = await snapshot();
     check('removing every element releases every capture resource',
