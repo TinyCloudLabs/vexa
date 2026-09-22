@@ -13,7 +13,7 @@
   "core/gateway/contracts/ws.v1": "77ce41cb384600acaf34402f4daf8d04b32063c662831238ba7a2e4195e80287",
   "core/identity/contracts/identity.v1": "36902fe610115088c855e7af607c1d778dbd3ab75512d8c71c8bf78cf1767dc7",
   "core/meetings/contracts/acts.v1": "1eaa34d27c52b0eb987a278115a1966c058f615ca16e3391b00107a6779dec4f",
-  "core/meetings/contracts/attributed-audio.v1": "6e89e1773dbceec2a78170607a3476d5492981dd3f32ee033dac52eb7dc04f78",
+  "core/meetings/contracts/attributed-audio.v1": "0f61c979479a67c32d44a9310445d39d132096cbfa5e3f577fae2974ab1a37cc",
   "core/meetings/contracts/captured-signal.v1": "976b79778e50ae5bbfea2cd968a936df628cce025475aca54587122332b62972",
   "core/meetings/contracts/flagged-issue.v1": "4b868f57298131f8eec8246d86d57251f259927d8bfd7df5a0f6016a10f16211",
   "core/meetings/contracts/invocation.v1": "d7bf2dce597cbb83742f2a55a86435928018622e202adb78a3a8c62b787b3eec",

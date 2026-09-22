@@ -31,7 +31,8 @@ from .service import (
 )
 from .attributed import (
     AttributedConflict, attributed_manifest_for_owner, attributed_range_for_owner, close_attributed_manifest,
-    upload_attributed_range,
+    attributed_manifest_for_session, fail_reserved_attributed_range, reserve_attributed_range,
+    upload_reserved_attributed_range,
 )
 
 MAX_ATTRIBUTED_AUDIO_REQUEST_BYTES = 32 * 1024 * 1024
@@ -287,41 +288,55 @@ def build_router(
             raise HTTPException(status_code=404, detail=str(e))
         return JSONResponse(content=receipt)
 
-    @router.post("/internal/attributed-audio/upload", include_in_schema=False)
-    async def internal_upload_attributed_audio(
-        file: UploadFile = File(...),
+    async def _attributed_auth(authorization: Optional[str]) -> Optional[int]:
+        bearer = _bearer_token(authorization)
+        internal_secret = os.getenv("INTERNAL_API_SECRET")
+        if internal_secret and bearer == internal_secret: return None
+        try: return int(_verify_meeting_token(bearer, secret=token_secret)["meeting_id"])
+        except ValueError as e: raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+
+    def _attributed_metadata(range_metadata: str) -> dict:
+        try: range_data = json.loads(range_metadata)
+        except (ValueError, TypeError): raise HTTPException(status_code=422, detail="range_metadata must be JSON")
+        if not isinstance(range_data, dict): raise HTTPException(status_code=422, detail="range_metadata must be an object")
+        return range_data
+
+    @router.get("/internal/attributed-audio/manifest", include_in_schema=False)
+    async def internal_attributed_audio_manifest(session_uid: str, authorization: Optional[str] = Header(default=None)):
+        try: return JSONResponse(content=await attributed_manifest_for_session(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid))
+        except SessionNotFound as e: raise HTTPException(status_code=404, detail=str(e))
+
+    @router.post("/internal/attributed-audio/reserve", include_in_schema=False)
+    async def internal_reserve_attributed_audio(
         session_uid: str = Form(...),
         range_metadata: str = Form(...),
         authorization: Optional[str] = Header(default=None),
     ):
         try:
-            range_data = json.loads(range_metadata)
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=422, detail="range_metadata must be JSON")
-        if not isinstance(range_data, dict):
-            raise HTTPException(status_code=422, detail="range_metadata must be an object")
-        bearer = _bearer_token(authorization)
-        internal_secret = os.getenv("INTERNAL_API_SECRET")
-        token_meeting_id: Optional[int] = None
-        if not (internal_secret and bearer == internal_secret):
-            try:
-                claims = _verify_meeting_token(bearer, secret=token_secret)
-                token_meeting_id = int(claims["meeting_id"])
-            except ValueError as e:
-                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+            receipt = await reserve_attributed_range(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata))
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/upload", include_in_schema=False)
+    async def internal_upload_attributed_audio(file: UploadFile = File(...), session_uid: str = Form(...), range_metadata: str = Form(...), authorization: Optional[str] = Header(default=None)):
         try:
-            receipt = await upload_attributed_range(
-                repo, storage, token_meeting_id=token_meeting_id, session_uid=session_uid,
-                range_data=range_data, data=await _read_attributed_body(file),
-            )
+            receipt = await upload_reserved_attributed_range(repo, storage, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata), data=await _read_attributed_body(file))
         except AttributedConflict as e:
             raise HTTPException(status_code=409, detail=str(e))
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
         except Exception as e:
-            # upload_attributed_range has already persisted the failed state before this response.
             raise HTTPException(status_code=502, detail=f"attributed PCM upload failed: {e}")
         return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/fail", include_in_schema=False)
+    async def internal_fail_attributed_audio(session_uid: str = Form(...), range_metadata: str = Form(...), authorization: Optional[str] = Header(default=None)):
+        try: return JSONResponse(content=await fail_reserved_attributed_range(repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, range_data=_attributed_metadata(range_metadata)))
+        except AttributedConflict as e: raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e: raise HTTPException(status_code=404, detail=str(e))
 
     @router.post("/internal/attributed-audio/close", include_in_schema=False)
     async def internal_close_attributed_audio(
@@ -329,21 +344,12 @@ def build_router(
         admitted_sequences: Optional[str] = Form(None),
         authorization: Optional[str] = Header(default=None),
     ):
-        bearer = _bearer_token(authorization)
-        internal_secret = os.getenv("INTERNAL_API_SECRET")
-        token_meeting_id: Optional[int] = None
-        if not (internal_secret and bearer == internal_secret):
-            try:
-                claims = _verify_meeting_token(bearer, secret=token_secret)
-                token_meeting_id = int(claims["meeting_id"])
-            except ValueError as e:
-                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
         try:
             expected = json.loads(admitted_sequences) if admitted_sequences else []
             if not isinstance(expected, list):
                 raise AttributedConflict("admitted_sequences must be a JSON array")
             return JSONResponse(content=await close_attributed_manifest(
-                repo, token_meeting_id=token_meeting_id, session_uid=session_uid, expected_sequences=expected,
+                repo, token_meeting_id=await _attributed_auth(authorization), session_uid=session_uid, expected_sequences=expected,
             ))
         except AttributedConflict as e:
             raise HTTPException(status_code=409, detail=str(e))

@@ -11,7 +11,7 @@ MAX_ATTRIBUTED_AUDIO_BYTES = 32 * 1024 * 1024
 _IMMUTABLE = (
     "version", "meeting_id", "sequence", "idempotency_key", "speaker_key", "speaker_name",
     "channel", "turn_generation", "attribution", "clock_origin_ms", "start_ms", "end_ms",
-    "codec", "sample_rate", "channels", "byte_count", "sha256",
+    "audio_duration_ms", "codec", "sample_rate", "channels", "byte_count", "sha256",
 )
 
 
@@ -42,23 +42,30 @@ def _safe_number(value, name: str) -> float:
     return float(value)
 
 
-def _validate(data: dict, body: bytes) -> None:
+def _validate(data: dict, body: Optional[bytes] = None) -> None:
     if data.get("version") != 1 or data.get("codec") != "pcm_f32le":
         raise AttributedConflict("unsupported attributed-audio version or codec")
     for key in ("sequence", "channel", "turn_generation", "sample_rate", "channels", "byte_count"):
         _safe_int(data.get(key), key)
     if data["sequence"] < 0 or data["channel"] < 0 or data["turn_generation"] < 1:
         raise AttributedConflict("invalid attributed range identity")
-    if data["sample_rate"] < 1 or data["channels"] != 1 or data["byte_count"] != len(body):
+    if data["sample_rate"] < 1 or data["channels"] != 1:
         raise AttributedConflict("invalid attributed PCM dimensions")
-    if len(body) > MAX_ATTRIBUTED_AUDIO_BYTES or len(body) % 4:
+    if data["byte_count"] > MAX_ATTRIBUTED_AUDIO_BYTES or data["byte_count"] % 4:
+        raise AttributedConflict("invalid attributed PCM body size")
+    if body is not None and data["byte_count"] != len(body):
+        raise AttributedConflict("invalid attributed PCM dimensions")
+    if body is not None and (len(body) > MAX_ATTRIBUTED_AUDIO_BYTES or len(body) % 4):
         raise AttributedConflict("invalid attributed PCM body size")
     start, end, origin = (_safe_number(data.get(k), k) for k in ("start_ms", "end_ms", "clock_origin_ms"))
     if start < 0 or end < start or origin < 0:
         raise AttributedConflict("invalid attributed PCM clock")
-    # PCM f32le is one 4-byte sample; allow one sample of timestamp rounding only.
-    expected = (end - start) * data["sample_rate"] * data["channels"] * 4 / 1000
-    if abs(expected - len(body)) > 4:
+    audio_duration = _safe_number(data.get("audio_duration_ms"), "audio_duration_ms")
+    if audio_duration < 0 or end - start + 1000 / data["sample_rate"] < audio_duration:
+        raise AttributedConflict("attributed PCM wall span is shorter than audio duration")
+    # PCM f32le is one 4-byte sample; validate sample time, not wall placement gaps.
+    expected = audio_duration * data["sample_rate"] * data["channels"] * 4 / 1000
+    if abs(expected - data["byte_count"]) > 4:
         raise AttributedConflict("attributed PCM duration does not match byte count")
     attribution = data.get("attribution")
     if not isinstance(attribution, dict) or attribution.get("source") not in ("glow-bound", "provisional", "unresolved"):
@@ -70,7 +77,9 @@ def _validate(data: dict, body: bytes) -> None:
     if not isinstance(name, str) or (attribution["source"] == "glow-bound" and not name) or (attribution["source"] == "unresolved" and name):
         raise AttributedConflict("invalid attributed speaker name/provenance")
     digest = data.get("sha256")
-    if not isinstance(digest, str) or digest != hashlib.sha256(body).hexdigest() or len(digest) != 64:
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise AttributedConflict("attributed PCM checksum does not match body")
+    if body is not None and digest != hashlib.sha256(body).hexdigest():
         raise AttributedConflict("attributed PCM checksum does not match body")
     if not isinstance(data.get("idempotency_key"), str) or not data["idempotency_key"]:
         raise AttributedConflict("invalid attributed idempotency key")
@@ -80,17 +89,22 @@ def _same_range(existing: dict, incoming: dict) -> bool:
     return all(existing.get(key) == incoming.get(key) for key in _IMMUTABLE)
 
 
-async def upload_attributed_range(repo, storage, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict, data: bytes) -> dict:
-    """Reserve an immutable row under the meeting lock, then upload bytes without ordering assumptions."""
+async def _session_meeting(repo, *, token_meeting_id: Optional[int], session_uid: str) -> int:
     session = await repo.find_session(session_uid)
     if session is None:
         raise SessionNotFound(f"no MeetingSession for session_uid {session_uid}")
     meeting_id = session["meeting_id"]
     if token_meeting_id is not None and meeting_id != token_meeting_id:
         raise SessionNotFound("MeetingToken meeting_id does not match the session's meeting")
+    return meeting_id
+
+
+async def reserve_attributed_range(repo, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict) -> dict:
+    """Durably reserve every immutable field before the bot offers bytes."""
+    meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
     if range_data.get("meeting_id") != str(meeting_id):
         raise AttributedConflict("attributed range meeting_id does not match the session")
-    _validate(range_data, data)
+    _validate(range_data)
     incoming = dict(range_data)
     incoming["meeting_id"] = str(meeting_id)
     incoming["state"] = "sealed"
@@ -116,8 +130,26 @@ async def upload_attributed_range(repo, storage, *, token_meeting_id: Optional[i
         next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
         return next_data, (dict(incoming), True)
 
-    reserved, newly_reserved = await repo.mutate_meeting_data(meeting_id, reserve)
-    if not newly_reserved and reserved.get("state") == "uploaded": return reserved
+    reserved, _ = await repo.mutate_meeting_data(meeting_id, reserve)
+    return reserved
+
+
+async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict, data: bytes) -> dict:
+    """Upload only against a pre-existing immutable reservation; upload/fail never regress uploaded."""
+    meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
+    if range_data.get("meeting_id") != str(meeting_id):
+        raise AttributedConflict("attributed range meeting_id does not match the session")
+    _validate(range_data, data)
+    incoming = dict(range_data); incoming.pop("state", None); incoming.pop("path", None); incoming.pop("storage_path", None)
+
+    def find_reserved(data_json):
+        manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+        found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming.get("idempotency_key")), None)
+        if not found or not _same_range(found, incoming):
+            raise AttributedConflict("attributed range was not durably reserved")
+        return data_json, dict(found)
+    reserved = (await repo.mutate_meeting_data(meeting_id, find_reserved))
+    if reserved.get("state") == "uploaded": return reserved
     owner = await repo.owner_of(meeting_id)
     key = f"attributed-audio/{owner or 0}/{meeting_id}/{session_uid}/{incoming['sequence']:06d}-{incoming['sha256']}.pcm"
     try:
@@ -140,6 +172,37 @@ async def upload_attributed_range(repo, storage, *, token_meeting_id: Optional[i
         next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
         return next_data, dict(found)
     return await repo.mutate_meeting_data(meeting_id, acknowledge)
+
+
+async def fail_reserved_attributed_range(repo, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict) -> dict:
+    meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
+    if range_data.get("meeting_id") != str(meeting_id):
+        raise AttributedConflict("attributed range meeting_id does not match the session")
+    _validate(range_data)
+    incoming = dict(range_data); incoming.pop("state", None); incoming.pop("path", None); incoming.pop("storage_path", None)
+    def fail(data_json):
+        manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+        found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming.get("idempotency_key")), None)
+        if not found or not _same_range(found, incoming):
+            raise AttributedConflict("attributed range was not durably reserved")
+        if found.get("state") != "uploaded": found["state"] = "failed"; found.pop("storage_path", None)
+        next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
+        return next_data, dict(found)
+    return await repo.mutate_meeting_data(meeting_id, fail)
+
+
+async def attributed_manifest_for_session(repo, *, token_meeting_id: Optional[int], session_uid: str) -> dict:
+    meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
+    def read(data_json):
+        manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+        return data_json, public_manifest(manifest)
+    return await repo.mutate_meeting_data(meeting_id, read)
+
+
+async def upload_attributed_range(repo, storage, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict, data: bytes) -> dict:
+    """Compatibility composition for callers outside the explicit HTTP protocol."""
+    await reserve_attributed_range(repo, token_meeting_id=token_meeting_id, session_uid=session_uid, range_data=range_data)
+    return await upload_reserved_attributed_range(repo, storage, token_meeting_id=token_meeting_id, session_uid=session_uid, range_data=range_data, data=data)
 
 
 async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], session_uid: str, expected_sequences: Optional[list[int]] = None) -> dict:
