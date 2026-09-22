@@ -128,6 +128,18 @@ OWNER_ONLY_KEYS = frozenset({
 # delivery path's internal-key set is pinned against it.
 RESPONSE_OMIT_KEYS = SENSITIVE_OMIT_KEYS | OWNER_ONLY_KEYS
 
+# Durable lifecycle forensics are an operator/owner diagnostic carrier, never a transcript-share
+# carrier.  Keep this one recursive policy at the response edge so new nested history blobs cannot
+# bypass an endpoint-specific omission list.
+NON_OWNER_DIAGNOSTIC_KEYS = frozenset({
+    "bot_logs", "bot_logs_truncated", "last_error", "error_details", "join_evidence",
+    "status_transition", "history", "failure_history", "error_history", "diagnostics",
+    "bot_resources", "stt_fault", "infra_fault", "outbound_events",
+})
+NON_OWNER_DIAGNOSTIC_SUFFIXES = ("_logs", "_history", "_evidence", "_details", "_trace", "_stack")
+NON_OWNER_VALUE_LIST_LIMIT = 8
+NON_OWNER_VALUE_DEPTH_LIMIT = 8
+
 # DENY-set, not allow-list, deliberately (unchanged from #1243). ``data`` is an open multi-producer
 # blob whose LIGHT keys the detail view genuinely renders (title, docs, notes, scheduled_at, flags,
 # completion_reason, constructed_meeting_url, calendar_uid, …) and product work adds new ones
@@ -269,6 +281,36 @@ def is_sensitive_key(key: str) -> bool:
     return any(k == s or k.endswith("_" + s) for s in SENSITIVE_KEY_SUFFIXES)
 
 
+def is_non_owner_diagnostic_key(key: str) -> bool:
+    """Whether a persisted key is lifecycle/operational diagnostics, at any nesting level."""
+    lowered = key.lower()
+    return (lowered in NON_OWNER_DIAGNOSTIC_KEYS
+            or lowered.endswith(NON_OWNER_DIAGNOSTIC_SUFFIXES)
+            or lowered in {"error", "errors", "detail", "reason"})
+
+
+def project_non_owner_value(value: Any, *, depth: int = 0) -> Any:
+    """Recursively bound a non-owner response without letting diagnostic siblings leak.
+
+    Meeting ``data`` is intentionally open-ended, so a top-level deny-list alone cannot protect a
+    future producer that nests a diagnostic event below an otherwise harmless key.  Lists retain a
+    fixed tail for ordinary product data; diagnostics and credential-shaped keys are removed before
+    their values are traversed.
+    """
+    if depth >= NON_OWNER_VALUE_DEPTH_LIMIT:
+        return None
+    if isinstance(value, dict):
+        return {
+            key: project_non_owner_value(item, depth=depth + 1)
+            for key, item in value.items()
+            if isinstance(key, str) and not is_sensitive_key(key) and not is_non_owner_diagnostic_key(key)
+        }
+    if isinstance(value, list):
+        return [project_non_owner_value(item, depth=depth + 1)
+                for item in value[-NON_OWNER_VALUE_LIST_LIMIT:]]
+    return value
+
+
 def omitted_keys(*, viewer_is_owner: bool) -> frozenset:
     """The explicit key set a response drops for this viewer.
 
@@ -304,10 +346,11 @@ def project_response_data(
     """
     omit = omitted_keys(viewer_is_owner=viewer_is_owner)
     projected = project_calendar_sources(data)
-    return {
+    result = {
         k: v for k, v in projected.items()
         if k not in omit and not is_sensitive_key(k)
     }
+    return result if viewer_is_owner else project_non_owner_value(result)
 
 
 def project_list_data(
@@ -336,7 +379,7 @@ def project_list_data(
                  and k not in omit and not is_sensitive_key(k)}
     if isinstance(sources, list):
         projected["calendar_sources"] = sources
-    return projected
+    return projected if viewer_is_owner else project_non_owner_value(projected)
 
 
 # --- caller-supplied metadata: bounds -------------------------------------------------------

@@ -320,6 +320,8 @@ async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], se
     if session is None: raise SessionNotFound(f"no MeetingSession for session_uid {session_uid}")
     meeting_id = session["meeting_id"]
     if token_meeting_id is not None and meeting_id != token_meeting_id: raise SessionNotFound("MeetingToken meeting_id does not match the session's meeting")
+    # The bot owns only a bounded receipt tail.  The meeting-api's durable ledger is authoritative
+    # and therefore seals itself; legacy clients may still send a small subset for compatibility.
     expected = set(expected_sequences or [])
     if any(not isinstance(value, int) or value < 0 for value in expected): raise AttributedConflict("invalid admitted sequence ledger")
     def close(data_json):

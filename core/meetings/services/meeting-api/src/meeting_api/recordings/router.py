@@ -253,9 +253,8 @@ def build_router(
             if not (internal_secret and bearer == internal_secret):
                 try:
                     claims = _verify_meeting_token(bearer, secret=token_secret)
-                except ValueError as e:
-                    raise HTTPException(status_code=401,
-                                        detail=f"Invalid recording upload token: {e}")
+                except ValueError:
+                    raise HTTPException(status_code=401, detail="recording upload unauthorized")
                 token_meeting_id = int(claims["meeting_id"])
             try:
                 receipt = await upload_signal_tape(
@@ -284,8 +283,8 @@ def build_router(
         else:
             try:
                 claims = _verify_meeting_token(bearer, secret=token_secret)
-            except ValueError as e:
-                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+            except ValueError:
+                raise HTTPException(status_code=401, detail="recording upload unauthorized")
             token_meeting_id = int(claims["meeting_id"])
 
         data = await file.read()
@@ -300,8 +299,9 @@ def build_router(
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
-        except HTTPException:
-            raise
+        except HTTPException as exc:
+            detail = "recording upload too large" if exc.status_code == 413 else "recording upload rejected"
+            raise HTTPException(status_code=exc.status_code, detail=detail)
         except Exception:
             raise HTTPException(status_code=502, detail="recording upload failed")
         return JSONResponse(content=receipt)
@@ -311,7 +311,7 @@ def build_router(
         internal_secret = os.getenv("INTERNAL_API_SECRET")
         if internal_secret and bearer == internal_secret: return None
         try: return int(_verify_meeting_token(bearer, secret=token_secret)["meeting_id"])
-        except ValueError as e: raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+        except ValueError: raise HTTPException(status_code=401, detail="recording upload unauthorized")
 
     def _attributed_metadata(range_metadata: str) -> dict:
         try: range_data = json.loads(range_metadata)
@@ -347,8 +347,9 @@ def build_router(
             raise HTTPException(status_code=409, detail=str(e))
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
-        except HTTPException:
-            raise
+        except HTTPException as exc:
+            detail = "attributed PCM body too large" if exc.status_code == 413 else "attributed PCM upload rejected"
+            raise HTTPException(status_code=exc.status_code, detail=detail)
         except Exception:
             # Storage responses can contain credentials, object paths, or arbitrary upstream bodies.
             # This internal boundary reports only a stable stage and HTTP status.

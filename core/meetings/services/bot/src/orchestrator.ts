@@ -85,11 +85,17 @@ export interface MeetingResult {
   completionReason?: CompletionReason;
 }
 
-/** Normalize a driver's join return — a bare `JoinOutcome` or a `JoinResult` — into `{ outcome,
- *  reason? }` so the orchestrator has ONE shape to reason about (and the reason text, when the
- *  driver supplied one, survives to the terminal lifecycle row). */
+/** Normalize a driver's join return — a bare `JoinOutcome` or a `JoinResult` — into one shape.
+ * Driver text is classification-only and never crosses into durable lifecycle diagnostics. */
 function normalizeJoin(r: JoinOutcome | JoinResult): JoinResult {
   return typeof r === 'string' ? { outcome: r } : r;
+}
+
+/** Terminal lifecycle fields cross a durable, user-readable boundary.  Driver exceptions and
+ * platform messages can contain credentials, URLs, storage paths, or transcript text, so this
+ * boundary carries only an allowlisted stage/code vocabulary. */
+function terminalDetail(stage: 'joining' | 'awaiting_admission' | 'active', code: string): string {
+  return `capture failed (stage=${stage} code=${code})`;
 }
 
 /**
@@ -455,7 +461,6 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // join. `unsubscribe()` is called on every exit path (pre-active + active) below.
     const unsubscribe = deps.acts.subscribe(handle);
     let outcome: JoinOutcome;
-    let joinReason: string | undefined;
     let joinSignals: JoinSignals | undefined;
     try {
       // Race the (possibly long, lobby-blocked) join against a pre-active abort. A stop/SIGTERM in the
@@ -491,7 +496,6 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         return { exitCode: 0, status: 'failed', completionReason: 'stopped' };
       }
       outcome = raced.result.outcome;
-      joinReason = raced.result.reason;
       joinSignals = raced.result.signals;
       await reportChain;   // flush in-flight reports before deciding admission
     } catch (e) {
@@ -500,7 +504,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       // A raw throw out of the join (browser crash, navigation error, an unrecognised platform).
       // The driver parked its measurements before re-raising, so even this path is evidenced —
       // typically as `navigation_failure` (system_fault) off the transport marker in the message.
-      const crashDetail = String(e);
+      const crashDetail = terminalDetail('joining', 'join_exception');
       await emit('failed', {
         failure_stage: 'joining', completion_reason: 'join_failure', reason: crashDetail, exit_code: 1,
         ...joinEvidenceFor('error', 'joining', driverSignals(deps.join), crashDetail),
@@ -510,12 +514,9 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (outcome !== 'admitted') {
       const reason = OUTCOME_FAIL[outcome];
       unsubscribe();
-      // ALWAYS stamp a human `reason` text (#926). A non-admitted verdict carries a completion_reason
-      // enum, but the terminal row also needs the human cause or meeting-api synthesizes the
-      // uninformative "Bot exited with code 1; reason: None". Prefer the driver's own message
-      // (the AdmissionError text — e.g. the Zoom "auth_required" / "host not started" cause); fall
-      // back to a derived line so NO reasonless terminal can ever leave this branch.
-      const reasonText = joinReason ?? `join ended without admission: ${outcome} → ${reason}`;
+      // ALWAYS stamp a terminal reason, but only from the closed stage/code vocabulary. A driver's
+      // message may contain arbitrary platform text and must not become durable meeting state.
+      const reasonText = terminalDetail(cur === 'awaiting_admission' || cur === 'needs_help' ? 'awaiting_admission' : 'joining', `join_${outcome}`);
       // The stage is DERIVED from where the bot actually got to, not stamped `awaiting_admission`
       // regardless (which it used to be, and which claims a lobby the bot may never have seen). The
       // control plane re-derives it server-side anyway (FM-003), so a truthful payload simply stops
@@ -555,7 +556,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       await closeRecording();
       await leavePlatform('pipeline_start_failed');
       unsubscribe();
-      await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
+      await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: terminalDetail('active', 'pipeline_start'), exit_code: 1 });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
     }
     const stopRemoval = deps.join.onRemoval(() => signalEnd?.('evicted'));

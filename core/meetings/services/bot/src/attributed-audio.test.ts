@@ -30,10 +30,13 @@ try {
   // copy before admission, so it never retains the old ~50MiB while claiming ~25MiB.
   for (let channel = 0; channel < 25; channel++) recorder.feed({ channel, speaker_key: `channel:${channel}`, speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(256 * 1024), capture_ms: channel, sample_rate: 16_000 });
   assert.ok(recorder.retainedBytes() <= ATTRIBUTED_AUDIO_HTTP_PCM_BUDGET_BYTES);
-  const manifest = await recorder.stop();
+  await assert.rejects(recorder.stop(), (error: unknown) => {
+    const message = String(error);
+    return message === 'Error: attributed-audio capture failed (code storage_admission)'
+      && !message.includes('stalled upload') && !message.includes('secret');
+  });
   assert.ok(uploads > 0);
   assert.equal(recorder.retainedBytes(), 0);
-  assert.ok(manifest.ranges.some(range => range.state === 'failed'));
 } finally {
   globalThis.fetch = originalFetch;
 }

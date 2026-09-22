@@ -21,7 +21,7 @@ recorder.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: 'Alice', att
 recorder.feed({ channel: 1, speaker_key: 'channel:1', speaker_name: 'Bob', attribution: { source: 'glow-bound', confidence: 1 }, pcm: new Float32Array([3]), capture_ms: 1_001, sample_rate: 1_000 });
 recorder.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: 'Alice', attribution: { source: 'glow-bound', confidence: 1 }, pcm: new Float32Array([2]), capture_ms: 1_004, sample_rate: 1_000 });
 const manifest = await recorder.stop();
-assert.deepEqual(store.rows.map(x => [x.channel, x.turn_generation, x.audio_duration_ms]), [[0, 1, 2], [1, 1, 1]]);
+assert.deepEqual(store.rows.map(x => [x.channel, x.turn_generation, x.audio_duration_ms]), [[0, 1, 2], [1, 2, 1]]);
 assert.equal(manifest.clock_origin_ms, 1_000); assert.equal(manifest.ranges[0].start_ms, 0); assert.equal(recorder.retainedBytes(), 0);
 
 // A stalled uploader cannot make admission closures, PCM, or metadata grow without bound.
@@ -51,11 +51,13 @@ const recovered: AttributedAudioManifest = { version: 1, meeting_id: 'm3', clock
 const restart = memoryStore(); restart.load = async () => structuredClone(recovered); restart.rows.push(...structuredClone(recovered.ranges));
 const recreated = createAttributedAudioRecorder('m3', restart, { cadenceMs: 5_000 }); await recreated.ready;
 recreated.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array([1]), capture_ms: 9, sample_rate: 1000 });
-const closed = await recreated.stop(); assert.deepEqual(closed.ranges.map(value => [value.sequence, value.state]), [[4, 'failed'], [5, 'uploaded']]);
+const closed = await recreated.stop();
+assert.deepEqual(restart.rows.map(value => [value.sequence, value.state]), [[4, 'failed'], [5, 'uploaded']]);
+assert.ok(closed.ranges.length <= 8, 'restart close keeps only bounded local receipts');
 
-// Historical rows are evidence, not a concurrency budget. 65 five-second ranges and a
-// three-hour-equivalent ledger must both close without a silent tail drop.
-for (const count of [65, 3 * 60 * 60 / 5]) {
+// The server ledger has every row; the worker retains only a fixed receipt tail even for a
+// multi-hour meeting.  Close sends no manifest, so its serialized worker payload stays bounded.
+for (const count of [1_000, 10_000]) {
   const historyStore = memoryStore();
   const history = createAttributedAudioSink(`history-${count}`, historyStore, 64 * 1024);
   for (let sequence = 0; sequence < count; sequence++) {
@@ -64,11 +66,22 @@ for (const count of [65, 3 * 60 * 60 / 5]) {
       codec: 'pcm_f32le', sample_rate: 250, channels: 1 }, [new Float32Array(1_250)]);
   }
   const historyManifest = await history.close();
-  assert.equal(historyManifest.ranges.length, count);
-  assert.deepEqual(historyManifest.ranges.map(range => range.sequence), Array.from({ length: count }, (_, index) => index));
+  assert.equal(historyStore.rows.length, count, 'durable store keeps the complete ordered ledger');
+  assert.deepEqual(historyStore.rows.map(range => range.sequence), Array.from({ length: count }, (_, index) => index));
+  assert.ok(historyManifest.ranges.length <= 8, 'worker close result contains only its bounded receipt tail');
   assert.equal(history.taskCount(), 0, 'settled historical ranges do not retain task state');
-  assert.equal(history.retainedMetadataCount(), count, 'telemetry counts the one retained manifest collection');
+  assert.ok(history.retainedMetadataCount() <= 8, 'settled history is compacted in the worker');
 }
+
+// A channel-per-frame meeting cannot leave a generation map behind after each range settles.
+const churn = createAttributedAudioSink('channel-churn', memoryStore(), 64 * 1024);
+for (let channel = 0; channel < 10_000; channel++) {
+  await churn.seal({ speaker_key: `channel:${channel}`, speaker_name: '', channel, turn_generation: channel + 1,
+    attribution: { source: 'unresolved', confidence: 0 }, start_ms: channel, end_ms: channel + 1,
+    codec: 'pcm_f32le', sample_rate: 1_000, channels: 1 }, [new Float32Array(1)]);
+}
+await churn.close();
+assert.ok(churn.retainedMetadataCount() <= 8, '10k channel receipts remain bounded locally');
 
 // A callback clock commonly jitters by a few milliseconds. Sample duration remains authoritative:
 // 4096 @16kHz twice is 512ms audio even though its wall span is 506ms.

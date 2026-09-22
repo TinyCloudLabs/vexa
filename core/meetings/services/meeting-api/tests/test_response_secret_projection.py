@@ -176,6 +176,28 @@ def test_generic_meeting_projections_never_ship_attributed_cleanup_or_nonowner_s
         assert "storage_path" not in repr(data)
 
 
+def test_share_projection_recursively_removes_and_bounds_diagnostic_siblings():
+    """A future producer cannot hide terminal blobs under a harmless-looking custom key."""
+    marker = "Bearer private-token s3://bucket/private.pcm transcript words"
+    data = {
+        **ROW_DATA,
+        "custom": {
+            "bot_logs": [marker] * 10_000,
+            "nested": {"join_evidence": {"detail": marker, "reason": marker}},
+            "ordinary": list(range(20)),
+        },
+        "last_error": {"error_details": marker},
+        "status_transition": [{"reason": marker}] * 10_000,
+    }
+    projected = project_response_data(data, viewer_is_owner=False)
+    assert marker not in repr(projected)
+    assert "last_error" not in projected and "status_transition" not in projected
+    assert "bot_logs" not in projected["custom"]
+    assert "join_evidence" not in projected["custom"]["nested"]
+    assert projected["custom"]["ordinary"] == list(range(12, 20))
+    assert len(repr(projected)) < 10_000
+
+
 @pytest.mark.parametrize("path_for", [
     lambda store: f"/transcripts/by-id/{_mid(store)}",
     lambda store: f"/transcripts/{PLAT}/{NID}",

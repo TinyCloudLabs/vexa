@@ -8,6 +8,9 @@ export const ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS = 250;
 const MAX_CHANNELS = 64;
 /** Storage can stall independently of PCM size. Bound promise/closure admission too. */
 export const MAX_PENDING_ATTRIBUTED_STORAGE_TASKS = 64;
+/** Settled receipts already live in the meeting-api ledger.  The worker needs only a small retry
+ * window; retaining the whole meeting ledger here made long meetings grow without bound. */
+export const MAX_RETAINED_ATTRIBUTED_RECEIPTS = 8;
 /** A missing row is metadata, but it still has to fit the HTTP body's hard limit. */
 const MAX_MISSING_BYTES = 32 * 1024 * 1024;
 export type Attribution = { source: 'glow-bound' | 'provisional' | 'unresolved'; confidence: number };
@@ -30,7 +33,8 @@ export interface AttributedAudioStore {
   reserve(range: ImmutableRange): Promise<AttributedAudioRange>;
   upload(range: ImmutableRange, pcm: readonly Uint8Array[]): Promise<{ path: string }>;
   fail(range: ImmutableRange): Promise<AttributedAudioRange>;
-  close(manifest: AttributedAudioManifest): Promise<void>;
+  /** The durable ledger, not this ephemeral worker, decides whether all ranges are terminal. */
+  close(): Promise<void>;
   load?(): Promise<AttributedAudioManifest>;
 }
 type SealInput = Omit<ImmutableRange, 'version' | 'meeting_id' | 'sequence' | 'idempotency_key' | 'clock_origin_ms' | 'byte_count' | 'sha256' | 'audio_duration_ms'> & {
@@ -52,9 +56,15 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     Object.keys(left).filter(key => key !== 'attribution' && key !== 'state' && key !== 'path').every(key =>
       (left as Record<string, unknown>)[key] === (right as Record<string, unknown>)[key])
     && JSON.stringify(left.attribution) === JSON.stringify(right.attribution);
+  const compact = () => {
+    const settled = manifest.ranges.filter(value => value.state !== 'sealed');
+    const sealed = manifest.ranges.filter(value => value.state === 'sealed');
+    manifest.ranges = [...settled.slice(-MAX_RETAINED_ATTRIBUTED_RECEIPTS), ...sealed];
+  };
   const replace = (range: AttributedAudioRange) => {
     const index = manifest.ranges.findIndex(value => value.idempotency_key === range.idempotency_key);
     if (index >= 0) manifest.ranges[index] = clone(range); else manifest.ranges.push(clone(range));
+    compact();
   };
   // Constructing a retry must not allocate an identity.  In particular, callers commonly retry
   // while the first reserve is in flight; consuming a sequence for that comparison creates a
@@ -92,11 +102,15 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     if (!store.load) return;
     const loaded = await store.load();
     if (loaded.meeting_id !== meetingId || loaded.state !== 'open') throw new Error('attributed-audio manifest is not an open manifest for this meeting');
-    manifest = clone(loaded); nextSequence = Math.max(0, ...manifest.ranges.map(range => range.sequence + 1));
+    nextSequence = Math.max(0, ...loaded.ranges.map(range => range.sequence + 1));
+    // The server owns the complete ledger.  Keep only the bounded receipt tail locally while a
+    // restart marks any unacknowledged reservations as failed.
+    const unresolved = loaded.ranges.filter(range => range.state === 'sealed');
+    manifest = { ...clone(loaded), ranges: loaded.ranges.filter(range => range.state !== 'sealed').slice(-MAX_RETAINED_ATTRIBUTED_RECEIPTS) };
     // A restart has no reserved PCM. Preserve its evidence as a durable missing outcome.
     // A restart can discover an arbitrarily long sealed tail. Reconcile it serially rather than
     // recreating one promise/closure per row before storage has made any progress.
-    for (const range of manifest.ranges.filter(value => value.state === 'sealed')) {
+    for (const range of unresolved) {
       await run({ ...range, state: undefined, path: undefined } as ImmutableRange).catch(() => undefined);
     }
   };
@@ -125,7 +139,7 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     if (tasks.size >= taskLimit) throw new Error('attributed-audio storage task admission exhausted');
     if (pcm) { if (bufferedBytes + byteCount > budgetBytes) throw new Error('attributed-audio PCM budget exceeded before durable handoff'); bufferedBytes += byteCount; }
     const range = immutable(input, byteCount, sha256, audioDurationMs, nextSequence++);
-    manifest.ranges.push({ ...range, state: 'sealed' });
+    manifest.ranges.push({ ...range, state: 'sealed' }); compact();
     return run(range, pcm);
   };
   return {
@@ -138,7 +152,9 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
       await Promise.allSettled([...tasks.values()].map(value => value.task));
       if (manifest.ranges.some(range => range.state === 'sealed')) throw new Error('attributed-audio ranges lack a durable outcome');
       const closingManifest = { ...clone(manifest), state: 'closed' as const };
-      await store.close(closingManifest); manifest = closingManifest; closed = true; return clone(manifest);
+      // Do not serialize a worker-side manifest: it is deliberately only a receipt tail.  The
+      // meeting-api seals and retains its authoritative durable ledger itself.
+      await store.close(); manifest = closingManifest; closed = true; return clone(manifest);
     },
     bufferedBytes: () => bufferedBytes, taskCount: () => tasks.size,
     // ``manifest.ranges`` is the one retained durable-accounting collection; settled tasks are
@@ -161,7 +177,10 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
   const budgetBytes = options.budgetBytes ?? DEFAULT_PCM_BUDGET_BYTES,
     gapMs = Math.min(options.gapMs ?? ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS, ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS);
   const sink = createAttributedAudioSink(meetingId, store, budgetBytes, options.maxPendingTasks);
-  const active = new Map<number, Active>(), missing = new Map<number, Missing>(), generation = new Map<number, number>();
+  const active = new Map<number, Active>(), missing = new Map<number, Missing>();
+  // A global monotonic generation is deterministic from the durable sequence and avoids an
+  // unbounded per-channel map in high-churn meetings.
+  let nextGeneration = 1;
   let origin: number | undefined, stopping = false, terminalFault: Error | undefined;
   const failClosed = () => { terminalFault ??= new Error('attributed-audio capture failed (code storage_admission)'); };
   const relative = (ms: number) => { if (origin === undefined) { origin = ms; sink.setClockOrigin(ms); } return ms - origin; };
@@ -188,7 +207,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     if (!matching) {
       if (value) flushMissing(frame.channel);
       if (missing.size >= MAX_CHANNELS) { failClosed(); return; }
-      const turn = (generation.get(frame.channel) ?? 0) + 1; generation.set(frame.channel, turn);
+      const turn = nextGeneration++;
       value = { speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name, channel: frame.channel, turn_generation: turn,
         attribution: frame.attribution, start_ms: start, end_ms: end, codec: 'pcm_f32le', sample_rate: frame.sample_rate, channels: 1, byte_count: 0, audio_duration_ms: 0 };
       missing.set(frame.channel, value);
@@ -214,7 +233,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
   };
   const ready = sink.ready.then(() => {
     const prior = sink.manifest(); origin = prior.ranges.length ? prior.clock_origin_ms : undefined;
-    for (const range of prior.ranges) generation.set(range.channel, Math.max(generation.get(range.channel) ?? 0, range.turn_generation));
+    nextGeneration = Math.max(nextGeneration, ...prior.ranges.map(range => range.turn_generation + 1));
   });
   const feed = (frame: AttributedAudioFrame): void => {
     if (stopping) throw new Error('attributed-audio recorder is stopped');
@@ -235,7 +254,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     value = active.get(frame.channel);
     if (!value) {
       if (active.size >= MAX_CHANNELS) { recordMissing(frame, start, end); return; }
-      const next = (generation.get(frame.channel) ?? 0) + 1; generation.set(frame.channel, next);
+      const next = nextGeneration++;
       value = { channel: frame.channel, speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name, attribution: frame.attribution,
         sample_rate: frame.sample_rate, channels: frame.channels ?? 1, generation: next, start_ms: start, end_ms: start, audio_duration_ms: 0, chunks: [], bytes: 0 }; active.set(frame.channel, value);
     }
@@ -256,7 +275,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
      * loss as a durable failed range rather than pretending that a complete manifest exists. */
     incomplete(frame: Omit<AttributedAudioFrame, 'pcm'>): Promise<AttributedAudioRange> {
       const start = relative(frame.capture_ms);
-      const turn = (generation.get(frame.channel) ?? 0) + 1; generation.set(frame.channel, turn);
+      const turn = nextGeneration++;
       return sink.fail({
         idempotency_key: `${meetingId}:page-boundary:${frame.channel}:${turn}:${start}`,
         speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name,

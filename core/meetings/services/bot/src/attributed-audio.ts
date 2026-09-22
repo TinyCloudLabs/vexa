@@ -46,7 +46,7 @@ export function createHttpAttributedAudioRecorder(inv: Invocation, options: { re
       return { path: receipt.path };
     },
     fail: async range => request('fail', endpoint('fail'), 'POST', metadata(range)) as Promise<any>,
-    close: async manifest => { const form = new FormData(); form.set('session_uid', inv.connectionId!); form.set('admitted_sequences', JSON.stringify(manifest.ranges.map(range => range.sequence))); await request('close', endpoint('close'), 'POST', form); },
+    close: async () => { const form = new FormData(); form.set('session_uid', inv.connectionId!); await request('close', endpoint('close'), 'POST', form); },
   };
   return createAttributedAudioRecorder(String(inv.meeting_id ?? ''), store, { budgetBytes: ATTRIBUTED_AUDIO_HTTP_PCM_BUDGET_BYTES });
 }

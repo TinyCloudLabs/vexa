@@ -293,11 +293,9 @@ async function main(): Promise<void> {
     check('join-error: failed / exit 1', res.status === 'failed' && res.exitCode === 1);
     check('join-error: failure_stage=joining', last(lc.events).failure_stage === 'joining');
     check('join-error: completion_reason=join_failure', last(lc.events).completion_reason === 'join_failure');
-    // The thrown message is the ONLY channel a join-phase cause has to `last_error`: the sealed
-    // CompletionReason enum cannot name platform-specific causes, so a typed brick throw (e.g.
-    // @vexa/join's TeamsJoinRedirectError, #915) carries its discriminator in this text.
-    check('join-error: the thrown reason text reaches the terminal event',
-      String(last(lc.events).reason ?? '').includes('navigation failed'));
+    check('join-error: terminal reason is bounded and omits injected exception text',
+      last(lc.events).reason === 'capture failed (stage=joining code=join_exception)'
+      && !JSON.stringify(last(lc.events)).includes('navigation failed'));
     check('join-error: no active emitted', !seq(lc.events).includes('active'));
     check('join-error: events conform', allConform(lc.events));
   }
@@ -335,7 +333,8 @@ async function main(): Promise<void> {
     const t = last(lc.events);
     check('reasonless#926: exit 1', res.exitCode === 1);
     check('reasonless#926: completion_reason=auth_session_missing', t.completion_reason === 'auth_session_missing');
-    check('reasonless#926: reason text is NON-NULL (carried from driver)', typeof t.reason === 'string' && t.reason.includes('auth_required'));
+    check('reasonless#926: reason is a non-null allowlisted join code',
+      t.reason === 'capture failed (stage=awaiting_admission code=join_auth_missing)');
     check('reasonless#926: events conform', allConform(lc.events));
 
     // (b) bare enum (no driver message) → orchestrator STILL stamps a derived reason (never null).
@@ -462,7 +461,8 @@ async function main(): Promise<void> {
     }).run({ pipelineStopMs: 5, recordingDrainMs: 5, platformLeaveMs: 5 });
     check('recording-drain: pipeline-start failure is bounded and emits failed',
       res.status === 'failed' && res.completionReason === 'join_failure' && Date.now() - started < 500 && left === 1);
-    check('pipeline teardown noise: detached observer retains pipeline failure', detached && last(lc.events).reason?.includes('partial capture init failed') === true);
+    check('pipeline teardown noise: detached observer retains bounded pipeline failure',
+      detached && last(lc.events).reason === 'capture failed (stage=active code=pipeline_start)');
   }
 
   // ── host removal while active → completed(evicted) ──
