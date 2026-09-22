@@ -1619,21 +1619,23 @@ class SqlAlchemyTranscriptStore:
             already_deleted = bool(
                 prior and prior.get("state", "completed") == "completed"
             )
-            if not already_deleted:
-                data["artifact_deletion"] = {
-                    "state": "pending",
-                    "requested_at": prior.get("requested_at")
-                    or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "scope": "primary_transcript_and_recording_storage",
-                    "backup_residuals": "expire_under_deployment_retention_policy",
-                }
-                meeting.data = data
-                flag_modified(meeting, "data")
-                await db.commit()
+            cleanup_version = int(prior.get("cleanup_version") or 0) + 1
+            data["artifact_deletion"] = {
+                "state": "pending",
+                "requested_at": prior.get("requested_at")
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "scope": "primary_transcript_and_recording_storage",
+                "backup_residuals": "expire_under_deployment_retention_policy",
+                "cleanup_version": cleanup_version,
+            }
+            meeting.data = data
+            flag_modified(meeting, "data")
+            await db.commit()
             return {
                 "meeting_id": meeting.id,
                 "recordings": deepcopy(list(data.get("recordings") or [])),
                 "attributed_audio_manifest": deepcopy(data.get("attributed_audio_manifest")),
+                "cleanup_version": cleanup_version,
                 "already_deleted": already_deleted,
             }
 
@@ -1654,9 +1656,13 @@ class SqlAlchemyTranscriptStore:
                 return None
             if meeting.status not in ("completed", "failed"):
                 return False
-            await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
             cleanup_plan = cleanup_plan or {}
+            deletion = data.get("artifact_deletion") or {}
+            if (deletion.get("state") != "pending"
+                    or deletion.get("cleanup_version") != cleanup_plan.get("cleanup_version")):
+                return False
+            await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
             # The objects deleted above came from this request's snapshot.  A concurrent rejected
             # PUT can restore a deterministic attributed ledger after that snapshot; preserving a
             # mismatched value makes the next public delete discover and remove it.
@@ -1671,6 +1677,7 @@ class SqlAlchemyTranscriptStore:
                 "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "scope": "primary_transcript_and_recording_storage",
                 "backup_residuals": "expire_under_deployment_retention_policy",
+                "cleanup_version": cleanup_plan["cleanup_version"],
             }
             meeting.data = data
             flag_modified(meeting, "data")

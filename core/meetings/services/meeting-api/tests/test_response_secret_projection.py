@@ -72,6 +72,9 @@ ROW_DATA = {
     # tier 1 — credential material, nobody's to read
     "webhook_secret": SECRET,
     "auth_userdata_path": USERDATA,
+    "attributed_audio_manifest": {"ranges": [{"storage_path": "attributed-audio/41/1/private.pcm"}]},
+    "artifact_deletion": {"state": "pending", "cleanup_version": 7},
+    "recordings": [{"media_files": [{"storage_path": "recordings/41/1/private.wav"}]}],
 }
 
 # Keys a reader may legitimately see — asserted present so the projection is proven to be a strip of
@@ -151,6 +154,26 @@ def test_owner_keeps_their_webhook_config_on_the_meeting_detail():
     data = client.get(f"/meetings/{_mid(store)}", headers={"x-user-id": str(OWNER)}).json()["data"]
     _assert_owner_private_present(data, where="GET /meetings/{id} (owner)")
     _assert_no_credentials(data, where="GET /meetings/{id} (owner)")
+
+
+def test_generic_meeting_projections_never_ship_attributed_cleanup_or_nonowner_storage_paths():
+    store, client = _client()
+    meeting_id = _mid(store)
+    owner_detail = client.get(f"/meetings/{meeting_id}", headers={"x-user-id": str(OWNER)}).json()["data"]
+    owner_list = client.get("/meetings", headers={"x-user-id": str(OWNER)}).json()["meetings"][0]["data"]
+    assert "attributed_audio_manifest" not in owner_detail
+    assert "artifact_deletion" not in owner_detail
+    assert "attributed_audio_manifest" not in owner_list
+    assert "artifact_deletion" not in owner_list
+
+    _share_with(client, VIEWER)
+    shared_detail = client.get(f"/meetings/{meeting_id}", headers={"x-user-id": str(VIEWER)}).json()["data"]
+    shared_list = client.get("/meetings", headers={"x-user-id": str(VIEWER)}).json()["meetings"][0]["data"]
+    for data in (shared_detail, shared_list):
+        assert "attributed_audio_manifest" not in data
+        assert "artifact_deletion" not in data
+        assert "recordings" not in data
+        assert "storage_path" not in repr(data)
 
 
 @pytest.mark.parametrize("path_for", [

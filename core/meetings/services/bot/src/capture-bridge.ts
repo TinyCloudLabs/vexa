@@ -1015,8 +1015,8 @@ export async function startCaptureBridge(
               // Playwright returns the exposed callback promise. Keep its rejection observed: the
               // Node recorder is the bounded admission point and records a durable failed row on
               // budget refusal instead of allowing an unhandled promise to retain this PCM.
-              if (name) Promise.resolve(w.__vexaNamedAudioData(ch, name, arr, ts)).catch((e: unknown) => w.logBot?.('[pertrack] attributed admission failed: ' + String(e)));
-              else Promise.resolve(w.__vexaPerSpeakerAudioData(ch, arr, ts)).catch((e: unknown) => w.logBot?.('[pertrack] attributed admission failed: ' + String(e)));
+              if (name) Promise.resolve(w.__vexaNamedAudioData(ch, name, arr, ts)).catch(() => w.logBot?.('[pertrack] attributed admission failed: upload_request_failed'));
+              else Promise.resolve(w.__vexaPerSpeakerAudioData(ch, arr, ts)).catch(() => w.logBot?.('[pertrack] attributed admission failed: upload_request_failed'));
             };
             src.connect(proc);
             proc.connect(ctx.destination);                     // pull the processor (it outputs silence)
@@ -1356,8 +1356,8 @@ export async function startCaptureBridge(
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
           const glow = lit.length === 1 ? lit[0] : undefined;
-          if (glow) Promise.resolve(w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now())).catch((e: unknown) => w.logBot?.('[gmeet] attributed admission failed: ' + String(e)));
-          else Promise.resolve(w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now())).catch((e: unknown) => w.logBot?.('[gmeet] attributed admission failed: ' + String(e)));
+          if (glow) Promise.resolve(w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now())).catch(() => w.logBot?.('[gmeet] attributed admission failed: upload_request_failed'));
+          else Promise.resolve(w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now())).catch(() => w.logBot?.('[gmeet] attributed admission failed: upload_request_failed'));
         },
       });
       await w.__vexaGmeetCapture.start();
@@ -1369,10 +1369,12 @@ export async function startCaptureBridge(
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
       mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006) }).catch((e) => {
-    console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`);
+    console.error(attributed
+      ? '[bot] capture bridge: attributed page-side start failed'
+      : `[bot] capture bridge: page-side start failed: ${String(e)}`);
     // The regular capture lane may degrade in place, but an enabled durable attributed producer
     // cannot later close an empty-success manifest after its page initialization failed.
-    if (attributed) throw e;
+    if (attributed) throw new Error('attributed-audio capture start failed');
   });
 
   // Captions are OFF by default now: the bot does not touch the meeting's UI to get a name source

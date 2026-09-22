@@ -481,24 +481,33 @@ export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTa
   let mixer: DynamicElementMixer | null = null;
   return {
     async start(): Promise<void> {
-      let stream = opts.stream;
-      if (!stream) {
-        // Dynamic mix: start recording IMMEDIATELY over the (possibly empty)
-        // destination stream and let the rescan attach media elements as they
-        // appear — late joiners land in the master, and an empty-at-join room
-        // still yields a recording once someone with audio arrives.
-        mixer = new DynamicElementMixer(opts.rescanMs ?? RESCAN_MS);
-        mixer.start();
-        stream = mixer.stream;
-        blog(`[record-chunker] dynamic mix started (${mixer.attachedCount} elements at start; rescan every ${opts.rescanMs ?? RESCAN_MS}ms)`);
+      try {
+        let stream = opts.stream;
+        if (!stream) {
+          // Dynamic mix: start recording IMMEDIATELY over the (possibly empty)
+          // destination stream and let the rescan attach media elements as they
+          // appear — late joiners land in the master, and an empty-at-join room
+          // still yields a recording once someone with audio arrives.
+          mixer = new DynamicElementMixer(opts.rescanMs ?? RESCAN_MS);
+          mixer.start();
+          stream = mixer.stream;
+          blog(`[record-chunker] dynamic mix started (${mixer.attachedCount} elements at start; rescan every ${opts.rescanMs ?? RESCAN_MS}ms)`);
+        }
+        chunker = new MediaRecorderChunker({
+          stream,
+          timesliceMs: opts.timesliceMs ?? 15000,
+          onChunk: opts.onChunk,
+          onStarted: opts.onStarted,
+        });
+        await chunker.start();
+      } catch (error) {
+        // `start()` owns a mixer before MediaRecorder is known to be viable. A construction/start
+        // rejection must release that partial graph immediately; callers may still call stop().
+        chunker = null;
+        mixer?.stop();
+        mixer = null;
+        throw error;
       }
-      chunker = new MediaRecorderChunker({
-        stream,
-        timesliceMs: opts.timesliceMs ?? 15000,
-        onChunk: opts.onChunk,
-        onStarted: opts.onStarted,
-      });
-      await chunker.start();
     },
     async stop(): Promise<void> {
       let failure: unknown;

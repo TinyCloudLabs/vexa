@@ -331,8 +331,10 @@ def build_router(
             raise HTTPException(status_code=404, detail=str(e))
         except HTTPException:
             raise
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"attributed PCM upload failed: {e}")
+        except Exception:
+            # Storage responses can contain credentials, object paths, or arbitrary upstream bodies.
+            # This internal boundary reports only a stable stage and HTTP status.
+            raise HTTPException(status_code=502, detail="attributed PCM upload failed")
         return JSONResponse(content=receipt)
 
     @router.post("/internal/attributed-audio/fail", include_in_schema=False)

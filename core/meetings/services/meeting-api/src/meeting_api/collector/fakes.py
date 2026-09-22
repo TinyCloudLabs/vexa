@@ -717,19 +717,21 @@ class InMemoryTranscriptStore:
         data = dict(m.get("data") or {})
         prior = data.get("artifact_deletion") or {}
         already_deleted = bool(prior and prior.get("state", "completed") == "completed")
-        if not already_deleted:
-            data["artifact_deletion"] = {
-                "state": "pending",
-                "requested_at": prior.get("requested_at")
-                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "scope": "primary_transcript_and_recording_storage",
-                "backup_residuals": "expire_under_deployment_retention_policy",
-            }
-            m["data"] = data
+        cleanup_version = int(prior.get("cleanup_version") or 0) + 1
+        data["artifact_deletion"] = {
+            "state": "pending",
+            "requested_at": prior.get("requested_at")
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scope": "primary_transcript_and_recording_storage",
+            "backup_residuals": "expire_under_deployment_retention_policy",
+            "cleanup_version": cleanup_version,
+        }
+        m["data"] = data
         return {
             "meeting_id": meeting_id,
             "recordings": list(data.get("recordings") or []),
             "attributed_audio_manifest": data.get("attributed_audio_manifest"),
+            "cleanup_version": cleanup_version,
             "already_deleted": already_deleted,
         }
 
@@ -741,9 +743,13 @@ class InMemoryTranscriptStore:
             return None
         if m["status"] not in ("completed", "failed"):
             return False
-        m["segments"] = {}
         data = dict(m.get("data") or {})
         cleanup_plan = cleanup_plan or {}
+        deletion = data.get("artifact_deletion") or {}
+        if (deletion.get("state") != "pending"
+                or deletion.get("cleanup_version") != cleanup_plan.get("cleanup_version")):
+            return False
+        m["segments"] = {}
         if data.get("recordings") == cleanup_plan.get("recordings"):
             data.pop("recordings", None)
         if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
@@ -755,6 +761,7 @@ class InMemoryTranscriptStore:
             "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "scope": "primary_transcript_and_recording_storage",
             "backup_residuals": "expire_under_deployment_retention_policy",
+            "cleanup_version": cleanup_plan["cleanup_version"],
         }
         m["data"] = data
         if self._redis is not None:

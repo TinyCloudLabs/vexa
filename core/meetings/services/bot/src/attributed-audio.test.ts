@@ -56,8 +56,33 @@ try {
   });
   assert.ok(recorder);
   await recorder.ready;
-  await assert.rejects(recorder.stop(), /attributed-audio request failed \(409\)/);
+  await assert.rejects(recorder.stop(), /attributed-audio close failed \(status 409\)/);
   assert.equal(recorder.retainedBytes(), 0);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+// Upstream storage errors may contain credentials, paths, PCM metadata, or arbitrary response
+// bodies. The bot boundary must retain only its bounded stage/status vocabulary.
+globalThis.fetch = async (input, init) => {
+  if (init?.method === 'GET') {
+    return Response.json({ version: 1, meeting_id: '1', clock_origin: 'first_admitted_capture_epoch_ms', clock_origin_ms: 0, state: 'open', ranges: [] });
+  }
+  if (String(input).endsWith('/close')) return new Response('s3://secret-bucket/a.pcm Authorization: Bearer secret', { status: 502 });
+  return Response.json({});
+};
+try {
+  const recorder = createHttpAttributedAudioRecorder({
+    platform: 'google_meet', meetingUrl: 'https://meet.test/a', botName: 'Vexa', redisUrl: 'redis://x',
+    transcribeEnabled: false, meeting_id: 1, connectionId: 's', attributedAudioUploadUrl: 'https://api.test/internal/attributed-audio/upload',
+  });
+  assert.ok(recorder);
+  await recorder.ready;
+  await assert.rejects(recorder.stop(), (error: unknown) => {
+    const message = String(error);
+    return message === 'Error: attributed-audio close failed (status 502)'
+      && !message.includes('secret-bucket') && !message.includes('Authorization');
+  });
 } finally {
   globalThis.fetch = originalFetch;
 }

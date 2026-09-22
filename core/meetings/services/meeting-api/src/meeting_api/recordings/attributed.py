@@ -153,6 +153,47 @@ async def reserve_attributed_range(repo, *, token_meeting_id: Optional[int], ses
     return reserved
 
 
+async def _retain_uncertain_upload_cleanup(repo, *, meeting_id: int, incoming: dict, key: str) -> None:
+    """Keep the deterministic key reachable when a PUT's outcome cannot be known.
+
+    Object stores may finish a PUT and still fail to acknowledge it to this process.  Once a
+    deletion tombstone exists, the only safe outcome is to retain the key in a new cleanup
+    generation; a later deletion owns the retry rather than guessing that no bytes were written.
+    """
+    def retain(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+        found = next((r for r in manifest["ranges"]
+                      if r.get("idempotency_key") == incoming["idempotency_key"]), None)
+        if found is None:
+            found = dict(incoming)
+            found["state"] = "failed"
+            found["path"] = f"/meetings/{meeting_id}/attributed-audio/ranges/{incoming['sequence']}"
+            manifest["ranges"].append(found)
+        found["storage_path"] = key
+        manifest["state"] = "closed"
+        next_data = dict(data_json)
+        next_data["attributed_audio_manifest"] = manifest
+        # This key was not necessarily in a deletion's storage snapshot.  Advance the fence even
+        # when the manifest happens to compare equal, so a stale finalizer cannot erase its only
+        # cleanup evidence.
+        if deletion.get("state") in ("pending", "completed"):
+            retrying = dict(deletion)
+            retrying["state"] = "pending"
+            retrying["cleanup_version"] = int(deletion.get("cleanup_version") or 0) + 1
+            retrying.pop("completed_at", None)
+            next_data["artifact_deletion"] = retrying
+        legacy = deletion.get("legacy_recording") if isinstance(deletion, dict) else None
+        if deletion.get("state") == "completed" and isinstance(legacy, dict):
+            rows = list(next_data.get("recordings") or [])
+            if not any(row.get("id") == legacy.get("id") for row in rows):
+                rows.append({**legacy, "deletion_pending": True})
+            next_data["recordings"] = rows
+        return next_data, None
+
+    await repo.mutate_meeting_data(meeting_id, retain)
+
+
 async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: Optional[int], session_uid: str, range_data: dict, data: bytes) -> dict:
     """Upload only against a pre-existing immutable reservation; upload/fail never regress uploaded."""
     meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
@@ -188,14 +229,19 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         def fail(data_json):
             deletion = data_json.get("artifact_deletion") or {}
             if deletion.get("state") in ("pending", "completed"):
-                return data_json, None
+                return data_json, True
             manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
             found = next(r for r in manifest["ranges"] if r.get("idempotency_key") == incoming["idempotency_key"])
             # A concurrent successful retry is final; a failed retry must not downgrade it.
             if found.get("state") != "uploaded": found["state"] = "failed"
             next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
-            return next_data, None
-        await repo.mutate_meeting_data(meeting_id, fail)
+            return next_data, False
+        deletion_won = await repo.mutate_meeting_data(meeting_id, fail)
+        # A raised PUT is ambiguous: the storage backend can have written the deterministic key
+        # before its acknowledgement failed.  Do not discard that key merely because a deletion
+        # raced it; retain a fenced cleanup obligation for the deletion retry.
+        if deletion_won:
+            await _retain_uncertain_upload_cleanup(repo, meeting_id=meeting_id, incoming=incoming, key=key)
         raise
 
     def acknowledge(data_json):
@@ -224,46 +270,7 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         try:
             await storage.delete(key)
         except Exception:
-            # The completed-artifact delete may already have removed the original reservation.
-            # If its compensating delete now fails, restore only this deterministic key as closed
-            # cleanup evidence. A repeat of the public completed-meeting deletion discovers it
-            # before terminalizing the same tombstone again.
-            def retain_cleanup_evidence(data_json):
-                deletion = data_json.get("artifact_deletion") or {}
-                manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
-                found = next((r for r in manifest["ranges"]
-                              if r.get("idempotency_key") == incoming["idempotency_key"]), None)
-                if found is None:
-                    found = dict(incoming)
-                    found["state"] = "failed"
-                    found["path"] = f"/meetings/{meeting_id}/attributed-audio/ranges/{incoming['sequence']}"
-                    manifest["ranges"].append(found)
-                found["storage_path"] = key
-                manifest["state"] = "closed"
-                next_data = dict(data_json)
-                next_data["attributed_audio_manifest"] = manifest
-                # This late object was absent from the deleter's snapshot. Move the durable
-                # generation forward before retaining it, so an already-running finalizer cannot
-                # accept that old snapshot and erase the only cleanup ledger for these bytes.
-                if deletion.get("state") in ("pending", "completed"):
-                    retrying = dict(deletion)
-                    retrying["state"] = "pending"
-                    retrying["cleanup_version"] = int(deletion.get("cleanup_version") or 0) + 1
-                    retrying.pop("completed_at", None)
-                    next_data["artifact_deletion"] = retrying
-                # A legacy recording delete has already removed its public row by the time this
-                # late acknowledgement discovers a failed compensating delete. Restore only its
-                # tombstoned retry handle; the next same-id delete re-snapshots and removes this
-                # deterministic object rather than leaving cleanup evidence unreachable.
-                legacy = deletion.get("legacy_recording") if isinstance(deletion, dict) else None
-                if deletion.get("state") == "completed" and isinstance(legacy, dict):
-                    rows = list(next_data.get("recordings") or [])
-                    if not any(row.get("id") == legacy.get("id") for row in rows):
-                        rows.append({**legacy, "deletion_pending": True})
-                    next_data["recordings"] = rows
-                return next_data, None
-
-            await repo.mutate_meeting_data(meeting_id, retain_cleanup_evidence)
+            await _retain_uncertain_upload_cleanup(repo, meeting_id=meeting_id, incoming=incoming, key=key)
         raise
 
 

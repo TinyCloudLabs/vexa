@@ -155,3 +155,69 @@ def test_completed_artifact_delete_is_idempotent_and_active_lifecycle_is_not_del
     assert response.status_code == 409
     assert active_store._meetings[MEETING_ID]["status"] == "active"
     assert active_storage.blobs
+
+
+def test_completed_delete_generation_fences_an_equal_manifest_snapshot():
+    """A late deterministic PUT can renew cleanup without changing the manifest value itself."""
+    import asyncio
+
+    store, _storage, _client = _fixture()
+    plan = asyncio.run(store.prepare_completed_artifact_deletion(OWNER, MEETING_ID))
+    manifest = store._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+    # Model the late PUT's durable cleanup restoration: its manifest is byte-for-byte equal to the
+    # snapshot, but its cleanup generation has advanced after the storage snapshot was taken.
+    store._meetings[MEETING_ID]["data"]["attributed_audio_manifest"] = manifest
+    store._meetings[MEETING_ID]["data"]["artifact_deletion"] = {
+        **store._meetings[MEETING_ID]["data"]["artifact_deletion"],
+        "state": "pending",
+        "cleanup_version": plan["cleanup_version"] + 1,
+    }
+    assert asyncio.run(store.finalize_completed_artifact_deletion(OWNER, MEETING_ID, plan)) is False
+    retained = store._meetings[MEETING_ID]["data"]
+    assert retained["attributed_audio_manifest"] == manifest
+    assert retained["artifact_deletion"]["state"] == "pending"
+
+
+def test_generic_delete_retries_late_put_cleanup_after_a_stale_snapshot():
+    """The completed-meeting front door retains and then cleans a late deterministic object."""
+    import asyncio
+
+    class LatePutStore(InMemoryTranscriptStore):
+        inject_late_put = True
+
+        async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None):
+            if self.inject_late_put:
+                self.inject_late_put = False
+                data = dict(self._meetings[meeting_id]["data"])
+                data["attributed_audio_manifest"] = {
+                    **cleanup_plan["attributed_audio_manifest"],
+                    "ranges": [{"storage_path": f"attributed-audio/{OWNER}/{MEETING_ID}/late/000001.pcm", "state": "failed"}],
+                }
+                data["artifact_deletion"] = {
+                    **data["artifact_deletion"], "state": "pending",
+                    "cleanup_version": cleanup_plan["cleanup_version"] + 1,
+                }
+                self._meetings[meeting_id]["data"] = data
+                storage.blobs[f"attributed-audio/{OWNER}/{MEETING_ID}/late/000001.pcm"] = b"late"
+            return await super().finalize_completed_artifact_deletion(user_id, meeting_id, cleanup_plan)
+
+    store = LatePutStore()
+    store.seed_meeting(
+        meeting_id=MEETING_ID, user_id=OWNER, platform="google_meet", native_meeting_id="private-room",
+        status="completed", data={"attributed_audio_manifest": {"state": "closed", "ranges": []}},
+    )
+    storage = InMemoryStorage()
+    client = TestClient(create_app(transcript_store=store, storage=storage), raise_server_exceptions=False)
+    headers = {"x-user-id": str(OWNER)}
+    first = client.delete(f"/meetings/{MEETING_ID}", headers=headers)
+    assert first.status_code == 409
+    retained = store._meetings[MEETING_ID]["data"]
+    assert retained["artifact_deletion"]["state"] == "pending"
+    assert retained["artifact_deletion"]["cleanup_version"] == 2
+    assert retained["attributed_audio_manifest"]["ranges"][0]["storage_path"].endswith("000001.pcm")
+    assert storage.blobs[f"attributed-audio/{OWNER}/{MEETING_ID}/late/000001.pcm"] == b"late"
+
+    # The owner retries the same generic endpoint; its new snapshot owns the restored key.
+    assert client.delete(f"/meetings/{MEETING_ID}", headers=headers).status_code == 204
+    assert storage.blobs == {}
+    assert "attributed_audio_manifest" not in store._meetings[MEETING_ID]["data"]

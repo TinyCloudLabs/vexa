@@ -59,6 +59,10 @@ LIST_OMIT_KEYS = frozenset({
     "chat_messages",
     "error_details",
     "last_error",
+    # The attributed ledger is a potentially large forensic artifact; its only read surface is the
+    # authenticated owner endpoint, never a generic list row.
+    "attributed_audio_manifest",
+    "artifact_deletion",
 })
 
 CALENDAR_SOURCE_LIST_KEYS = frozenset({
@@ -87,6 +91,11 @@ SENSITIVE_OMIT_KEYS = frozenset({
     # S3 path of the authenticated browser-session userdata used for authenticated spawns — a
     # pointer to a live browser session's cookies.
     "auth_userdata_path",
+    # The manifest names durable object keys and the deletion ledger names their cleanup state.
+    # Neither belongs on an ordinary meeting response, including the owner's; the dedicated
+    # attributed-audio endpoint is the owner-authenticated read surface.
+    "attributed_audio_manifest",
+    "artifact_deletion",
 })
 
 # ── Response-edge omissions · TIER 2: the OWNER's, and only the owner's ──────────────────────────
@@ -109,6 +118,9 @@ OWNER_ONLY_KEYS = frozenset({
     # The reader roster — every user id that can read this meeting. A share recipient enumerating it
     # learns who ELSE the owner shared with, which is other people's material, not theirs.
     "transcript_viewers",
+    # Recording rows contain storage paths. A transcript share grants transcript access, not object
+    # namespace visibility; the owner has the dedicated recordings surface.
+    "recordings",
 })
 
 # What a NON-OWNER's response drops explicitly: both tiers. Kept as one name because that is the

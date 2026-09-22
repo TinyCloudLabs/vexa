@@ -367,6 +367,62 @@ def test_attributed_reservation_persists_key_and_late_ack_deletes_object():
     assert racing.blobs == {}, "an upload whose acknowledgement loses to deletion cannot orphan PCM"
 
 
+def test_raised_uncertain_put_after_completed_delete_restores_cleanup_evidence():
+    """A storage acknowledgement error may follow a completed PUT; retain its key for retry."""
+    repo, storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "uncertain-put",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import reserve_attributed_range, upload_reserved_attributed_range
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+
+    class WritesThenRaises(InMemoryStorage):
+        async def upload(self, key, data, content_type=None):
+            await super().upload(key, data, content_type=content_type)
+            repo._meetings[MEETING_ID]["data"] = {"artifact_deletion": {"state": "completed", "cleanup_version": 4}}
+            raise RuntimeError("s3://credential-bearing-store acknowledgement timed out")
+
+    uncertain = WritesThenRaises()
+    with pytest.raises(RuntimeError):
+        asyncio.run(upload_reserved_attributed_range(repo, uncertain, token_meeting_id=MEETING_ID,
+                    session_uid=SESSION_UID, range_data=meta, data=pcm))
+    data = repo._meetings[MEETING_ID]["data"]
+    assert uncertain.blobs[reserved["storage_path"]] == pcm
+    assert data["attributed_audio_manifest"]["ranges"][0]["storage_path"] == reserved["storage_path"]
+    assert data["artifact_deletion"]["state"] == "pending"
+    assert data["artifact_deletion"]["cleanup_version"] == 5
+
+
+def test_attributed_upload_storage_error_uses_a_bounded_public_detail():
+    repo, _storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "safe-error",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+
+    class UnsafeStorage(InMemoryStorage):
+        async def upload(self, key, data, content_type=None):
+            raise RuntimeError(f"s3://private-bucket/{key} Authorization: Bearer credential")
+
+    unsafe = UnsafeStorage()
+    client = _client_for(repo, unsafe)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    headers = {"authorization": f"Bearer {token}"}
+    assert client.post("/internal/attributed-audio/reserve", headers=headers,
+                       data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 200
+    response = client.post("/internal/attributed-audio/upload", headers=headers,
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+                           files={"file": ("range.pcm", pcm, "application/octet-stream")})
+    assert response.status_code == 502
+    assert response.json() == {"detail": "attributed PCM upload failed"}
+    assert "private-bucket" not in response.text and "credential" not in response.text
+
+
 def test_restart_failure_retains_reservation_key_until_legacy_delete_cleans_put_crash():
     """reserve -> PUT crash -> restart fail -> close -> DELETE leaves no deterministic object."""
     repo, storage = _seeded()
