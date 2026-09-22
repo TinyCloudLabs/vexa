@@ -77,7 +77,9 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
       log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
       return;
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
+    // Do not make a second application-owned copy while the sink is intentionally retaining this
+    // admitted chunk. The sink keeps `bytes` reserved until this upload settles.
+    await svc.uploadChunk(url, token, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength), seq, isFinal, format);
   };
 }
 
@@ -96,10 +98,9 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
     resolve: () => void; reject: (error: Error) => void;
   }
   const jobs: Job[] = [];
-  const waiters: Array<() => void> = [];
   let retainedBytes = 0;
   let uploading = false;
-  let admitting = 0;
+  let closing = false;
   let closed = false;
   let failure: Error | null = null;
   let anyChunk = false;                                // did the tap ever deliver a chunk?
@@ -107,7 +108,6 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
 
-  const wake = (): void => { while (waiters.length) waiters.shift()!(); };
   const fail = (error: unknown): Error => error instanceof Error ? error : new Error(String(error));
   const drain = (): void => {
     if (uploading) return;
@@ -132,40 +132,30 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       } finally {
         retainedBytes -= job.bytes.byteLength;
         uploading = false;
-        wake();
         drain();
       }
     })();
   };
 
-  const waitForCapacity = async (bytes: number): Promise<void> => {
-    while (!failure && (retainedBytes + bytes > maxRetainedBytes || jobs.length + (uploading ? 1 : 0) >= MAX_QUEUED_RECORDING_CHUNKS)) {
-      await new Promise<void>((resolve) => waiters.push(resolve));
+  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, allowClosing = false): Promise<void> => {
+    if (closed || (closing && !allowClosing)) return Promise.reject(new Error('recording sink is closed'));
+    if (failure) throw failure;
+    if (bytes.byteLength > maxRetainedBytes) return Promise.reject(new Error(`recording chunk ${seq} exceeds ${maxRetainedBytes}-byte admission budget`));
+    // Reservation is synchronous and precedes every await. A caller whose bytes would exceed the
+    // budget is rejected before this sink takes ownership; it cannot sit invisibly in a waiter.
+    if (retainedBytes + bytes.byteLength > maxRetainedBytes || jobs.length + (uploading ? 1 : 0) >= MAX_QUEUED_RECORDING_CHUNKS) {
+      return Promise.reject(new Error(`recording chunk ${seq} rejected: delivery admission budget exhausted`));
     }
-    if (failure) throw failure;
-  };
-
-  const enqueue = async (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): Promise<void> => {
-    if (closed) throw new Error('recording sink is closed');
-    if (failure) throw failure;
-    if (bytes.byteLength > maxRetainedBytes) throw new Error(`recording chunk ${seq} exceeds ${maxRetainedBytes}-byte admission budget`);
     // Publish ingress state synchronously. Browser/MediaRecorder callers may invoke chunk() and
     // close() in the same turn; close must see that already-arrived part and synthesize its final.
     anyChunk = true;
     if (isFinal) finalRequested = true;
     if (seq > maxSeq) maxSeq = seq;
     lastFormat = format;
-    admitting++;
-    try {
-      await waitForCapacity(bytes.byteLength);
-      retainedBytes += bytes.byteLength;
-      const admitted = new Promise<void>((resolve, reject) => jobs.push({ seq, isFinal, format, bytes, resolve, reject }));
-      drain();
-      await admitted;
-    } finally {
-      admitting--;
-      wake();
-    }
+    retainedBytes += bytes.byteLength;
+    const admitted = new Promise<void>((resolve, reject) => jobs.push({ seq, isFinal, format, bytes, resolve, reject }));
+    drain();
+    return admitted;
   };
 
   return {
@@ -178,11 +168,14 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
         if (failure) throw failure;
         return;
       }
-      if (anyChunk && !finalRequested && !failure) await enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      // Freeze ingress before selecting the fallback sequence. All pre-close calls reserve and
+      // append synchronously, so the final marker follows them in the serialized queue.
+      closing = true;
+      if (anyChunk && !finalRequested && !failure) await enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), true);
       closed = true;
-      // Callers may already be backpressured in chunk(); wait for those admitted jobs without
-      // retaining a promise chain per chunk. A failing upload rejects close truthfully.
-      while ((uploading || jobs.length || admitting) && !failure) await new Promise<void>((resolve) => waiters.push(resolve));
+      // A failing upload rejects close truthfully. Polling is only lifecycle observation; no
+      // caller bytes are parked outside `retainedBytes` while this waits.
+      while ((uploading || jobs.length) && !failure) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (failure) throw failure;
     },
     resourceCounts() {

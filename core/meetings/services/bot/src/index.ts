@@ -32,7 +32,7 @@ import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redi
 import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
-import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
+import { createCaptureSignalRecorder, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { createResourceMonitor } from './resources.js';
@@ -200,9 +200,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
+  const captureSignalMaxBytes = resolveMaxTapeBytes();
   const signalRecorder: CaptureSignalRecorder | null =
-    (inv.captureSignalEnabled ?? env.VEXA_CAPTURE_SIGNAL === '1')
-      ? createCaptureSignalRecorder(inv)
+    inv.captureSignalEnabled === true && captureSignalMaxBytes > 0
+      ? createCaptureSignalRecorder(inv, { maxBytes: captureSignalMaxBytes })
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
   // The bot's own commentary, teed beside the tape. Started HERE — before the browser launches —

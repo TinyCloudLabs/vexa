@@ -149,18 +149,36 @@ export function startBotLogSidecar(
 export function wrapTranscriptWithSnapshot<
   S extends { segment_id: string; start?: number },
   T extends { publish(segment: S): Promise<void>; retract?(ids: string[]): Promise<void> },
->(sink: T, path: string, log: (m: string) => void = (m) => console.log(`[bot] transcript-snapshot: ${m}`)): T & { writeSnapshot: () => Promise<number> } {
+>(sink: T, path: string, log: (m: string) => void = (m) => console.log(`[bot] transcript-snapshot: ${m}`), maxRetainedBytes = 16 * 1024 * 1024): T & { writeSnapshot: () => Promise<number> } {
   const durable = new Map<string, S>();
+  let retainedBytes = 0;
+  let capped = false;
   const wrapped = {
     ...sink,
     async publish(segment: S): Promise<void> {
-      if (segment?.segment_id) durable.set(segment.segment_id, { ...segment });
+      if (segment?.segment_id) {
+        const previous = durable.get(segment.segment_id);
+        const next = { ...segment };
+        const previousBytes = previous ? Buffer.byteLength(JSON.stringify(previous)) : 0;
+        const nextBytes = Buffer.byteLength(JSON.stringify(next));
+        if (retainedBytes - previousBytes + nextBytes <= maxRetainedBytes) {
+          durable.set(segment.segment_id, next);
+          retainedBytes += nextBytes - previousBytes;
+        } else if (!capped) {
+          capped = true;
+          log(`retention cap ${maxRetainedBytes}B reached; later transcript rows are not snapshotted`);
+        }
+      }
       return sink.publish(segment);
     },
     ...(sink.retract
       ? {
         async retract(ids: string[]): Promise<void> {
-          for (const id of ids) durable.delete(id);
+          for (const id of ids) {
+            const previous = durable.get(id);
+            if (previous) retainedBytes -= Buffer.byteLength(JSON.stringify(previous));
+            durable.delete(id);
+          }
           return sink.retract!(ids);
         },
       }
@@ -308,12 +326,11 @@ export function resolveMaxTapeBytes(
 ): number {
   if (raw === undefined || raw.trim() === '') return DEFAULT_MAX_TAPE_BYTES;
   const n = Number(raw);
-  // A garbled cap is NOT an instruction to record without bound — fall back loudly to the default.
-  // (Same rule as meeting-api's env_flag: an unrecognized value is not an explicit opt-out, and a
-  // set-but-empty env line — which .env files produce constantly — must read as unset.)
+  // A malformed or non-positive cap never enables a tape. The enable flag and this positive bound
+  // are both required at the composition root.
   if (!Number.isFinite(n) || n <= 0) {
-    signalEvent('cap-invalid', { raw, using: DEFAULT_ENABLED_MAX_TAPE_BYTES });
-    return DEFAULT_ENABLED_MAX_TAPE_BYTES;
+    signalEvent('cap-invalid', { raw, using: DEFAULT_MAX_TAPE_BYTES });
+    return DEFAULT_MAX_TAPE_BYTES;
   }
   return n;
 }
@@ -407,6 +424,24 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
   const botlogPath = path.replace(/\.captured-signal\.jsonl$/, '.botlog.txt');
   const transcriptPath = path.replace(/\.captured-signal\.jsonl$/, '.transcript.jsonl');
 
+  // This function is also a public seam used by tests and embeddings. Make an off/zero cap a true
+  // no-op here as well as at the composition root: no directory, header, timer, writer, or flush
+  // promise is allocated merely because a caller constructed the diagnostic adapter.
+  // Direct construction is an explicit diagnostic API use and retains its bounded test/embedding
+  // default. Production never reaches this branch unless invocation.v1 said true *and* supplied a
+  // positive configured cap (index.ts); an explicit false/zero is always a no-op.
+  const requestedMaxBytes = opts.maxBytes ?? (inv.captureSignalEnabled === false
+    ? DEFAULT_MAX_TAPE_BYTES
+    : (resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES));
+  if (!Number.isFinite(requestedMaxBytes) || requestedMaxBytes <= 0) {
+    const noop = (): void => { /* capture diagnostics intentionally disabled */ };
+    return {
+      sink: { captureFrame: noop, captureHint: noop, captureCaption: noop, captureCsrc: noop, captureObservation: noop },
+      path, captionsPath, csrcPath, observationsPath, botlogPath, transcriptPath,
+      bytesWritten: () => 0, isCapped: () => false, close: async () => {},
+    };
+  }
+
   const headerLine = JSON.stringify(sessionHeader(inv, startedAt)) + '\n';
   let writer: SignalWriter | null = null;
   let flushing: Promise<void> = Promise.resolve();
@@ -442,7 +477,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
   // incident.
   // The composition root calls this only after VEXA_CAPTURE_SIGNAL/captureSignalEnabled opted in.
   // Direct callers retain the bounded diagnostic default; an unset process never creates it.
-  const maxBytes = opts.maxBytes ?? (resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES);
+  const maxBytes = requestedMaxBytes;
   let written = writer ? headerLine.length : 0;
   let capped = false;
 

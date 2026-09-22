@@ -57,16 +57,17 @@ async function main(): Promise<void> {
     });
     const first = sink.chunk('google_meet/bound', 0, false, 'webm', new Uint8Array(12));
     await flush();
-    const second = sink.chunk('google_meet/bound', 1, false, 'webm', new Uint8Array(12));
+    let secondRejected = false;
+    const second = sink.chunk('google_meet/bound', 1, false, 'webm', new Uint8Array(12)).catch(() => { secondRejected = true; });
     await flush();
     check('backpressure: retained bytes never exceed admission budget', sink.resourceCounts().retainedBytes <= 16,
       JSON.stringify(sink.resourceCounts()));
-    check('backpressure: second chunk waits instead of accumulating a byte queue', sink.resourceCounts().queuedChunks === 1,
+    check('atomic admission: same-tick second 12-byte chunk is rejected before it can retain 24 bytes', secondRejected,
       JSON.stringify(sink.resourceCounts()));
     release();
     await Promise.all([first, second]);
     await sink.close('google_meet/bound');
-    check('backpressure: every admitted chunk is delivered in order', delivered.slice(0, 2).join(',') === '0,1', delivered.join(','));
+    check('backpressure: admitted data is delivered before the close fallback marker', delivered.join(',') === '0,1', delivered.join(','));
     check('backpressure: close returns retained bytes to zero', sink.resourceCounts().retainedBytes === 0,
       JSON.stringify(sink.resourceCounts()));
   }
@@ -84,6 +85,26 @@ async function main(): Promise<void> {
     release();
     await closing;
     check('drain: data and final acknowledged before close resolves', delivered.join(',') === '0,1');
+  }
+  // close() freezes new ingress, but it must not jump its fallback marker ahead of chunks that
+  // were already admitted in the same turn while seq0's uploader was stalled.
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: Array<{ seq: number; final: boolean }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), uploadChunk: async (seq, final) => { await blocked; delivered.push({ seq, final }); },
+    });
+    const zero = sink.chunk('google_meet/close-order', 0, false, 'webm', new Uint8Array([0]));
+    const one = sink.chunk('google_meet/close-order', 1, false, 'webm', new Uint8Array([1]));
+    const closing = sink.close('google_meet/close-order');
+    await flush();
+    release();
+    await Promise.all([zero, one, closing]);
+    check('close order: blocked seq0, queued seq1, then fallback final',
+      delivered.map((x) => `${x.seq}:${x.final}`).join(',') === '0:false,1:false,2:true', JSON.stringify(delivered));
+    check('close order: counters return to zero after drained close', sink.resourceCounts().retainedBytes === 0,
+      JSON.stringify(sink.resourceCounts()));
   }
   // ── 1) each timeslice uploads IMMEDIATELY, in seq order, bytes forwarded ─────────────────────
   {

@@ -16,8 +16,8 @@
  * already has one mixed stream) — that lives in each lane; the MediaRecorder
  * loop is identical and lives here.
  *
- * No fallbacks: if `onChunk` throws or returns false we splice the chunk anyway
- * and log (the server-side reconciler re-fetches via the chunk_seq contract);
+ * A rejected bridge acknowledgement is terminal: the recorder stops and `stop()` rejects rather
+ * than sending a final marker that would claim completion after an admitted chunk was lost.
  * if no supported mimeType exists we log and refuse to start.
  */
 
@@ -48,9 +48,13 @@ export interface RecordingTapOptions {
 export interface MediaRecorderChunkerOptions extends RecordingTapOptions {
   /** Combined audio stream to record (lane-built). */
   stream: MediaStream;
+  /** Maximum Blob bytes owned between MediaRecorder and the Node bridge. */
+  maxPendingBytes?: number;
+  /** A stopped recorder that never produces its terminal event is a failed recording, not success. */
+  stopTimeoutMs?: number;
 }
 
-const BUFFER_CAP = 10;
+const DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024;
 
 /** The 4-byte EBML magic every valid webm/Matroska stream starts with (`1a 45 df a3`). */
 const EBML_MAGIC = [0x1a, 0x45, 0xdf, 0xa3];
@@ -72,9 +76,13 @@ export class MediaRecorderChunker implements RecordingTap {
   private opts: MediaRecorderChunkerOptions;
   private recorder: MediaRecorder | null = null;
   private chunkSeq = 0;
-  private pending: Blob[] = [];
-  private deliveries: Promise<void> = Promise.resolve();
+  private pending: Array<{ blob: Blob; seq: number }> = [];
+  private pendingBytes = 0;
+  private processing = false;
+  private pausedForBackpressure = false;
+  private failure: Error | null = null;
   private resolveFinalChunk: (() => void) | null = null;
+  private rejectFinalChunk: ((error: Error) => void) | null = null;
   private finalTimer: ReturnType<typeof setTimeout> | null = null;
   private mimeType = "audio/webm";
   /**
@@ -94,6 +102,77 @@ export class MediaRecorderChunker implements RecordingTap {
   /** The underlying MediaRecorder (null until start()). */
   getMediaRecorder(): MediaRecorder | null {
     return this.recorder;
+  }
+
+  /** Bytes and chunks retained by this browser-side admission boundary. */
+  resourceCounts(): { retainedBytes: number; queuedChunks: number; processing: boolean; failed: boolean } {
+    return {
+      retainedBytes: this.pendingBytes,
+      queuedChunks: this.pending.length,
+      processing: this.processing,
+      failed: !!this.failure,
+    };
+  }
+
+  private fail(error: unknown): void {
+    if (this.failure) return;
+    this.failure = error instanceof Error ? error : new Error(String(error));
+    blog(`[record-chunker] terminal failure: ${this.failure.message}`);
+    const recorder = this.recorder;
+    try { if (recorder?.state === 'recording') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
+  }
+
+  private maybeResume(): void {
+    const recorder = this.recorder;
+    if (!this.pausedForBackpressure || this.failure || !recorder || recorder.state !== 'paused') return;
+    // Resume only after the queued Blob ownership is below half the cap. This gives the recorder
+    // room for its next timeslice instead of pause/resume thrashing around one byte of headroom.
+    if (this.pendingBytes > this.maxPendingBytes() / 2) return;
+    try { recorder.resume(); this.pausedForBackpressure = false; } catch (error) { this.fail(error); }
+  }
+
+  private maxPendingBytes(): number {
+    return this.opts.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
+  }
+
+  private pump(): void {
+    if (this.processing || this.failure) return;
+    const next = this.pending.shift();
+    if (!next) { this.maybeResume(); return; }
+    this.processing = true;
+    void this.deliver(next).finally(() => {
+      this.pendingBytes -= next.blob.size;
+      this.processing = false;
+      this.maybeResume();
+      this.pump();
+    });
+  }
+
+  private async deliver(item: { blob: Blob; seq: number }): Promise<void> {
+    try {
+      const arrBuffer = await item.blob.arrayBuffer();
+      let bytes = new Uint8Array(arrBuffer);
+      if (!this.initSegment && isWebmHeader(bytes)) this.initSegment = bytes;
+      if (this.initSegment && !this.initSegmentDelivered && !isWebmHeader(bytes)) {
+        const merged = new Uint8Array(this.initSegment.length + bytes.length);
+        merged.set(this.initSegment, 0);
+        merged.set(bytes, this.initSegment.length);
+        bytes = merged;
+        blog(`[record-chunker] chunk ${item.seq} re-attached EBML init segment (${this.initSegment.length}B)`);
+      }
+      const carriesHeader = isWebmHeader(bytes);
+      let binary = '';
+      const encodeChunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += encodeChunkSize) binary += String.fromCharCode(...bytes.subarray(i, i + encodeChunkSize));
+      const ok = await this.opts.onChunk({ base64: btoa(binary), chunkSeq: item.seq, isFinal: false, mimeType: this.mimeType });
+      if (carriesHeader) this.initSegmentDelivered = !!ok;
+      // A false bridge acknowledgement means the durable sink did not own this admitted chunk.
+      // Continuing to a final marker would falsely claim a complete recording.
+      if (!ok) throw new Error(`recording chunk ${item.seq} was rejected by the bridge`);
+      blog(`[record-chunker] chunk ${item.seq} (${bytes.length} bytes)`);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   async start(): Promise<void> {
@@ -127,77 +206,39 @@ export class MediaRecorderChunker implements RecordingTap {
     // t=0 of the master — listeners align segment timestamps to audio origin.
     recorder.onstart = () => { try { this.opts.onStarted?.(); } catch { /* */ } };
 
+    const maxPendingBytes = this.maxPendingBytes();
+    if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes <= 0) throw new Error('record-chunker maxPendingBytes must be a positive integer');
+
     recorder.ondataavailable = (event: BlobEvent) => {
       if (!(event.data && event.data.size > 0)) {
         blog("[record-chunker] dataavailable fired with empty data (skipping)");
         return;
       }
 
-      // Defensive buffer + cap — successful callbacks splice; the cap should
-      // never trip in normal operation (the reconciler re-fetches if it does).
-      this.pending.push(event.data);
-      if (this.pending.length > BUFFER_CAP) {
-        const dropped = this.pending.shift();
-        blog(`[record-chunker] WARN buffer exceeded cap ${BUFFER_CAP}, dropped oldest (${dropped?.size ?? 0} bytes); reconciler will re-fetch`);
+      if (this.failure) return;
+      // The browser cannot await an event listener. Admit its Blob synchronously, pause the
+      // recorder before another timeslice can arrive, and fail terminally if one event itself is
+      // larger than the declared ownership budget. No admitted Blob is ever discarded.
+      if (event.data.size > maxPendingBytes || this.pendingBytes + event.data.size > maxPendingBytes) {
+        this.fail(new Error(`recording producer overflow: ${event.data.size}B event exceeds ${maxPendingBytes}B pending budget`));
+        return;
       }
-
-      const seq = this.chunkSeq;
-      this.chunkSeq = seq + 1;
-
-      // Blob reads and host acknowledgements can finish out of order. Serialize both so
-      // the final marker follows every preceding audio chunk callback.
-      this.deliveries = this.deliveries.then(async () => {
-        try {
-          const arrBuffer = await event.data.arrayBuffer();
-          let bytes = new Uint8Array(arrBuffer);
-
-          // Retain the EBML init segment from the FIRST self-describing blob. webm/Matroska always
-          // starts with `1a 45 df a3`; MediaRecorder puts EBML + Segment + Tracks in chunk 0.
-          if (!this.initSegment && isWebmHeader(bytes)) this.initSegment = bytes;
-
-          // If the init segment has NOT yet been delivered (chunk 0's own send failed over the
-          // bridge) and THIS chunk is cluster-only, PREPEND the retained header so the master is
-          // never assembled headerless. The byte-concat codec keeps this valid: a chunk that is
-          // [EBML init][cluster] is exactly what a self-describing chunk 0 looks like.
-          if (this.initSegment && !this.initSegmentDelivered && !isWebmHeader(bytes)) {
-            const merged = new Uint8Array(this.initSegment.length + bytes.length);
-            merged.set(this.initSegment, 0);
-            merged.set(bytes, this.initSegment.length);
-            bytes = merged;
-            blog(`[record-chunker] chunk ${seq} re-attached EBML init segment (${this.initSegment.length}B) — chunk 0 delivery was lost`);
-          }
-
-          const carriesHeader = isWebmHeader(bytes);
-          let binary = "";
-          const encodeChunkSize = 0x8000;
-          for (let i = 0; i < bytes.length; i += encodeChunkSize) {
-            binary += String.fromCharCode(...bytes.subarray(i, i + encodeChunkSize));
-          }
-          const base64 = btoa(binary);
-          blog(`[record-chunker] chunk ${seq} (${bytes.length} bytes)`);
-          try {
-            const ok = await this.opts.onChunk({ base64, chunkSeq: seq, isFinal: false, mimeType: this.mimeType });
-            // A header-bearing chunk that the sink REJECTED is not delivered — clear the flag so the
-            // retained init segment is re-attached to the next surviving (cluster-only) chunk.
-            if (carriesHeader) this.initSegmentDelivered = !!ok;
-            if (!ok) blog(`[record-chunker] chunk ${seq} callback returned false — sink rejected; reconciler will re-fetch`);
-          } catch (cbErr: any) {
-            if (carriesHeader) this.initSegmentDelivered = false;
-            blog(`[record-chunker] chunk ${seq} callback threw: ${cbErr?.message || cbErr}; reconciler will re-fetch`);
-          } finally {
-            const idx = this.pending.indexOf(event.data);
-            if (idx >= 0) this.pending.splice(idx, 1);
-          }
-        } catch (err: any) {
-          const idx = this.pending.indexOf(event.data);
-          if (idx >= 0) this.pending.splice(idx, 1);
-          blog(`[record-chunker] chunk ${seq} encode FAILED: ${err?.message || err}; spliced`);
-        }
-      });
+      const seq = this.chunkSeq++;
+      this.pending.push({ blob: event.data, seq });
+      this.pendingBytes += event.data.size;
+      if (recorder.state === 'recording') {
+        try { recorder.pause(); this.pausedForBackpressure = true; } catch (error) { this.fail(error); return; }
+      }
+      this.pump();
     };
 
     recorder.onstop = async () => {
-      await this.deliveries;
+      while ((this.processing || this.pending.length) && !this.failure) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (this.failure) {
+        if (this.finalTimer !== null) { clearTimeout(this.finalTimer); this.finalTimer = null; }
+        this.rejectFinalChunk?.(this.failure); this.resolveFinalChunk = null; this.rejectFinalChunk = null;
+        return;
+      }
       // Final chunk (empty body OK — server treats isFinal=true as the COMPLETED signal).
       try {
         const finalSeq = this.chunkSeq;
@@ -205,10 +246,11 @@ export class MediaRecorderChunker implements RecordingTap {
         await this.opts.onChunk({ base64: "", chunkSeq: finalSeq, isFinal: true, mimeType: this.mimeType });
         blog(`[record-chunker] final chunk emitted (seq=${finalSeq})`);
       } catch (err: any) {
-        blog(`[record-chunker] final chunk callback failed: ${err?.message || err}`);
+        this.fail(err);
       } finally {
         if (this.finalTimer !== null) { clearTimeout(this.finalTimer); this.finalTimer = null; }
-        if (this.resolveFinalChunk) { this.resolveFinalChunk(); this.resolveFinalChunk = null; }
+        if (this.failure) this.rejectFinalChunk?.(this.failure); else this.resolveFinalChunk?.();
+        this.resolveFinalChunk = null; this.rejectFinalChunk = null;
       }
     };
 
@@ -218,17 +260,23 @@ export class MediaRecorderChunker implements RecordingTap {
 
   async stop(): Promise<void> {
     if (!this.recorder) { blog("[record-chunker] stop() before start() — ignoring"); return; }
-    if (this.recorder.state === "inactive") { blog("[record-chunker] recorder already inactive"); return; }
+    if (this.recorder.state === "inactive") {
+      if (this.failure) throw this.failure;
+      blog("[record-chunker] recorder already inactive");
+      return;
+    }
 
-    const finalChunkPromise = new Promise<void>((resolve) => {
+    const finalChunkPromise = new Promise<void>((resolve, reject) => {
       this.resolveFinalChunk = resolve;
+      this.rejectFinalChunk = reject;
       this.finalTimer = setTimeout(() => {
         this.finalTimer = null;
-        if (this.resolveFinalChunk) {
-          blog("[record-chunker] final chunk timeout — resolving");
-          this.resolveFinalChunk(); this.resolveFinalChunk = null;
+        if (this.rejectFinalChunk) {
+          const error = new Error('MediaRecorder stop timed out before the recording drained');
+          this.fail(error);
+          this.rejectFinalChunk(error); this.resolveFinalChunk = null; this.rejectFinalChunk = null;
         }
-      }, 10000);
+      }, this.opts.stopTimeoutMs ?? 10000);
     });
 
     try { this.recorder.stop(); }

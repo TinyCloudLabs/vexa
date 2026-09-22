@@ -35,8 +35,8 @@ const seconds = Number(
   process.argv[3] ?? process.env.VEXA_TEST_MEMORY_SECONDS ?? 600,
 );
 assert(
-  Number.isSafeInteger(seconds) && seconds >= 15 && seconds <= 7200,
-  "duration must be 15–7200 seconds",
+  Number.isSafeInteger(seconds) && seconds >= 15 && seconds <= 10_800,
+  "duration must be 15–10800 seconds",
 );
 const videoCount = Number(
   process.argv[4] ?? process.env.VEXA_TEST_MEMORY_VIDEOS ?? 0,
@@ -72,6 +72,10 @@ let finalSeen = false;
 let partsAfterFinal = 0;
 const resources = createResourceMonitor();
 let recordingSink: ReturnType<typeof createBotRecordingSink> | undefined;
+// The probe deliberately injects a recording-only pipeline. Keep its accounting as a resource
+// source, rather than spelling a fictional STT number into measurements.
+const liveSttResources = { retainedBytes: 0 };
+const liveSttRetainedBytes = (): number => liveSttResources.retainedBytes;
 try {
   const launched = await launchPersistentBrowser({
     dataDir: profile,
@@ -457,7 +461,7 @@ try {
       captureResources,
       recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
       recordingQueuedChunks: recordingSink?.resourceCounts().queuedChunks ?? 0,
-      liveSttRetainedBytes: 0,
+      liveSttRetainedBytes: liveSttRetainedBytes(),
       captureStreams,
       heapUsage,
       ...heap,
@@ -482,17 +486,18 @@ try {
       () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
     ).catch(() => ({ contexts: -1, sources: -1, worklets: -1, tracks: -1 })),
     recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
-    liveSttRetainedBytes: 0,
+    liveSttRetainedBytes: liveSttRetainedBytes(),
   };
   assert.equal(postStop.recordingRetainedBytes, 0, 'recording delivery releases retained bytes after stop');
-  assert.equal(postStop.liveSttRetainedBytes, 0, 'disabled live STT retains no bytes');
+  assert.equal(postStop.liveSttRetainedBytes, 0, 'injected live-STT resource source releases bytes after stop');
+  assert.deepEqual(postStop.capture, { contexts: 0, sources: 0, worklets: 0, tracks: 0 }, 'capture contexts, sources, worklets and tracks are released after stop');
   if (mode !== "recording" && mode !== "idle") {
     if (liveMeetUrl) {
       assert(frames > 0, "live Meet delivered captured audio frames");
     } else {
       const minimumFrames = Math.floor(((sampledDurationMs * 16000) / (1000 * 4096)) * 0.99);
-      assert(framesByChannel.size >= 3, "all three persistent audio channels captured");
-      for (const [channel, count] of [...framesByChannel.entries()].filter(([channel]) => channel < 3)) {
+      for (const channel of [0, 1, 2]) {
+        const count = framesByChannel.get(channel) ?? 0;
         assert(
           count >= minimumFrames,
           `channel ${channel}: ${count} frames, expected at least ${minimumFrames} (99% of nominal PCM duration)`,

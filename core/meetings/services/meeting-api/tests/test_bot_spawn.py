@@ -1181,33 +1181,25 @@ def test_passcode_is_not_written_onto_non_teams_join_urls(monkeypatch):
 
 # ── O-TEL-1: what the spawn resolves when identity answers, and when it does not ─────────────────
 
-async def test_spawn_defaults_capture_signal_on_when_identity_is_unreachable(monkeypatch):
-    """No ADMIN_API_URL / a 500 / an admin-api that predates the field → the tape still runs.
-
-    The failure this forbids is silent: a transient identity blip turns fixture collection off
-    fleet-wide, prod looks entirely healthy, and nobody notices until someone asks why no fixtures
-    arrived. The bot-context lookup is best-effort by contract, so its failure mode must be the
-    product default, not the absence of one.
-    """
+async def test_spawn_defaults_capture_signal_off_when_identity_is_unreachable(monkeypatch):
+    """Diagnostics are opt-in: an unavailable identity service cannot start a tape."""
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     await request_bot(repo, runtime, user_id=USER, platform="google_meet",
                       native_meeting_id="ctx-unreachable", redis_url="redis://redis:6379/0",
                       token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
-    assert inv["captureSignalEnabled"] is True
+    assert inv["captureSignalEnabled"] is False
 
 
 @pytest.mark.parametrize("ctx,expected,slug", [
     ({"capture_signal": True}, True, "on"),
     ({"capture_signal": False}, False, "off"),
-    ({}, True, "absent"),                     # an older admin-api has no such key → default ON
-    ({"capture_signal": "false"}, True, "str"),   # only a real boolean false is the kill switch
+    ({}, False, "absent"),                   # an older admin-api has no opt-in → disabled
+    ({"capture_signal": "false"}, False, "str"),  # malformed contract value → disabled
 ])
 async def test_spawn_threads_capture_signal_from_bot_context(monkeypatch, ctx, expected, slug):
-    """One hop, two readers: the same best-effort bot-context call feeds the STT backend AND the
-    tape flag. The string case is deliberate — identity normalizes the settings string into a real
-    boolean, so a string arriving here means a contract drift, and defaulting ON is the safe read."""
+    """Only the typed opt-in from the shared bot-context hop reaches the invocation."""
     from meeting_api.bot_spawn import service as spawn_service
 
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
