@@ -36,6 +36,9 @@ export interface AttributedAudioManifest {
 export interface AttributedAudioStore {
   /** Durably write bytes and return their immutable retrieval URL before this promise resolves. */
   put(range: Omit<AttributedAudioRange, 'state' | 'url'>, pcm: Uint8Array): Promise<{ url: string }>;
+  /** Persist the manifest/range ledger. This is distinct from object storage: a failed upload is
+   * evidence too, and must survive before a later close can publish the manifest. */
+  save(manifest: AttributedAudioManifest): Promise<void>;
   close(manifest: AttributedAudioManifest): Promise<void>;
 }
 
@@ -43,40 +46,71 @@ export interface AttributedAudioStore {
 export function createAttributedAudioSink(meetingId: string, store: AttributedAudioStore, budgetBytes = DEFAULT_PCM_BUDGET_BYTES) {
   const manifest: AttributedAudioManifest = { version: 1, meeting_id: meetingId, state: 'open', ranges: [] };
   let bufferedBytes = 0;
+  let nextSequence = 0;
+  let closing = false;
   let closed = false;
+  const admitted = new Map<string, Promise<AttributedAudioRange>>();
+
+  const snapshot = () => structuredClone(manifest);
+  const persist = () => store.save(snapshot());
   return {
-    manifest: () => structuredClone(manifest),
-    async seal(input: Omit<AttributedAudioRange, 'version' | 'meeting_id' | 'sequence' | 'idempotency_key' | 'byte_count' | 'sha256' | 'state'>, pcm: Float32Array): Promise<AttributedAudioRange> {
-      if (closed) throw new Error('attributed-audio manifest is closed');
+    manifest: snapshot,
+    async seal(input: Omit<AttributedAudioRange, 'version' | 'meeting_id' | 'sequence' | 'byte_count' | 'sha256' | 'state'> & { idempotency_key?: string }, pcm: Float32Array): Promise<AttributedAudioRange> {
+      if (closing || closed) throw new Error('attributed-audio manifest is closed');
       const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
       if (bufferedBytes + bytes.byteLength > budgetBytes) throw new Error('attributed-audio PCM budget exceeded before durable handoff');
-      bufferedBytes += bytes.byteLength;
-      const sequence = manifest.ranges.length;
-      const idempotency_key = `${meetingId}:${input.speaker_key}:${input.start_ms}:${sequence}`;
+      const idempotency_key = input.idempotency_key ?? `${meetingId}:${input.speaker_key}:${input.start_ms}:${input.end_ms}`;
+      const duplicate = admitted.get(idempotency_key);
+      if (duplicate) return duplicate;
+      const sequence = nextSequence++;
       const range: Omit<AttributedAudioRange, 'state' | 'url'> = {
         ...input, version: ATTRIBUTED_AUDIO_VERSION, meeting_id: meetingId, sequence, idempotency_key,
         byte_count: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
       };
-      try {
-        const persisted = await store.put(range, bytes);
-        const complete: AttributedAudioRange = { ...range, state: 'uploaded', url: persisted.url };
-        manifest.ranges.push(complete);
-        return complete;
-      } catch (error) {
-        manifest.ranges.push({ ...range, state: 'failed' });
-        throw error;
-      } finally {
-        // The caller may now release its Float32Array: persistence completed (or a durable failure is recorded).
-        bufferedBytes -= bytes.byteLength;
-      }
+      // Reserve synchronously before any await. A close therefore sees every admitted range and
+      // concurrent callers cannot re-use a sequence number.
+      const entry: AttributedAudioRange = { ...range, state: 'sealed' };
+      manifest.ranges.push(entry);
+      bufferedBytes += bytes.byteLength;
+      const upload = (async () => {
+        try {
+          await persist();
+          const persisted = await store.put(range, bytes);
+          entry.state = 'uploaded';
+          entry.url = persisted.url;
+          await persist();
+          return structuredClone(entry);
+        } catch (error) {
+          entry.state = 'failed';
+          delete entry.url;
+          // Do not call an in-memory row durable. If this fails, close retries this exact
+          // manifest publication rather than pretending the failure was recorded.
+          await persist();
+          throw error;
+        } finally {
+          bufferedBytes -= bytes.byteLength;
+        }
+      })();
+      admitted.set(idempotency_key, upload);
+      return upload;
     },
     async close(): Promise<AttributedAudioManifest> {
-      if (!closed) {
+      if (closed) return snapshot();
+      closing = true;
+      // Admissions are frozen first, then every previously admitted upload settles. Failed
+      // ranges remain in the manifest; none can disappear behind a close race.
+      await Promise.allSettled([...admitted.values()]);
+      manifest.state = 'closed';
+      try {
+        await persist();
+        await store.close(snapshot());
         closed = true;
-        manifest.state = 'closed';
-        await store.close(manifest);
+        return snapshot();
+      } catch (error) {
+        // Keep admission closed, but permit retrying manifest publication/close.
+        manifest.state = 'open';
+        throw error;
       }
-      return structuredClone(manifest);
     },
     bufferedBytes: () => bufferedBytes,
   };
