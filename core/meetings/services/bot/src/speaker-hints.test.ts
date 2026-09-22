@@ -27,7 +27,9 @@ const check = (name: string, cond: boolean, detail = '') => {
 
 const inv = (platform: Invocation['platform']): Invocation => ({
   platform, meetingUrl: 'https://example.test/m', botName: 'Vexa',
-  redisUrl: 'redis://localhost:6379', transcribeEnabled: false,
+  // These composition cases exercise the enabled-transcription lane factories. Recording-only
+  // null-pipeline allocation is covered explicitly in pipeline.test.ts.
+  redisUrl: 'redis://localhost:6379', transcribeEnabled: true,
 });
 const nullSink: TranscriptSink = { async publish() { /* discard */ } };
 

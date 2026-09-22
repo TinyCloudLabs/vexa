@@ -105,6 +105,12 @@ Measurements include process RSS, renderer JS heap, capture frame counts, record
 and chunk order. Audio is saved as `master.webm` for independent decoding. A two-GiB browser-RSS
 guard aborts the local fixture; it is not a measured production capacity limit.
 
+Set `VEXA_TEST_MEMORY_STT=1` to run the production GMeet STT pipeline with a local deterministic
+transcriber. Its measurements report the pipeline-owned PCM window, including a required
+positive-retention and post-stop-zero control. Without it, `liveStt` is explicitly `disabled`
+(with no synthetic byte count). The 10,800-second qualification requires this setting and fails
+when the owner measurement is unavailable.
+
 This probe measures components on the host where it runs. macOS RSS can omit compressed memory;
 use Linux cgroup measurements for the deployment budget. A flat synthetic trace does not prove
 a real Google Meet is stable. The deployment still requires a controlled 60-minute Meet and

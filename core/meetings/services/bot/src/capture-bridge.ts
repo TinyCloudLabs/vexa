@@ -1270,6 +1270,8 @@ export async function startCaptureBridge(
         ?? w.VexaBrowserUtils.createGmeetSpeakers?.({ log: (m: string) => w.logBot?.('[PerSpeaker] ' + m) });
       w.__vexaGmeetCapture = w.VexaBrowserUtils.createGmeetCapture({
         log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
+        // Probe-only override: production leaves this unset and retains the conservative scan.
+        rescanMs: Number.isFinite(w.__vexaCaptureRescanMs) ? w.__vexaCaptureRescanMs : undefined,
         onAudio: (index: number, pcm: Float32Array) => {
           w.__vexaGmeetSpeakers?.reportTrackAudio?.(index);
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
@@ -1383,10 +1385,13 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     return Number.isFinite(n) && n > 0 ? n : 15000;
   })();
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
-  await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
+  await page.exposeFunction('__vexaRecordingChunk', async (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): Promise<void> => {
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
     const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
-    recording.chunk(key, chunkSeq, isFinal, format, bytes);
+    // Await admission and durable upload. The page's chunker awaits this exposed function, so a
+    // slow remote uploader pauses production at the capture boundary instead of accumulating
+    // base64 strings, promises, or PCM in Node.
+    await recording.chunk(key, chunkSeq, isFinal, format, bytes);
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
   // Page-side: start the generic recording tap (finds + combines the page audio elements).
@@ -1406,10 +1411,17 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
-    await page.evaluate(async () => {
+    try {
+      await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
-      try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
-    }).catch(() => { /* page already gone */ });
+        await w.__vexaRecordingTap?.stop?.();
+      });
+    } catch (error) {
+      // The page producer, not the recording sink, knows that capture was incomplete. Carry that
+      // fact across the bridge before teardown so close() cannot add an is_final success marker.
+      recording.abort(error);
+      throw error;
+    }
   };
 }
 

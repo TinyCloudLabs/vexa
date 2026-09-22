@@ -55,6 +55,7 @@ export interface GmeetPipeline {
   feedAudio(channel: number, glowName: string | undefined, pcm: Float32Array, tsMs: number): void;
   flush(): Promise<void>;
   dispose(): Promise<void>;
+  resourceCounts(): { retainedPcmBytes: number };
 }
 
 export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
@@ -303,5 +304,6 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
       })();
       return disposePromise;
     },
+    resourceCounts: () => ({ retainedPcmBytes: mgr.resourceCounts().retainedPcmBytes }),
   };
 }

@@ -25,7 +25,7 @@ import {
   uploadSignalTapes,
   type TapePart,
 } from './signal-upload.js';
-import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
+import { captureSignalEnabled, createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
 import type { Invocation } from './config.js';
 import type { CapturedFrame } from './ports.js';
 import type { CsrcRecord, ObservationRecord, TeamsCaptionRecord } from './capture-bridge.js';
@@ -91,9 +91,14 @@ console.log('\n── tape size cap ──');
   // The .env.example failure class (v0.12.5): a set-but-EMPTY line must read as unset, not as 0 —
   // and a garbled value must not read as "record without bound".
   check('cap default when env empty', resolveMaxTapeBytes('') === DEFAULT_MAX_TAPE_BYTES);
-  check('cap default when env garbled', resolveMaxTapeBytes('lots') === DEFAULT_MAX_TAPE_BYTES);
-  check('cap default when env <= 0', resolveMaxTapeBytes('0') === DEFAULT_MAX_TAPE_BYTES);
+  check('cap invalid value stays disabled', resolveMaxTapeBytes('lots') === DEFAULT_MAX_TAPE_BYTES);
+  check('cap invalid <= 0 stays disabled', resolveMaxTapeBytes('0') === DEFAULT_MAX_TAPE_BYTES);
   check('explicit cap honored', resolveMaxTapeBytes('1024') === 1024);
+  check('diagnostics require identity explicit true plus a positive cap',
+    captureSignalEnabled(inv({ captureSignalEnabled: true }), '1024')
+      && !captureSignalEnabled(inv({ captureSignalEnabled: true }), '')
+      && !captureSignalEnabled(inv({ captureSignalEnabled: false }), '1024')
+      && !captureSignalEnabled(inv({}), '1024'));
 }
 
 // ── the Teams CC sidecar ────────────────────────────────────────────────────────────────────────

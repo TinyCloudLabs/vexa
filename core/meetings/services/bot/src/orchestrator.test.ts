@@ -28,10 +28,11 @@ import {
   type MeetingResult,
 } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
+import { createBotRecordingSink } from './recording.js';
 import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
 import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
-import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
+import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, Pipeline, TranscriptSink, PrimaryReachability } from './ports.js';
 import type { Invocation } from './config.js';
 import { noopAloneness, controlledAloneness, noopPipeline, noopActs } from './test-doubles.js';
 
@@ -225,6 +226,27 @@ async function main(): Promise<void> {
   // ── producer-owned event time: admission/runtime billing survives callback delay ──
   {
     const lc = recordingSink();
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join: mockJoin('admitted'),
+      pipeline: { async start() {}, async stop() { throw new Error('MediaRecorder stop timed out'); } },
+      acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+      recording: { async close() { throw new Error('recording producer overflow'); } },
+    });
+    const running = o.run();
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    const result = await running;
+    check('capture/recording teardown failure is failed, never completed', result.status === 'failed' && result.exitCode === 1);
+    check('capture/recording teardown failure remains observable on lifecycle',
+      last(lc.events).status === 'failed' && last(lc.events).failure_stage === 'active'
+        && last(lc.events).reason?.includes('recording/capture teardown failed') === true,
+      JSON.stringify(last(lc.events)));
+    check('capture/recording teardown failure never synthesizes a completed terminal', !seq(lc.events).includes('completed'));
+  }
+
+  // ── producer-owned event time: admission/runtime billing survives callback delay ──
+  {
+    const lc = recordingSink();
     const timestamps = [
       '2026-07-28T10:00:00.000Z',
       '2026-07-28T10:00:05.000Z',
@@ -332,9 +354,9 @@ async function main(): Promise<void> {
     check('pipeline-fail: events conform', allConform(lc.events));
   }
 
-  // A serialized upload retry must not consume the 20s signal watchdog and hide the leave or
-  // terminal event. Deliberate leave closes the browser in this fixture, so it also proves the
-  // failure observer is detached before teardown noise can rewrite a successful meeting.
+  // A stalled capture/recording teardown must not consume the watchdog or claim a completed
+  // recording. Deliberate leave closes the browser in this fixture, so it also proves the failure
+  // observer is detached before teardown noise can rewrite the attributable failed terminal.
   {
     const lc = recordingSink();
     let fireLeave: (a: { action: 'leave' }) => void = () => {};
@@ -357,9 +379,37 @@ async function main(): Promise<void> {
     const running = o.run({ pipelineStopMs: 5, recordingDrainMs: 5 });
     setTimeout(() => fireLeave({ action: 'leave' }), 5);
     const res = await running;
-    check('recording-drain: normal teardown is bounded and emits completed',
-      res.status === 'completed' && res.completionReason === 'stopped' && Date.now() - started < 500 && left === 1);
-    check('browser teardown noise: detached observer preserves completed terminal', detached && last(lc.events).status === 'completed');
+    check('recording-drain: incomplete teardown is bounded and emits failed',
+      res.status === 'failed' && Date.now() - started < 500 && left === 1);
+    check('browser teardown noise: detached observer preserves failed terminal', detached && last(lc.events).status === 'failed');
+  }
+
+  // A pipeline that cannot stop has an unknowable capture tail. Invalidate the real recording
+  // owner before bounded close so it retains neither queued bytes nor a fabricated final marker.
+  for (const stopKind of ['deadline', 'rejection'] as const) {
+    const lc = recordingSink();
+    const uploads: Array<{ seq: number; final: boolean; bytes: number }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), maxRetainedBytes: 16,
+      uploadChunk: async (seq, final, _format, bytes) => { uploads.push({ seq, final, bytes: bytes.byteLength }); },
+    });
+    await sink.chunk('google_meet/teardown', 0, false, 'webm', new Uint8Array(8));
+    const pipeline: Pipeline = {
+      async start() {},
+      async stop() {
+        if (stopKind === 'deadline') return new Promise<void>(() => {});
+        throw new Error('capture shutdown rejected');
+      },
+    };
+    const result = await createOrchestrator(inv(), {
+      lifecycle: lc, join: mockJoin('admitted'), pipeline, acts: noopActs(), aloneness: noopAloneness(), recording: sink,
+    }).run({ maxActiveMs: 2, pipelineStopMs: 5, recordingDrainMs: 5 });
+    check(`recording invalidation (${stopKind}): bounded teardown emits failed`,
+      result.status === 'failed' && last(lc.events).status === 'failed');
+    check(`recording invalidation (${stopKind}): admitted seq0 stays non-final with no synthetic final`,
+      JSON.stringify(uploads) === JSON.stringify([{ seq: 0, final: false, bytes: 8 }]), JSON.stringify(uploads));
+    check(`recording invalidation (${stopKind}): sink releases all retained bytes`,
+      sink.resourceCounts().retainedBytes === 0 && sink.resourceCounts().failed, JSON.stringify(sink.resourceCounts()));
   }
 
   // An ordinary Stop may already be inside its long transcript drain when Docker sends SIGTERM.
@@ -383,8 +433,8 @@ async function main(): Promise<void> {
     await stopStarted;
     o.stop('stopped', true);
     const result = await running;
-    check('SIGTERM shortens an ordinary pipeline drain already in progress',
-      result.status === 'completed' && Date.now() - startedAt < 80,
+    check('SIGTERM shortens an incomplete pipeline drain and reports failure',
+      result.status === 'failed' && Date.now() - startedAt < 80,
       `elapsed=${Date.now() - startedAt} status=${result.status}`);
   }
 
