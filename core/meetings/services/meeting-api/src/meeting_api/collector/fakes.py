@@ -733,7 +733,7 @@ class InMemoryTranscriptStore:
             "already_deleted": already_deleted,
         }
 
-    async def finalize_completed_artifact_deletion(self, user_id, meeting_id):
+    async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None):
         from datetime import datetime, timezone
 
         m = self._meetings.get(meeting_id)
@@ -743,7 +743,12 @@ class InMemoryTranscriptStore:
             return False
         m["segments"] = {}
         data = dict(m.get("data") or {})
-        for key in ("recordings", "attributed_audio_manifest", "processed", "notes", "share_grants", "transcript_viewers"):
+        cleanup_plan = cleanup_plan or {}
+        if data.get("recordings") == cleanup_plan.get("recordings"):
+            data.pop("recordings", None)
+        if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
+            data.pop("attributed_audio_manifest", None)
+        for key in ("processed", "notes", "share_grants", "transcript_viewers"):
             data.pop(key, None)
         data["artifact_deletion"] = {
             "state": "completed",

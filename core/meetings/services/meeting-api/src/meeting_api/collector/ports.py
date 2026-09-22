@@ -344,13 +344,14 @@ class TranscriptStore(Protocol):
         ...
 
     async def finalize_completed_artifact_deletion(
-        self, user_id: int, meeting_id: int
+        self, user_id: int, meeting_id: int, cleanup_plan: Optional[dict] = None
     ) -> Optional[bool]:
-        """After object deletion succeeds, erase transcript rows and recording metadata atomically.
+        """After object deletion succeeds, erase transcript rows and matching artifact metadata atomically.
 
         The terminal meeting/lifecycle row is retained with an artifact-deletion tombstone. Returns
-        ``None`` for unknown/unowned and ``False`` if the meeting is no longer terminal. Repeated
-        calls on the tombstone are successful no-ops.
+        ``None`` for unknown/unowned and ``False`` if the meeting is no longer terminal.  The
+        cleanup plan is the object-deletion snapshot: metadata written after that snapshot is
+        retained for a retry rather than being erased without deleting its object.
         """
         ...
 

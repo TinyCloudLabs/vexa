@@ -614,7 +614,7 @@ def build_router(
                     "user_id": user_id, "meeting_id": meeting_id,
                 }))
 
-            finalized = await store.finalize_completed_artifact_deletion(user_id, meeting_id)
+            finalized = await store.finalize_completed_artifact_deletion(user_id, meeting_id, plan)
             if finalized is None:
                 raise HTTPException(status_code=404, detail="Meeting not found")
             if finalized is False:
