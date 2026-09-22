@@ -8,8 +8,9 @@
  * RED on the pre-#593 inline pipeline (the first thrown await rejects start()); GREEN after.
  * Run: npx tsx src/live-pipeline.test.ts
  */
-import { createLivePipeline, serr, type LiveStage } from './pipeline.js';
-import type { Pipeline } from './ports.js';
+import { createBotPipeline, createLivePipeline, serr, type LiveStage } from './pipeline.js';
+import type { Invocation } from './config.js';
+import type { Pipeline, TranscriptSink } from './ports.js';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = ''): void => {
@@ -206,6 +207,37 @@ async function main(): Promise<void> {
     await live.start(); await live.stop();
     check('capture-stop failure: observable incomplete capture fault', faults.includes('capture-stop'));
     check('capture-stop failure: engine still tears down', engine.stops === 1);
+  }
+
+  // 11) Disabling live STT owns only the transcription engine. Capture and the durable recording
+  // tap still run, while the recording-only pipeline accepts PCM without allocating turn state or
+  // emitting a false transcript final. This is the integration seam between the memory and
+  // attributed-audio lanes: recording may be the sole requested artifact for a live meeting.
+  {
+    const invocation: Invocation = {
+      platform: 'google_meet', meetingUrl: 'https://meet.google.com/abc-defg-hij', botName: 'Vexa',
+      redisUrl: 'redis://localhost:6379', transcribeEnabled: false, recordingEnabled: true,
+    };
+    const published: unknown[] = [];
+    const transcript: TranscriptSink = {
+      async publish(segment) { published.push(segment); },
+      async retract() { /* recording-only mode has no pending transcript tail */ },
+    };
+    const engine = createBotPipeline(invocation, transcript);
+    const capture: Spy = { started: 0, stopped: 0 };
+    const recording: Spy = { started: 0, stopped: 0 };
+    const live = createLivePipeline({
+      startCapture: okThunk(capture), startRecording: okThunk(recording), engine, onFault: () => {},
+    });
+    await live.start();
+    engine.feedAudio(0, 'Alice', new Float32Array(320).fill(0.1), Date.now());
+    await live.stop();
+    check('recording-only: capture and durable recording start even when live STT is disabled',
+      capture.started === 1 && recording.started === 1, JSON.stringify({ capture, recording }));
+    check('recording-only: capture and recording both release on stop',
+      capture.stopped === 1 && recording.stopped === 1, JSON.stringify({ capture, recording }));
+    check('recording-only: PCM does not allocate STT state or publish a false transcript final',
+      engine.resourceCounts === undefined && published.length === 0, JSON.stringify({ resources: engine.resourceCounts, published }));
   }
 
   console.log(failed === 0 ? '\n✅ live-pipeline: all passed' : `\n❌ live-pipeline: ${failed} failed`);
