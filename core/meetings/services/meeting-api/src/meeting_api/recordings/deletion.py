@@ -73,16 +73,30 @@ async def delete_owned_recording(
 
     meeting_id = int(recording["meeting_id"])
     deleted_keys = await delete_recording_objects(storage, recording)
+    # Attributed PCM belongs to the same completed meeting artifact. Delete objects first so a
+    # storage fault leaves its manifest available for retry rather than lying about cleanup.
+    manifest = await repo.attributed_manifest_for_owner(user_id, meeting_id)
+    attributed_keys = [r.get("storage_path") for r in (manifest or {}).get("ranges", [])
+                       if isinstance(r, dict) and isinstance(r.get("storage_path"), str)
+                       and r["storage_path"].startswith(f"attributed-audio/{user_id}/{meeting_id}/")]
+    for key in attributed_keys:
+        await storage.delete(key)
 
     def _remove(current: list[dict]):
         remaining = [r for r in current if r.get("id") != recording_id]
         return remaining, len(remaining) != len(current)
 
     await repo.mutate_recordings(meeting_id, _remove)
+    if manifest is not None:
+        def _remove_attributed(data: dict):
+            next_data = dict(data)
+            next_data.pop("attributed_audio_manifest", None)
+            return next_data, None
+        await repo.mutate_meeting_data(meeting_id, _remove_attributed)
     return {
         "status": "deleted",
         "recording_id": recording_id,
         "meeting_id": meeting_id,
-        "objects_deleted": len(deleted_keys),
+        "objects_deleted": len(deleted_keys) + len(attributed_keys),
         "scope": "primary_object_storage",
     }

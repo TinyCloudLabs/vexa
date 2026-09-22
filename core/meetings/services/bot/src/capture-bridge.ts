@@ -716,7 +716,7 @@ export async function startCaptureBridge(
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
   // Float32Array and stamp the capture time if the page didn't supply one (production stamps
   // Date.now() on the Node side — index.ts:1598–1605).
-  const onPerSpeakerAudio = (speakerIndex: number, samples: number[], tsMs?: number): void => {
+  const onPerSpeakerAudio = async (speakerIndex: number, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
@@ -725,6 +725,11 @@ export async function startCaptureBridge(
     // an unbound track (name not yet resolved) arrives with no name → the per-channel lane opens the
     // turn UNKNOWN and upgrades it the moment the resolver binds (gmeet-pipeline onset-adopt); the
     // named path is __vexaNamedAudioData.
+    if (attributed && !useMix) {
+      // An unbound voiced channel is evidence, not an "Unknown" transcript or a dropped frame.
+      await attributed.feed({ channel: speakerIndex, speaker_name: '', speaker_key: `gmeet:channel:${speakerIndex}`,
+        attribution: { source: 'unresolved', confidence: 0 }, pcm, capture_ms: ts, sample_rate: 16000 });
+    }
     if (useMix) pipeline.feedMixedAudio(pcm, ts);
     else pipeline.feedAudio(speakerIndex, undefined, pcm, ts);
   };
@@ -734,10 +739,10 @@ export async function startCaptureBridge(
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(channel, pcm, ts, glowName);                            // O-TEL-1: tap BEFORE the pipeline
-    if (attributed && glowName) {
+    if (attributed) {
       await attributed.feed({
-        channel, speaker_name: glowName, speaker_key: `gmeet:${channel}:${glowName}`,
-        attribution: { source: 'glow-bound', confidence: 1 }, pcm, capture_ms: ts, sample_rate: 16000,
+        channel, speaker_name: glowName ?? '', speaker_key: glowName ? `gmeet:${channel}:${glowName}` : `gmeet:channel:${channel}`,
+        attribution: glowName ? { source: 'glow-bound', confidence: 1 } : { source: 'unresolved', confidence: 0 }, pcm, capture_ms: ts, sample_rate: 16000,
       });
     }
     pipeline.feedAudio(channel, glowName, pcm, ts);
@@ -945,8 +950,11 @@ export async function startCaptureBridge(
               // that never earns a name; carrying it to the transcript needs the retroactive repaint
               // the transport spine has (stable speaker_key) and the per-channel lane does not — the
               // Commit-B follow-up. Until then it is reported as data on the bind observations.
-              if (name) w.__vexaNamedAudioData(ch, name, arr, ts);
-              else w.__vexaPerSpeakerAudioData(ch, arr, ts);
+              // Playwright returns the exposed callback promise. Keep its rejection observed: the
+              // Node recorder is the bounded admission point and records a durable failed row on
+              // budget refusal instead of allowing an unhandled promise to retain this PCM.
+              if (name) Promise.resolve(w.__vexaNamedAudioData(ch, name, arr, ts)).catch((e: unknown) => w.logBot?.('[pertrack] attributed admission failed: ' + String(e)));
+              else Promise.resolve(w.__vexaPerSpeakerAudioData(ch, arr, ts)).catch((e: unknown) => w.logBot?.('[pertrack] attributed admission failed: ' + String(e)));
             };
             src.connect(proc);
             proc.connect(ctx.destination);                     // pull the processor (it outputs silence)
@@ -1284,8 +1292,8 @@ export async function startCaptureBridge(
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
           const glow = lit.length === 1 ? lit[0] : undefined;
-          if (glow) w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now());
-          else w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now());
+          if (glow) Promise.resolve(w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now())).catch((e: unknown) => w.logBot?.('[gmeet] attributed admission failed: ' + String(e)));
+          else Promise.resolve(w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now())).catch((e: unknown) => w.logBot?.('[gmeet] attributed admission failed: ' + String(e)));
         },
       });
       await w.__vexaGmeetCapture.start();
