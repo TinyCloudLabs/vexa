@@ -34,7 +34,7 @@ export interface GmeetCapture {
   /** Number of currently-connected participant streams. */
   streamCount(): number;
   /** Bounded resource accounting used by the long-meeting probe. */
-  resourceCounts(): { contexts: number; sources: number; worklets: number; tracks: number };
+  resourceCounts(): { contexts: number; sources: number; worklets: number; tracks: number; references: number };
 }
 
 export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
@@ -174,6 +174,20 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     }
   }
 
+  function retainLiveOwners(elements: HTMLMediaElement[]): void {
+    // An element may change to B before a later DOM sibling that still references A is
+    // visited. Retain every already-owned target first, so replacing that first element
+    // cannot release A between the two discoveries.
+    for (const el of elements) {
+      const stream: MediaStream = (el as any).srcObject;
+      const track = stream?.getAudioTracks()[0];
+      const existing = bindings.get(el);
+      const shared = track && connections.get(track.id);
+      if (shared && (!existing || existing.stream !== stream || existing.connection.track.id !== track.id))
+        shared.elements.set(el, stream);
+    }
+  }
+
   return {
     async start(): Promise<void> {
       if (running) return;
@@ -194,10 +208,12 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
 
       rescanTimer = setInterval(() => {
         if (!running) return;
-        // Register current elements before detaching stale bindings. Meet can append and play a
-        // replacement for a live track, then remove the old element between scans. Reconciling
-        // the replacement first keeps the track owner (and its stable channel) alive.
-        for (const el of findMediaElements()) if (connectElement(el, nextIndex)) nextIndex++;
+        const mediaElements = findMediaElements();
+        // First retain all desired references that already have an owner. A DOM-ordered scan can
+        // otherwise release A while the earlier element changes to B, before its later A mirror
+        // is visited and attached. Only after that pre-registration may replacements release.
+        retainLiveOwners(mediaElements);
+        for (const el of mediaElements) if (connectElement(el, nextIndex)) nextIndex++;
         // A removed element or swapped srcObject must not pin its old source once all surviving
         // references have been reconciled.
         for (const [el, binding] of Array.from(bindings.entries())) {
@@ -226,8 +242,12 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     streamCount(): number { return connections.size; },
     resourceCounts() {
       let worklets = 0;
-      for (const connection of connections.values()) if (connection.node) worklets++;
-      return { contexts: context ? 1 : 0, sources: connections.size, worklets, tracks: connections.size };
+      let references = 0;
+      for (const connection of connections.values()) {
+        if (connection.node) worklets++;
+        references += connection.elements.size;
+      }
+      return { contexts: context ? 1 : 0, sources: connections.size, worklets, tracks: connections.size, references };
     },
   };
 }

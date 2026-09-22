@@ -41,23 +41,23 @@ const firstMirror = el(firstStream);
 elements.push(first, firstMirror); present.add(first); present.add(firstMirror);
 const capture = createGmeetCapture({ onAudio() {}, rescanMs: 1, findRetries: 1 });
 await capture.start(); await wait();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1, references: 2 });
 
 present.delete(first); await wait();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1, references: 1 });
 
 firstStream.track.end();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0, references: 0 });
 
 const second = el(new Stream('second', new Track('second-track')));
 elements.push(second); present.add(second); await wait();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1, references: 1 });
 second.srcObject = new Stream('replacement', new Track('replacement-track')); await wait();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 1, worklets: 1, tracks: 1, references: 1 });
 present.delete(second); await wait();
-assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0, references: 0 });
 capture.stop(); capture.stop();
-assert.deepEqual(capture.resourceCounts(), { contexts: 0, sources: 0, worklets: 0, tracks: 0 });
+assert.deepEqual(capture.resourceCounts(), { contexts: 0, sources: 0, worklets: 0, tracks: 0, references: 0 });
 assert.equal(Context.all.length, 1, 'churn shares one AudioContext');
 assert.equal(Context.all[0].closed, 1, 'stop closes the shared context once');
 console.log('PASS gmeet lifecycle: mirrors deduplicate and end/remove/replacement/stop release every owned resource');
