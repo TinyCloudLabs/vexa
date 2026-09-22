@@ -25,7 +25,7 @@ import { stat } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import type { Invocation } from './config.js';
-import { DEFAULT_MAX_TAPE_BYTES, signalEvent, type CaptureSignalRecorder } from './telemetry.js';
+import { DEFAULT_ENABLED_MAX_TAPE_BYTES, signalEvent, type CaptureSignalRecorder } from './telemetry.js';
 
 /** The files one session leaves: the frame/hint tape, the STT round-trip sidecar, the Teams CC
  *  sidecar, the transport (CSRC) sidecar, and the observations sidecar. Mirrors meeting-api's
@@ -76,7 +76,7 @@ export async function uploadSignalTapes(
   if (!recorder) return summary;
 
   const { inv } = opts;
-  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_TAPE_BYTES;
+  const maxBytes = opts.maxBytes ?? DEFAULT_ENABLED_MAX_TAPE_BYTES;
   const url = inv.recordingUploadUrl;
   if (!url) {
     // The local hot-loop path (VEXA_CAPTURE_SIGNAL=1, no control plane) lands here every run, so it

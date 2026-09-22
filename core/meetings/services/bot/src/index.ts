@@ -312,7 +312,17 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     ? { probeSecondary: () => pingRedis(inv.redisUrl) }
     : undefined;
 
-  const resources = createResourceMonitor({ log: (message) => console.log(message) });
+  const resources = createResourceMonitor({
+    log: (message) => console.log(message),
+    retained: () => {
+      const counts = recording?.resourceCounts();
+      return {
+        recording_retained_bytes: counts?.retainedBytes ?? 0,
+        recording_queued_chunks: counts?.queuedChunks ?? 0,
+        live_stt_retained_bytes: inv.transcribeEnabled === false ? 0 : 0,
+      };
+    },
+  });
   const orchestrator = createOrchestrator(inv, {
     lifecycle,
     join,

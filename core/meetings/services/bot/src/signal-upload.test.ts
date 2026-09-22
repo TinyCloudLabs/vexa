@@ -25,7 +25,7 @@ import {
   uploadSignalTapes,
   type TapePart,
 } from './signal-upload.js';
-import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
+import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES, DEFAULT_ENABLED_MAX_TAPE_BYTES } from './telemetry.js';
 import type { Invocation } from './config.js';
 import type { CapturedFrame } from './ports.js';
 import type { CsrcRecord, ObservationRecord, TeamsCaptionRecord } from './capture-bridge.js';
@@ -91,8 +91,8 @@ console.log('\n── tape size cap ──');
   // The .env.example failure class (v0.12.5): a set-but-EMPTY line must read as unset, not as 0 —
   // and a garbled value must not read as "record without bound".
   check('cap default when env empty', resolveMaxTapeBytes('') === DEFAULT_MAX_TAPE_BYTES);
-  check('cap default when env garbled', resolveMaxTapeBytes('lots') === DEFAULT_MAX_TAPE_BYTES);
-  check('cap default when env <= 0', resolveMaxTapeBytes('0') === DEFAULT_MAX_TAPE_BYTES);
+  check('cap invalid value uses bounded enabled-mode cap', resolveMaxTapeBytes('lots') === DEFAULT_ENABLED_MAX_TAPE_BYTES);
+  check('cap invalid <= 0 uses bounded enabled-mode cap', resolveMaxTapeBytes('0') === DEFAULT_ENABLED_MAX_TAPE_BYTES);
   check('explicit cap honored', resolveMaxTapeBytes('1024') === 1024);
 }
 

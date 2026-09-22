@@ -45,6 +45,31 @@ function fakeUploader(): { seen: Seen[]; upload: ChunkUploader } {
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 async function main(): Promise<void> {
+  // ── 0) bounded admission: a slow uploader applies backpressure at chunk(), not an unbounded
+  // promise chain. Once released, every admitted chunk is delivered and retained bytes settle. ──
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: number[] = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), maxRetainedBytes: 16,
+      uploadChunk: async (seq) => { await blocked; delivered.push(seq); },
+    });
+    const first = sink.chunk('google_meet/bound', 0, false, 'webm', new Uint8Array(12));
+    await flush();
+    const second = sink.chunk('google_meet/bound', 1, false, 'webm', new Uint8Array(12));
+    await flush();
+    check('backpressure: retained bytes never exceed admission budget', sink.resourceCounts().retainedBytes <= 16,
+      JSON.stringify(sink.resourceCounts()));
+    check('backpressure: second chunk waits instead of accumulating a byte queue', sink.resourceCounts().queuedChunks === 1,
+      JSON.stringify(sink.resourceCounts()));
+    release();
+    await Promise.all([first, second]);
+    await sink.close('google_meet/bound');
+    check('backpressure: every admitted chunk is delivered in order', delivered.slice(0, 2).join(',') === '0,1', delivered.join(','));
+    check('backpressure: close returns retained bytes to zero', sink.resourceCounts().retainedBytes === 0,
+      JSON.stringify(sink.resourceCounts()));
+  }
   for (const explicitFinal of [false, true]) {
     let release: () => void = () => {};
     const blocked = new Promise<void>((resolve) => { release = resolve; });

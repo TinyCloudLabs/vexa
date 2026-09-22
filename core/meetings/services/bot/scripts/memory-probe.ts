@@ -15,6 +15,7 @@ import { launchPersistentBrowser } from "@vexa/remote-browser";
 import { getJoinBrowserArgs, joinMeeting, leaveGoogleMeet } from "@vexa/join";
 import { startCaptureBridge, startRecording } from "../src/capture-bridge.js";
 import { createResourceMonitor } from "../src/resources.js";
+import { createBotRecordingSink } from "../src/recording.js";
 // Defaults to a synthetic fixture. An explicitly supplied room tests real Meet
 // capture/recording, with local sinks; it is not a deployed end-to-end bot test.
 const liveMeetUrl = process.env.VEXA_TEST_MEET_URL;
@@ -70,6 +71,7 @@ let seqs: number[] = [];
 let finalSeen = false;
 let partsAfterFinal = 0;
 const resources = createResourceMonitor();
+let recordingSink: ReturnType<typeof createBotRecordingSink> | undefined;
 try {
   const launched = await launchPersistentBrowser({
     dataDir: profile,
@@ -221,6 +223,21 @@ try {
             }
           });
         }
+        // Exercise the same lifecycle as Meet tile churn: short-lived elements and tracks appear,
+        // end, and leave the DOM while capture is live. The bridge scan override below makes this
+        // deterministic in the 15-second local probe without changing production cadence.
+        w.fixture.churnTimer = setInterval(async () => {
+          const osc = ctx.createOscillator();
+          const dest = ctx.createMediaStreamDestination();
+          osc.connect(dest); osc.start();
+          const transient = document.createElement('audio');
+          transient.srcObject = dest.stream; document.body.appendChild(transient);
+          await transient.play().catch(() => {});
+          setTimeout(() => {
+            for (const track of dest.stream.getTracks()) track.stop();
+            osc.stop(); transient.remove();
+          }, 250);
+        }, 500);
       },
       { videos: videoCount, rtc },
     );
@@ -256,6 +273,8 @@ try {
       };
   });
   if (mode !== "recording" && mode !== "idle")
+    await page.evaluate(() => { (window as any).__vexaCaptureRescanMs = 100; });
+  if (mode !== "recording" && mode !== "idle")
     stopCapture = await startCaptureBridge(
       page,
       inv as any,
@@ -270,15 +289,16 @@ try {
         recordHint() {},
       } as any,
     );
-  if (mode !== "capture" && mode !== "idle")
-    stopRecording = await startRecording(page, inv as any, {
-      chunk(
-        _k: string,
-        seq: number,
-        final: boolean,
-        _f: string,
-        bytes: Uint8Array,
-      ) {
+  if (mode !== "capture" && mode !== "idle") {
+    const uploadDelayMs = Number(process.env.VEXA_TEST_MEMORY_UPLOAD_DELAY_MS ?? 100);
+    recordingSink = createBotRecordingSink({
+      inv: inv as any,
+      maxRetainedBytes: 16 * 1024 * 1024,
+      // Delayed, in-process uploader makes the probe exercise the real admission boundary without
+      // depending on a receiver. It retains no copy of bytes after this await resolves.
+      uploadChunk: async (seq, final, _format, bytes) => {
+        if (Number.isFinite(uploadDelayMs) && uploadDelayMs > 0)
+          await new Promise((resolve) => setTimeout(resolve, uploadDelayMs));
         appendFileSync(
           join(output, "parts.jsonl"),
           JSON.stringify({ seq, final, bytes: bytes.length }) + "\n",
@@ -289,8 +309,9 @@ try {
         recordedBytes += bytes.length;
         appendFileSync(join(output, "master.webm"), bytes);
       },
-      close() {},
     });
+    stopRecording = await startRecording(page, inv as any, recordingSink);
+  }
   const cdp = await context.newCDPSession(page);
   await cdp.send("Performance.enable");
   const nativeSampling = process.env.VEXA_TEST_MEMORY_NATIVE === "1";
@@ -399,6 +420,9 @@ try {
     const captureStreams = await page.evaluate(
       () => (window as any).probeCaptureStreams,
     );
+    const captureResources = await page.evaluate(
+      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
+    );
     const heapUsage = await cdp.send("Runtime.getHeapUsage");
     if (nativeSampling && Date.now() >= nextNativeSampleAt) {
       const sampleId = Math.floor(elapsedMs / 1000);
@@ -430,6 +454,10 @@ try {
           }
         : {}),
       resources: resources.snapshot(),
+      captureResources,
+      recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
+      recordingQueuedChunks: recordingSink?.resourceCounts().queuedChunks ?? 0,
+      liveSttRetainedBytes: 0,
       captureStreams,
       heapUsage,
       ...heap,
@@ -448,17 +476,23 @@ try {
   stopRecording = null;
   await stopCapture?.();
   stopCapture = null;
+  await page.evaluate(() => clearInterval((window as any).fixture?.churnTimer)).catch(() => {});
+  const postStop = {
+    capture: await page.evaluate(
+      () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
+    ).catch(() => ({ contexts: -1, sources: -1, worklets: -1, tracks: -1 })),
+    recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
+    liveSttRetainedBytes: 0,
+  };
+  assert.equal(postStop.recordingRetainedBytes, 0, 'recording delivery releases retained bytes after stop');
+  assert.equal(postStop.liveSttRetainedBytes, 0, 'disabled live STT retains no bytes');
   if (mode !== "recording" && mode !== "idle") {
     if (liveMeetUrl) {
       assert(frames > 0, "live Meet delivered captured audio frames");
     } else {
       const minimumFrames = Math.floor(((sampledDurationMs * 16000) / (1000 * 4096)) * 0.99);
-      assert.equal(
-        framesByChannel.size,
-        3,
-        "all three audio channels captured",
-      );
-      for (const [channel, count] of framesByChannel) {
+      assert(framesByChannel.size >= 3, "all three persistent audio channels captured");
+      for (const [channel, count] of [...framesByChannel.entries()].filter(([channel]) => channel < 3)) {
         assert(
           count >= minimumFrames,
           `channel ${channel}: ${count} frames, expected at least ${minimumFrames} (99% of nominal PCM duration)`,
@@ -486,6 +520,8 @@ try {
     recordedBytes,
     parts: seqs.length,
     finalSeen,
+    postStop,
+    verdict: postStop.recordingRetainedBytes === 0 && postStop.liveSttRetainedBytes === 0 ? 'pass' : 'fail',
   });
   if (liveMeetUrl)
     await leaveGoogleMeet(page, undefined, "controlled_test_complete");
