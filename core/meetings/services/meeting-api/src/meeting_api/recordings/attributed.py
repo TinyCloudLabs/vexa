@@ -214,7 +214,26 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         try:
             await storage.delete(key)
         except Exception:
-            pass
+            # The completed-artifact delete may already have removed the original reservation.
+            # If its compensating delete now fails, restore only this deterministic key as closed
+            # cleanup evidence. A repeat of the public completed-meeting deletion discovers it
+            # before terminalizing the same tombstone again.
+            def retain_cleanup_evidence(data_json):
+                manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+                found = next((r for r in manifest["ranges"]
+                              if r.get("idempotency_key") == incoming["idempotency_key"]), None)
+                if found is None:
+                    found = dict(incoming)
+                    found["state"] = "failed"
+                    found["path"] = f"/meetings/{meeting_id}/attributed-audio/ranges/{incoming['sequence']}"
+                    manifest["ranges"].append(found)
+                found["storage_path"] = key
+                manifest["state"] = "closed"
+                next_data = dict(data_json)
+                next_data["attributed_audio_manifest"] = manifest
+                return next_data, None
+
+            await repo.mutate_meeting_data(meeting_id, retain_cleanup_evidence)
         raise
 
 
