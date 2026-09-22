@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 
 export const ATTRIBUTED_AUDIO_VERSION = 1;
 export const DEFAULT_PCM_BUDGET_BYTES = 32 * 1024 * 1024;
+/** Public attributed-audio.v1 maximum callback scheduling gap; larger gaps form a new range. */
+export const ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS = 250;
 const MAX_CHANNELS = 64;
 /** A missing row is metadata, but it still has to fit the HTTP body's hard limit. */
 const MAX_MISSING_BYTES = 32 * 1024 * 1024;
@@ -145,7 +147,8 @@ type Missing = Omit<SealInput, 'byte_count' | 'sha256' | 'audio_duration_ms'> & 
 export function createAttributedAudioRecorder(meetingId: string, store: AttributedAudioStore, options: { cadenceMs?: number; budgetBytes?: number; gapMs?: number } = {}) {
   const cadenceMs = options.cadenceMs ?? 10_000;
   if (cadenceMs < 5_000 || cadenceMs > 15_000) throw new Error('attributed-audio cadence must be 5–15 seconds');
-  const budgetBytes = options.budgetBytes ?? DEFAULT_PCM_BUDGET_BYTES, gapMs = options.gapMs ?? 250;
+  const budgetBytes = options.budgetBytes ?? DEFAULT_PCM_BUDGET_BYTES,
+    gapMs = Math.min(options.gapMs ?? ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS, ATTRIBUTED_AUDIO_MAX_CALLBACK_GAP_MS);
   const sink = createAttributedAudioSink(meetingId, store, budgetBytes);
   const active = new Map<number, Active>(), missing = new Map<number, Missing>(), generation = new Map<number, number>();
   let origin: number | undefined, stopping = false;

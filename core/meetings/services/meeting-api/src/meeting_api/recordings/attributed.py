@@ -8,10 +8,10 @@ from typing import Optional
 from .service import SessionNotFound
 
 MAX_ATTRIBUTED_AUDIO_BYTES = 32 * 1024 * 1024
-# Browser callbacks are timestamped on a scheduling clock while PCM is sample-clocked. A small
-# scheduling skew is ordinary; a capture gap is represented by a new range and is never accepted
-# as a stretched one.
-MAX_TIMESTAMP_JITTER_MS = 10
+# Browser callbacks are timestamped on a scheduling clock while PCM is sample-clocked. The public
+# attributed-audio.v1 contract admits callbacks separated by at most this much scheduling time;
+# a larger gap is represented by a new range.
+MAX_CALLBACK_GAP_MS = 250
 _IMMUTABLE = (
     "version", "meeting_id", "sequence", "idempotency_key", "speaker_key", "speaker_name",
     "channel", "turn_generation", "attribution", "clock_origin_ms", "start_ms", "end_ms",
@@ -69,7 +69,7 @@ def _validate(data: dict, body: Optional[bytes] = None) -> None:
         raise AttributedConflict("invalid attributed PCM clock")
     audio_duration = _safe_number(data.get("audio_duration_ms"), "audio_duration_ms")
     wall_span = end - start
-    if audio_duration < 0 or abs(wall_span - audio_duration) > MAX_TIMESTAMP_JITTER_MS + 1000 / data["sample_rate"]:
+    if audio_duration < 0 or abs(wall_span - audio_duration) > MAX_CALLBACK_GAP_MS + 1000 / data["sample_rate"]:
         raise AttributedConflict("attributed PCM wall span does not match the sample clock")
     # PCM f32le is one 4-byte sample; validate sample time, not wall placement gaps.
     expected = audio_duration * data["sample_rate"] * data["channels"] * 4 / 1000
@@ -234,7 +234,9 @@ async def fail_reserved_attributed_range(repo, *, token_meeting_id: Optional[int
             raise AttributedConflict("attributed range was not durably reserved")
         if manifest.get("state") != "open" and found.get("state") != "failed":
             raise AttributedConflict("attributed audio manifest is closed")
-        if found.get("state") != "uploaded": found["state"] = "failed"; found.pop("storage_path", None)
+        # The reservation owns this deterministic key even after a restart has no PCM to retry.
+        # Deletion/reconciliation need it to remove a PUT that crashed before acknowledgement.
+        if found.get("state") != "uploaded": found["state"] = "failed"
         next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
         return next_data, dict(found)
     return await repo.mutate_meeting_data(meeting_id, fail)
