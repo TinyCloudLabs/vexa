@@ -43,6 +43,7 @@ import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
 import type { RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
+import { createHttpAttributedAudioRecorder } from './attributed-audio.js';
 
 /** Float32 PCM → base64 of its little-endian bytes — the EXACT codec wire payload, so a stored
  *  captured-signal.v1 frame round-trips through @vexa/capture-codec (encode→decode→same PCM). */
@@ -707,6 +708,8 @@ export async function startCaptureBridge(
   // is OPTIONAL + zero-overhead when unset (makeTelemetryTap short-circuits to a single truthiness
   // check), so the proven O6 capture path is byte-for-byte unchanged. captureFrame is fire-and-forget.
   const tee = makeTelemetryTap(lane, telemetry);
+  const attributed = inv.platform === 'google_meet' && inv.attributedAudioEnabled
+    ? createHttpAttributedAudioRecorder(inv) : undefined;
   const observeRemoteAudio = makeRemoteAudioEnergyTap(activity);
 
   // ── Node-side frame sink: one capture.v1 frame crossing the Playwright boundary. ──
@@ -726,11 +729,17 @@ export async function startCaptureBridge(
     else pipeline.feedAudio(speakerIndex, undefined, pcm, ts);
   };
   // gmeet: the v1 producer stamps the glow name page-side; this named variant carries it through.
-  const onNamedAudio = (channel: number, glowName: string | undefined, samples: number[], tsMs?: number): void => {
+  const onNamedAudio = async (channel: number, glowName: string | undefined, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(channel, pcm, ts, glowName);                            // O-TEL-1: tap BEFORE the pipeline
+    if (attributed && glowName) {
+      await attributed.feed({
+        channel, speaker_name: glowName, speaker_key: `gmeet:${channel}:${glowName}`,
+        attribution: { source: 'glow-bound', confidence: 1 }, pcm, capture_ms: ts, sample_rate: 16000,
+      });
+    }
     pipeline.feedAudio(channel, glowName, pcm, ts);
   };
   // mixed lane "who is lit" hint (Zoom/Teams active-speaker → the namer's time window).
@@ -1332,6 +1341,10 @@ export async function startCaptureBridge(
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
     }).catch(() => { /* page already gone */ });
+    // Seal the last voiced turn, drain all admitted requests, then close the durable manifest.
+    // A rejected close is intentionally surfaced to the pipeline teardown instead of fabricating
+    // a closed manifest that omits an admitted range.
+    await attributed?.stop();
   };
 }
 

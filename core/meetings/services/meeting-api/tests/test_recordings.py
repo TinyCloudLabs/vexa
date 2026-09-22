@@ -8,6 +8,8 @@ session-resolution seams behave.
 from __future__ import annotations
 
 import pytest
+import hashlib
+import json
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -63,6 +65,37 @@ def _client_for(repo, storage):
     app = FastAPI()
     app.include_router(build_router(repo, storage, token_secret=SECRET))
     return TestClient(app)
+
+
+def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
+    """The actual HTTP bot/store/read path, not a disconnected sink fake."""
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    pcm = b"\x00\x00\x80?\x00\x00\x00@"
+    meta = {
+        "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "turn-0",
+        "speaker_key": "gmeet:3:Alice", "speaker_name": "Alice",
+        "attribution": {"source": "glow-bound", "confidence": 1}, "start_ms": 1000, "end_ms": 1000.25,
+        "codec": "pcm_f32le", "sample_rate": 16000, "channels": 1,
+        "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+    }
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    request = lambda value=meta, body=pcm: client.post(
+        "/internal/attributed-audio/upload", headers={"authorization": f"Bearer {token}"},
+        data={"session_uid": SESSION_UID, "range_metadata": json.dumps(value)},
+        files={"file": ("range.pcm", body, "application/octet-stream")},
+    )
+    first = request(); assert first.status_code == 200
+    assert first.json()["path"] == "/meetings/1/attributed-audio/ranges/0"
+    assert request().json() == first.json(), "same idempotency + checksum is a successful retry"
+    altered = dict(meta); altered["sha256"] = hashlib.sha256(b"other").hexdigest(); altered["byte_count"] = 5
+    assert request(altered, b"other").status_code == 409
+    closed = client.post("/internal/attributed-audio/close", headers={"authorization": f"Bearer {token}"},
+                         data={"session_uid": SESSION_UID})
+    assert closed.status_code == 200 and closed.json()["state"] == "closed"
+    assert closed.json()["clock_origin"] == "capture_epoch_ms"
+    assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER)}).content == pcm
+    assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
 def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():

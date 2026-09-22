@@ -1425,6 +1425,7 @@
       "zoom-capture",
       "acts.v1",
       "captured-signal.v1",
+      "attributed-audio.v1",
       "flagged-issue.v1",
       "invocation.v1",
       "lifecycle.v1",

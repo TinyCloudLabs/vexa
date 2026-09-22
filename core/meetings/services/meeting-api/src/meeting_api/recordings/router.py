@@ -29,6 +29,10 @@ from .service import (
     upload_chunk,
     upload_signal_tape,
 )
+from .attributed import (
+    AttributedConflict, attributed_range_for_owner, close_attributed_manifest,
+    upload_attributed_range,
+)
 
 
 #: Default page size for ``GET /recordings``. The route used to have none: it answered with every
@@ -265,6 +269,77 @@ def build_router(
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
         return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/upload", include_in_schema=False)
+    async def internal_upload_attributed_audio(
+        file: UploadFile = File(...),
+        session_uid: str = Form(...),
+        range_metadata: str = Form(...),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        try:
+            range_data = json.loads(range_metadata)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="range_metadata must be JSON")
+        if not isinstance(range_data, dict):
+            raise HTTPException(status_code=422, detail="range_metadata must be an object")
+        bearer = _bearer_token(authorization)
+        internal_secret = os.getenv("INTERNAL_API_SECRET")
+        token_meeting_id: Optional[int] = None
+        if not (internal_secret and bearer == internal_secret):
+            try:
+                claims = _verify_meeting_token(bearer, secret=token_secret)
+                token_meeting_id = int(claims["meeting_id"])
+            except ValueError as e:
+                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+        try:
+            receipt = await upload_attributed_range(
+                repo, storage, token_meeting_id=token_meeting_id, session_uid=session_uid,
+                range_data=range_data, data=await file.read(),
+            )
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            # upload_attributed_range has already persisted the failed state before this response.
+            raise HTTPException(status_code=502, detail=f"attributed PCM upload failed: {e}")
+        return JSONResponse(content=receipt)
+
+    @router.post("/internal/attributed-audio/close", include_in_schema=False)
+    async def internal_close_attributed_audio(
+        session_uid: str = Form(...),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        bearer = _bearer_token(authorization)
+        internal_secret = os.getenv("INTERNAL_API_SECRET")
+        token_meeting_id: Optional[int] = None
+        if not (internal_secret and bearer == internal_secret):
+            try:
+                claims = _verify_meeting_token(bearer, secret=token_secret)
+                token_meeting_id = int(claims["meeting_id"])
+            except ValueError as e:
+                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+        try:
+            return JSONResponse(content=await close_attributed_manifest(
+                repo, token_meeting_id=token_meeting_id, session_uid=session_uid,
+            ))
+        except AttributedConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except SessionNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @router.get("/meetings/{meeting_id}/attributed-audio/ranges/{sequence}")
+    async def get_attributed_audio_range(
+        meeting_id: int, sequence: int, x_user_id: Optional[str] = Header(default=None),
+    ):
+        try:
+            data = await attributed_range_for_owner(
+                repo, storage, user_id=_resolve_user_id(x_user_id), meeting_id=meeting_id, sequence=sequence,
+            )
+        except SessionNotFound:
+            raise HTTPException(status_code=404, detail="attributed audio range not found")
+        return Response(content=data, media_type="application/octet-stream")
 
     @router.get("/recordings")
     async def list_recordings(

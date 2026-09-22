@@ -592,6 +592,12 @@ def create_app(
             "GET", _meeting(f"/recordings/{recording_id}/media/{media_file_id}/raw"), request
         )
 
+    @app.get("/meetings/{meeting_id}/attributed-audio/ranges/{sequence}")
+    async def get_attributed_audio_range(meeting_id: int, sequence: int, request: Request):
+        return await _forward(
+            "GET", _meeting(f"/meetings/{meeting_id}/attributed-audio/ranges/{sequence}"), request
+        )
+
     @app.get("/meetings")
     async def meetings(request: Request):
         return await _forward("GET", _meeting("/meetings"), request)
