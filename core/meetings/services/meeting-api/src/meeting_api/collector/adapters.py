@@ -1632,6 +1632,7 @@ class SqlAlchemyTranscriptStore:
             return {
                 "meeting_id": meeting.id,
                 "recordings": list(data.get("recordings") or []),
+                "attributed_audio_manifest": data.get("attributed_audio_manifest"),
                 "already_deleted": already_deleted,
             }
 
@@ -1654,7 +1655,7 @@ class SqlAlchemyTranscriptStore:
                 return False
             await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
-            for key in ("recordings", "processed", "notes", "share_grants", "transcript_viewers"):
+            for key in ("recordings", "attributed_audio_manifest", "processed", "notes", "share_grants", "transcript_viewers"):
                 data.pop(key, None)
             data["artifact_deletion"] = {
                 "state": "completed",

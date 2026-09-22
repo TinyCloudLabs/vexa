@@ -194,6 +194,20 @@ async function main(): Promise<void> {
     check('serr: bare object → NOT flattened to [object …]', !serr({ isTrusted: true }).includes('[object'));
   }
 
+  // 10) A bounded attributed-audio stop failure is visible as an incomplete capture outcome but
+  // does not prevent the engine from being torn down in the controlled bot exit path.
+  {
+    const faults: LiveStage[] = [];
+    const engine = fakeEngine();
+    const live = createLivePipeline({
+      startCapture: async () => async () => { throw new Error('attributed close timed out'); },
+      engine, onFault: (stage) => faults.push(stage),
+    });
+    await live.start(); await live.stop();
+    check('capture-stop failure: observable incomplete capture fault', faults.includes('capture-stop'));
+    check('capture-stop failure: engine still tears down', engine.stops === 1);
+  }
+
   console.log(failed === 0 ? '\n✅ live-pipeline: all passed' : `\n❌ live-pipeline: ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

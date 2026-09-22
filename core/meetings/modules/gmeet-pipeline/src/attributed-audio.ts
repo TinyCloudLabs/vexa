@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 export const ATTRIBUTED_AUDIO_VERSION = 1;
 export const DEFAULT_PCM_BUDGET_BYTES = 32 * 1024 * 1024;
 const MAX_CHANNELS = 64;
-const MAX_SEALED_RANGES = 64;
+/** A missing row is metadata, but it still has to fit the HTTP body's hard limit. */
+const MAX_MISSING_BYTES = 32 * 1024 * 1024;
 export type Attribution = { source: 'glow-bound' | 'provisional' | 'unresolved'; confidence: number };
 
 export interface AttributedAudioRange {
@@ -41,7 +42,11 @@ const digest = (chunks: readonly Uint8Array[]) => {
 export function createAttributedAudioSink(meetingId: string, store: AttributedAudioStore, budgetBytes = DEFAULT_PCM_BUDGET_BYTES) {
   let manifest: AttributedAudioManifest = { version: 1, meeting_id: meetingId, clock_origin: 'first_admitted_capture_epoch_ms', clock_origin_ms: 0, state: 'open', ranges: [] };
   let bufferedBytes = 0, nextSequence = 0, closing = false, closed = false, initialized = !store.load;
-  const tasks = new Map<string, Promise<AttributedAudioRange>>();
+  const tasks = new Map<string, { range: ImmutableRange; task: Promise<AttributedAudioRange> }>();
+  const sameImmutable = (left: ImmutableRange, right: ImmutableRange) =>
+    Object.keys(left).filter(key => key !== 'attribution' && key !== 'state' && key !== 'path').every(key =>
+      (left as Record<string, unknown>)[key] === (right as Record<string, unknown>)[key])
+    && JSON.stringify(left.attribution) === JSON.stringify(right.attribution);
   const replace = (range: AttributedAudioRange) => {
     const index = manifest.ranges.findIndex(value => value.idempotency_key === range.idempotency_key);
     if (index >= 0) manifest.ranges[index] = clone(range); else manifest.ranges.push(clone(range));
@@ -52,18 +57,26 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     clock_origin_ms: manifest.clock_origin_ms, byte_count: byteCount, sha256, audio_duration_ms: audioDurationMs,
   });
   const run = (range: ImmutableRange, pcm?: readonly Uint8Array[]) => {
+    const bytes = pcm?.reduce((total, chunk) => total + chunk.byteLength, 0) ?? 0;
     const task = (async () => {
-      const reserved = await store.reserve(range); replace(reserved);
-      if (!pcm) { const failed = await store.fail(range); replace(failed); return failed; }
       try {
-        const receipt = await store.upload(range, pcm);
-        const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+        const reserved = await store.reserve(range); replace(reserved);
+        if (!pcm) { const failed = await store.fail(range); replace(failed); return failed; }
+        try {
+          const receipt = await store.upload(range, pcm);
+          const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+        } catch (error) {
+          try { const failed = await store.fail(range); replace(failed); } catch { /* close exposes unresolved reservation */ }
+          throw error;
+        }
       } catch (error) {
-        try { const failed = await store.fail(range); replace(failed); } catch { /* close exposes unresolved reservation */ }
+        // A failed reservation never owns PCM. Keep a local failed row so close remains an
+        // observable incomplete outcome; a later restart/retry can durably reserve this key.
+        const failed = { ...range, state: 'failed' as const }; replace(failed);
         throw error;
-      } finally { bufferedBytes -= pcm.reduce((total, chunk) => total + chunk.byteLength, 0); }
+      } finally { bufferedBytes -= bytes; }
     })();
-    tasks.set(range.idempotency_key, task);
+    tasks.set(range.idempotency_key, { range, task });
     void task.finally(() => tasks.delete(range.idempotency_key)).catch(() => undefined);
     return task;
   };
@@ -85,11 +98,19 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     if (!Number.isFinite(audioDurationMs) || audioDurationMs < 0) throw new Error('invalid attributed-audio duration');
     const sha256 = pcm ? digest(pcm) : (input.sha256 ?? '0'.repeat(64));
     const key = input.idempotency_key ?? `${meetingId}:${input.speaker_key}:${input.turn_generation}:${input.start_ms}:${input.end_ms}`;
-    const duplicate = tasks.get(key); if (duplicate) return duplicate;
-    const prior = manifest.ranges.find(value => value.idempotency_key === key); if (prior) return Promise.resolve(clone(prior));
-    if (manifest.ranges.length + tasks.size >= MAX_SEALED_RANGES) throw new Error('attributed-audio range budget exceeded');
+    const proposed = immutable(input, byteCount, sha256, audioDurationMs);
+    const duplicate = tasks.get(key);
+    if (duplicate) {
+      if (!sameImmutable(duplicate.range, proposed)) throw new Error('attributed-audio idempotency key conflicts with pending payload');
+      return duplicate.task;
+    }
+    const prior = manifest.ranges.find(value => value.idempotency_key === key);
+    if (prior) {
+      if (!sameImmutable(prior as ImmutableRange, proposed)) throw new Error('attributed-audio idempotency key conflicts with durable ledger');
+      return Promise.resolve(clone(prior));
+    }
     if (pcm) { if (bufferedBytes + byteCount > budgetBytes) throw new Error('attributed-audio PCM budget exceeded before durable handoff'); bufferedBytes += byteCount; }
-    const range = immutable(input, byteCount, sha256, audioDurationMs);
+    const range = proposed;
     manifest.ranges.push({ ...range, state: 'sealed' });
     return run(range, pcm);
   };
@@ -100,7 +121,7 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     fail(input: SealInput & { byte_count: number; sha256: string; audio_duration_ms: number }) { return admit(input); },
     async close() {
       if (closed) return clone(manifest); closing = true;
-      await Promise.allSettled([...tasks.values()]);
+      await Promise.allSettled([...tasks.values()].map(value => value.task));
       if (manifest.ranges.some(range => range.state === 'sealed')) throw new Error('attributed-audio ranges lack a durable outcome');
       const closingManifest = { ...clone(manifest), state: 'closed' as const };
       await store.close(closingManifest); manifest = closingManifest; closed = true; return clone(manifest);
@@ -149,6 +170,13 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
       missing.set(frame.channel, value);
     }
     if (!value) return;
+    // Split, never grow a missing row past the server's request validator. The incoming frame
+    // normally fits this bound; an oversized callback is represented as several truthful rows.
+    if (value.byte_count && value.byte_count + frame.pcm.byteLength > MAX_MISSING_BYTES) {
+      flushMissing(frame.channel);
+      recordMissing(frame, start, end);
+      return;
+    }
     value.byte_count += frame.pcm.byteLength; value.audio_duration_ms += frame.pcm.length / frame.sample_rate * 1000; value.end_ms = end;
   };
   const ready = sink.ready.then(() => {
@@ -169,7 +197,13 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
       value = { channel: frame.channel, speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name, attribution: frame.attribution,
         sample_rate: frame.sample_rate, channels: frame.channels ?? 1, generation: next, start_ms: start, end_ms: start, audio_duration_ms: 0, chunks: [], bytes: 0 }; active.set(frame.channel, value);
     }
-    if (sink.bufferedBytes() + activeBytes() + frame.pcm.byteLength > budgetBytes || sink.taskCount() >= MAX_SEALED_RANGES) { recordMissing(frame, start, end); return; }
+    if (sink.bufferedBytes() + activeBytes() + frame.pcm.byteLength > budgetBytes) {
+      // Do not leave an empty active turn behind: it would later become a zero-byte uploaded
+      // range and falsely make an over-budget capture look complete.
+      if (value.bytes === 0) active.delete(frame.channel);
+      recordMissing(frame, start, end);
+      return;
+    }
     value.chunks.push(frame.pcm); value.bytes += frame.pcm.byteLength; value.audio_duration_ms += frame.pcm.length / frame.sample_rate * 1000; value.end_ms = end;
     if (end - value.start_ms >= cadenceMs) flush(frame.channel);
     else { if (value.idle) clearTimeout(value.idle); value.idle = setTimeout(() => flush(frame!.channel), cadenceMs); }

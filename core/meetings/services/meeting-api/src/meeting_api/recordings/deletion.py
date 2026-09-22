@@ -57,6 +57,17 @@ async def delete_recording_objects(storage: Storage, recording: dict) -> list[st
     return keys
 
 
+async def delete_attributed_objects(storage: Storage, manifest: Optional[dict], *, user_id: int, meeting_id: int) -> list[str]:
+    """Delete only the attributed keys the owner-scoped durable ledger names."""
+    prefix = f"attributed-audio/{user_id}/{meeting_id}/"
+    keys = sorted({row.get("storage_path") for row in (manifest or {}).get("ranges", [])
+                   if isinstance(row, dict) and isinstance(row.get("storage_path"), str)
+                   and row["storage_path"].startswith(prefix)})
+    for key in keys:
+        await storage.delete(key)
+    return keys
+
+
 async def delete_owned_recording(
     repo: RecordingRepo, storage: Storage, *, user_id: int, recording_id: int
 ) -> Optional[dict]:
@@ -76,11 +87,7 @@ async def delete_owned_recording(
     # Attributed PCM belongs to the same completed meeting artifact. Delete objects first so a
     # storage fault leaves its manifest available for retry rather than lying about cleanup.
     manifest = await repo.attributed_manifest_for_owner(user_id, meeting_id)
-    attributed_keys = [r.get("storage_path") for r in (manifest or {}).get("ranges", [])
-                       if isinstance(r, dict) and isinstance(r.get("storage_path"), str)
-                       and r["storage_path"].startswith(f"attributed-audio/{user_id}/{meeting_id}/")]
-    for key in attributed_keys:
-        await storage.delete(key)
+    attributed_keys = await delete_attributed_objects(storage, manifest, user_id=user_id, meeting_id=meeting_id)
 
     def _remove(current: list[dict]):
         remaining = [r for r in current if r.get("id") != recording_id]
