@@ -1597,6 +1597,7 @@ class SqlAlchemyTranscriptStore:
             return True
 
     async def prepare_completed_artifact_deletion(self, user_id, meeting_id) -> "Optional[dict]":
+        from copy import deepcopy
         from datetime import datetime, timezone
 
         from sqlalchemy import select
@@ -1631,12 +1632,12 @@ class SqlAlchemyTranscriptStore:
                 await db.commit()
             return {
                 "meeting_id": meeting.id,
-                "recordings": list(data.get("recordings") or []),
-                "attributed_audio_manifest": data.get("attributed_audio_manifest"),
+                "recordings": deepcopy(list(data.get("recordings") or [])),
+                "attributed_audio_manifest": deepcopy(data.get("attributed_audio_manifest")),
                 "already_deleted": already_deleted,
             }
 
-    async def finalize_completed_artifact_deletion(self, user_id, meeting_id) -> "Optional[bool]":
+    async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None) -> "Optional[bool]":
         from datetime import datetime, timezone
 
         from sqlalchemy import delete, select
@@ -1655,7 +1656,15 @@ class SqlAlchemyTranscriptStore:
                 return False
             await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
-            for key in ("recordings", "attributed_audio_manifest", "processed", "notes", "share_grants", "transcript_viewers"):
+            cleanup_plan = cleanup_plan or {}
+            # The objects deleted above came from this request's snapshot.  A concurrent rejected
+            # PUT can restore a deterministic attributed ledger after that snapshot; preserving a
+            # mismatched value makes the next public delete discover and remove it.
+            if data.get("recordings") == cleanup_plan.get("recordings"):
+                data.pop("recordings", None)
+            if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
+                data.pop("attributed_audio_manifest", None)
+            for key in ("processed", "notes", "share_grants", "transcript_viewers"):
                 data.pop(key, None)
             data["artifact_deletion"] = {
                 "state": "completed",

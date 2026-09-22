@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import hashlib
+import httpx
 import json
 from pathlib import Path
 import subprocess
@@ -424,19 +425,17 @@ def test_late_ack_cleanup_failure_retains_ledger_until_legacy_delete_retries_it(
     assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
 
 
-def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_retry():
-    """A completed delete cannot strand a PUT whose rejected acknowledgement cannot compensate."""
+async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_retry():
+    """Public deletes retain a late rejected PUT's ledger until their retry deletes its object."""
     from meeting_api import create_app
     from meeting_api.collector.fakes import InMemoryTranscriptStore
-    from meeting_api.recordings.attributed import (
-        AttributedConflict, reserve_attributed_range, upload_reserved_attributed_range,
-    )
-    from meeting_api.recordings.deletion import delete_owned_recording
 
     class SharedRepo(InMemoryTranscriptStore):
         def __init__(self):
             super().__init__()
             self.sessions = {SESSION_UID: MEETING_ID}
+            self.finalization_reached = asyncio.Event()
+            self.release_finalization = asyncio.Event()
 
         async def find_session(self, session_uid):
             meeting_id = self.sessions.get(session_uid)
@@ -468,11 +467,20 @@ def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_ret
             ]}
             return prepared
 
+        async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None):
+            self.finalization_reached.set()
+            await self.release_finalization.wait()
+            return await super().finalize_completed_artifact_deletion(
+                user_id, meeting_id, cleanup_plan
+            )
+
     class SuspendedPutStorage(InMemoryStorage):
         def __init__(self):
             super().__init__()
             self.before_write = asyncio.Event()
             self.release_write = asyncio.Event()
+            self.before_compensation = asyncio.Event()
+            self.release_compensation = asyncio.Event()
             self.fail_compensation = True
 
         async def upload(self, key, data, content_type=None):
@@ -482,9 +490,11 @@ def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_ret
             await super().upload(key, data, content_type=content_type)
 
         async def delete(self, key):
-            # The completed delete sees no object before the PUT releases. Fail only the late
-            # compensating delete after that object has actually been written.
+            # The legacy delete sees no object before the PUT releases. Pause its rejected
+            # acknowledgement's compensating delete until the meeting delete has snapshotted.
             if key.startswith("attributed-audio/") and key in self.blobs and self.fail_compensation:
+                self.before_compensation.set()
+                await self.release_compensation.wait()
                 self.fail_compensation = False
                 raise RuntimeError("first compensating delete failed")
             await super().delete(key)
@@ -502,38 +512,66 @@ def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_ret
             "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
             "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
             "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    app = create_app(transcript_store=repo, recording_repo=repo, storage=storage, token_secret=SECRET)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    bot_headers = {"authorization": f"Bearer {token}"}
+    owner_headers = {"x-user-id": str(USER)}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        reserved = await client.post(
+            "/internal/attributed-audio/reserve", headers=bot_headers,
+            data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+        )
+        assert reserved.status_code == 200
+        key = reserved.json()["storage_path"]
 
-    async def run_race():
-        reserved = await reserve_attributed_range(repo, token_meeting_id=MEETING_ID,
-                                                   session_uid=SESSION_UID, range_data=meta)
-        put = asyncio.create_task(upload_reserved_attributed_range(
-            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
-            range_data=meta, data=pcm,
+        put = asyncio.create_task(client.post(
+            "/internal/attributed-audio/upload", headers=bot_headers,
+            data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+            files={"file": ("range.pcm", pcm, "application/octet-stream")},
         ))
-        await storage.before_write.wait()
-        assert await delete_owned_recording(repo, storage, user_id=USER, recording_id=recording_id)
+        deleting_meeting = None
+        try:
+            await asyncio.wait_for(storage.before_write.wait(), timeout=1)
+            # Exact public legacy route: it completes before the delayed PUT writes any object.
+            assert (await client.delete(
+                f"/recordings/{recording_id}", headers=owner_headers
+            )).status_code == 200
+            storage.release_write.set()
+            await asyncio.wait_for(storage.before_compensation.wait(), timeout=1)
+            # Exact public completed-meeting route snapshots the now-empty plan and reaches finalization.
+            deleting_meeting = asyncio.create_task(client.delete(
+                f"/meetings/{MEETING_ID}", headers=owner_headers
+            ))
+            await asyncio.wait_for(repo.finalization_reached.wait(), timeout=1)
+            storage.release_compensation.set()
+            put_response = await asyncio.wait_for(put, timeout=1)
+        finally:
+            storage.release_write.set()
+            storage.release_compensation.set()
+            repo.release_finalization.set()
+
+        assert deleting_meeting is not None
+        meeting_response = await asyncio.wait_for(deleting_meeting, timeout=1)
+
+        assert put_response.status_code == 409, put_response.text
+        assert meeting_response.status_code == 204, meeting_response.text
+
+        retained = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+        assert retained["state"] == "closed"
+        assert retained["ranges"][0]["storage_path"] == key
+        assert key in storage.blobs
         assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+
+        # The public retry sees that durable evidence, removes the late object and ledger, and remains
+        # idempotent without allowing either to reappear.
+        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
+        assert key not in storage.blobs
         assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
-        storage.release_write.set()
-        with pytest.raises(AttributedConflict):
-            await put
-        return reserved
-
-    reserved = asyncio.run(run_race())
-    retained = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
-    assert retained["state"] == "closed"
-    assert retained["ranges"][0]["storage_path"] == reserved["storage_path"]
-    assert reserved["storage_path"] in storage.blobs
-    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
-
-    # The production composition's public completed-meeting route finds the restored key, deletes
-    # it, then atomically removes the last cleanup ledger evidence.
-    retry = TestClient(create_app(transcript_store=repo, recording_repo=repo, storage=storage),
-                       raise_server_exceptions=False)
-    assert retry.delete(f"/meetings/{MEETING_ID}", headers={"x-user-id": str(USER)}).status_code == 204
-    assert reserved["storage_path"] not in storage.blobs
-    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
-    assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
+        assert key not in storage.blobs
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():
