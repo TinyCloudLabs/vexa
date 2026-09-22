@@ -329,6 +329,8 @@ def build_router(
             raise HTTPException(status_code=409, detail=str(e))
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"attributed PCM upload failed: {e}")
         return JSONResponse(content=receipt)

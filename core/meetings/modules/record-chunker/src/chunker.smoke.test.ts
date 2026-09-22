@@ -167,6 +167,27 @@ async function main() {
   if (!finalRejectObserved || !finalRejected.resourceCounts().failed)
     fails.push('false final acknowledgement did not fail the recording producer');
 
+  // A requested recording whose MediaRecorder cannot be constructed must reject its start bridge;
+  // returning success here would let the bot report a completed meeting with no recording.
+  const originalRecorder = (globalThis as any).MediaRecorder;
+  const originalWindowRecorder = (globalThis as any).window.MediaRecorder;
+  class FailingMediaRecorder {
+    static isTypeSupported() { return true; }
+    constructor() { throw new Error('MediaRecorder unavailable'); }
+  }
+  (globalThis as any).MediaRecorder = FailingMediaRecorder;
+  (globalThis as any).window.MediaRecorder = FailingMediaRecorder;
+  let startRejected = false;
+  try {
+    await new MediaRecorderChunker({ stream: {} as any, onChunk: async () => true }).start();
+  } catch (error) {
+    startRejected = error instanceof Error && error.message === 'MediaRecorder unavailable';
+  } finally {
+    (globalThis as any).MediaRecorder = originalRecorder;
+    (globalThis as any).window.MediaRecorder = originalWindowRecorder;
+  }
+  if (!startRejected) fails.push('MediaRecorder construction failure did not reject recording start');
+
   console.log(`chunks: ${JSON.stringify(got.map((c) => ({ seq: c.chunkSeq, final: c.isFinal, bytes: decode(c.base64).length })))}`);
   if (fails.length) {
     console.log('❌ FAIL — ' + fails.join('; '));

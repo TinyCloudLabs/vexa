@@ -553,7 +553,7 @@ export function serr(e: unknown): string {
 export interface LivePipelineDeps {
   /** Attach the page-side capture; returns its teardown. Best-effort — a throw DEGRADES, never evicts. */
   startCapture: () => Promise<() => Promise<void>>;
-  /** Attach the page-side recording (optional); returns its teardown. Best-effort. */
+  /** Attach the requested page-side recording; returns its teardown. */
   startRecording?: () => Promise<() => Promise<void>>;
   /** The transcription engine (the BotPipeline). Its start() failure is non-fatal + retried. */
   engine: Pipeline;
@@ -629,14 +629,20 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       }
       catch (e) { if (!stopped) captureFault('capture-start', e); }
       if (stopped) return;
-      // recording-start — best-effort.
+      // A requested recording that never starts is not a successful recording meeting. Keep the
+      // bot seated for orderly cleanup, but retain this fault for its terminal lifecycle outcome.
       if (startRecording) {
         try {
           const stop = await startRecording();
           if (stopped) await stop().catch(() => { /* stop won while recording was attaching */ });
           else stopRecording = stop;
         }
-        catch (e) { if (!stopped) onFault('recording-start', e); }
+        catch (e) {
+          if (!stopped) {
+            if (terminalFault === null) terminalFault = e;
+            onFault('recording-start', e);
+          }
+        }
       }
       if (stopped) return;
       // engine-start — non-fatal degrade + bounded retry (the pyannote model load; #593 root cause).

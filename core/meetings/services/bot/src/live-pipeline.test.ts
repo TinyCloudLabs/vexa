@@ -2,7 +2,7 @@
  * L2 — createLivePipeline guard (#593 A4). The admitted→capture-start handoff had NO unit before
  * this: the composed pipeline was inline in index.ts (three bare awaits). This proves the
  * load-bearing invariant — a post-admission subsystem failure (page-side capture throw, recording
- * throw, or the engine/pyannote-model load rejecting) DEGRADES LOUDLY and NEVER rejects start(), so
+ * throw or engine/pyannote-model load rejecting) DEGRADES LOUDLY and NEVER rejects start(), so
  * the orchestrator's leave-on-pipeline-fail backstop never fires and the bot stays seated.
  *
  * RED on the pre-#593 inline pipeline (the first thrown await rejects start()); GREEN after.
@@ -70,7 +70,8 @@ async function main(): Promise<void> {
     check('engine throw: capture attached first', capSpy.started === 1);
   }
 
-  // 3) recording-start throws → start() RESOLVES; fault reported; engine still starts.
+  // 3) A requested recording-start throws → start() resolves for orderly cleanup, but stop()
+  // reports the terminal artifact failure after releasing capture and the engine.
   {
     const faults: LiveStage[] = [];
     const capSpy: Spy = { started: 0, stopped: 0 };
@@ -87,6 +88,11 @@ async function main(): Promise<void> {
     check('recording throw: start() RESOLVED', resolved);
     check('recording throw: onFault(recording-start) fired', faults.includes('recording-start'));
     check('recording throw: engine STILL started', engine.starts === 1);
+    let rejected = false;
+    try { await live.stop(); } catch { rejected = true; }
+    check('recording throw: terminal outcome rejects after cleanup',
+      rejected && capSpy.stopped === 1 && engine.stops === 1,
+      JSON.stringify({ rejected, capSpy, engineStops: engine.stops }));
   }
 
   // 4) happy path → no faults; stop() tears down capture + recording + engine.

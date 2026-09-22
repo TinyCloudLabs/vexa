@@ -203,9 +203,14 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         if deletion.get("state") in ("pending", "completed"):
             raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
+        # Another request can finish this deterministic PUT and close the manifest while this
+        # request is still in storage. The matching uploaded row is the durable acknowledgement;
+        # never compensate by deleting the object it names.
+        found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming["idempotency_key"]), None)
+        if found and _same_range(found, incoming) and found.get("state") == "uploaded":
+            return data_json, dict(found)
         if manifest.get("state") != "open":
             raise AttributedConflict("attributed audio manifest is closed or deleted")
-        found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming["idempotency_key"]), None)
         if not found or not _same_range(found, incoming) or found.get("state") == "failed":
             raise AttributedConflict("attributed range cannot be acknowledged")
         found["state"] = "uploaded"; found["storage_path"] = key
@@ -237,6 +242,15 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
                 manifest["state"] = "closed"
                 next_data = dict(data_json)
                 next_data["attributed_audio_manifest"] = manifest
+                # This late object was absent from the deleter's snapshot. Move the durable
+                # generation forward before retaining it, so an already-running finalizer cannot
+                # accept that old snapshot and erase the only cleanup ledger for these bytes.
+                if deletion.get("state") in ("pending", "completed"):
+                    retrying = dict(deletion)
+                    retrying["state"] = "pending"
+                    retrying["cleanup_version"] = int(deletion.get("cleanup_version") or 0) + 1
+                    retrying.pop("completed_at", None)
+                    next_data["artifact_deletion"] = retrying
                 # A legacy recording delete has already removed its public row by the time this
                 # late acknowledgement discovers a failed compensating delete. Restore only its
                 # tombstoned retry handle; the next same-id delete re-snapshots and removes this
@@ -247,10 +261,6 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
                     if not any(row.get("id") == legacy.get("id") for row in rows):
                         rows.append({**legacy, "deletion_pending": True})
                     next_data["recordings"] = rows
-                    retrying = dict(deletion)
-                    retrying["state"] = "pending"
-                    retrying.pop("completed_at", None)
-                    next_data["artifact_deletion"] = retrying
                 return next_data, None
 
             await repo.mutate_meeting_data(meeting_id, retain_cleanup_evidence)

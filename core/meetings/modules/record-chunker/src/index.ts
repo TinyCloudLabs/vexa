@@ -192,7 +192,7 @@ export class MediaRecorderChunker implements RecordingTap {
         : new MediaRecorder(this.opts.stream);
     } catch (err: any) {
       blog(`[record-chunker] Failed to construct MediaRecorder: ${err?.message || err}`);
-      return;
+      throw err;
     }
 
     this.recorder = recorder;

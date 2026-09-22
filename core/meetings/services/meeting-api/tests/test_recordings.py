@@ -111,7 +111,7 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
 
 @pytest.mark.asyncio
 async def test_concurrent_close_and_late_identical_put_keeps_uploaded_object():
-    """A close racing a duplicate PUT must acknowledge the durable row, never delete its key."""
+    """A duplicate whose PUT finishes after close must acknowledge the durable uploaded row."""
     repo, storage = _seeded()
     pcm = b"\0\0\0\0"
     meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "closed-duplicate",
@@ -122,18 +122,57 @@ async def test_concurrent_close_and_late_identical_put_keeps_uploaded_object():
     from meeting_api.recordings.attributed import (
         close_attributed_manifest, reserve_attributed_range, upload_reserved_attributed_range,
     )
+    class FirstPutWaits(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.first_put_started = asyncio.Event()
+            self.release_first_put = asyncio.Event()
+            self.puts = 0
+
+        async def upload(self, key, data, content_type=None):
+            self.puts += 1
+            if self.puts == 1:
+                self.first_put_started.set()
+                await self.release_first_put.wait()
+            await super().upload(key, data, content_type=content_type)
+
+    storage = FirstPutWaits()
     reserved = await reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta)
+    delayed = asyncio.create_task(upload_reserved_attributed_range(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta, data=pcm,
+    ))
+    await asyncio.wait_for(storage.first_put_started.wait(), timeout=1)
     first = await upload_reserved_attributed_range(repo, storage, token_meeting_id=MEETING_ID,
                                                    session_uid=SESSION_UID, range_data=meta, data=pcm)
-    closed, duplicate = await asyncio.gather(
-        close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID),
-        upload_reserved_attributed_range(repo, storage, token_meeting_id=MEETING_ID,
-                                         session_uid=SESSION_UID, range_data=meta, data=pcm),
-    )
+    closed = await close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID)
+    storage.release_first_put.set()
+    duplicate = await asyncio.wait_for(delayed, timeout=1)
     assert closed["state"] == "closed"
     assert duplicate == first
     assert storage.blobs[reserved["storage_path"]] == pcm
     assert storage.deleted == [], "the late duplicate must not compensate-delete an uploaded row's key"
+
+
+def test_attributed_upload_preserves_http_exception_status(monkeypatch):
+    """Authentication and bounded-body refusals are client errors, never an upstream 502."""
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "http-status",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
+            "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    form = {"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}
+    assert client.post("/internal/attributed-audio/upload", data=form,
+                       files={"file": ("range.pcm", pcm, "application/octet-stream")}).status_code == 401
+
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    headers = {"authorization": f"Bearer {token}"}
+    assert client.post("/internal/attributed-audio/reserve", headers=headers, data=form).status_code == 200
+    monkeypatch.setattr("meeting_api.recordings.router.MAX_ATTRIBUTED_AUDIO_REQUEST_BYTES", len(pcm) - 1)
+    assert client.post("/internal/attributed-audio/upload", headers=headers, data=form,
+                       files={"file": ("range.pcm", pcm, "application/octet-stream")}).status_code == 413
 
 
 @pytest.mark.parametrize("state", ["pending", "completed"])
@@ -604,6 +643,7 @@ async def test_legacy_delete_race_restores_late_put_cleanup_evidence_for_same_ro
         assert retained["ranges"][0]["storage_path"] == key
         assert key in storage.blobs
         assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["cleanup_version"] == 2
         assert repo._meetings[MEETING_ID]["data"]["recordings"][0]["id"] == recording_id
 
         # The same legacy front door can now find its restored durable cleanup handle and remove
@@ -612,6 +652,7 @@ async def test_legacy_delete_race_restores_late_put_cleanup_evidence_for_same_ro
         assert key not in storage.blobs
         assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
         assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["cleanup_version"] == 3
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():

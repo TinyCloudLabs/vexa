@@ -1389,9 +1389,10 @@ export async function startCaptureBridge(
     activity?.unavailable();
     let pageFailure: unknown;
     try {
-      await page.evaluate(() => {
+      await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
-      try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
+      let captureFailure: unknown;
+      try { await w.__vexaGmeetCapture?.stop?.(); } catch (error) { captureFailure = error; }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       // destroy() flushes a caption still mid-refinement as stable:false — the meeting's last
@@ -1417,6 +1418,7 @@ export async function startCaptureBridge(
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
+      if (captureFailure) throw captureFailure;
       });
     } catch (error) {
       pageFailure = error;
@@ -1501,7 +1503,10 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       });
       await w.__vexaRecordingTap.start();
     }
-  }, timesliceMs).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
+  }, timesliceMs).catch((e) => {
+    console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`);
+    throw e;
+  });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
