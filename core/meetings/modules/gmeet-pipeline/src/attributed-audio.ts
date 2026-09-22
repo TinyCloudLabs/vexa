@@ -196,7 +196,15 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     if (!frame.pcm.length) return;
     const start = relative(frame.capture_ms), end = start + frame.pcm.length / frame.sample_rate * 1000;
     let value = active.get(frame.channel);
-    if (value && (activeIdentity(value) !== identity(frame) || start > value.end_ms + gapMs)) flush(frame.channel);
+    // The server validates the whole range's wall-clock/sample-clock delta, not each callback in
+    // isolation.  Split before adjacent scheduling gaps can accumulate past that published bound.
+    const frameDurationMs = frame.pcm.length / frame.sample_rate * 1000;
+    const cumulativeClockGapMs = value
+      ? Math.abs((start + frameDurationMs - value.start_ms) - (value.audio_duration_ms + frameDurationMs))
+      : 0;
+    if (value && (activeIdentity(value) !== identity(frame)
+      || start > value.end_ms + gapMs
+      || cumulativeClockGapMs > gapMs + 1000 / frame.sample_rate)) flush(frame.channel);
     value = active.get(frame.channel);
     if (!value) {
       if (active.size >= MAX_CHANNELS) { recordMissing(frame, start, end); return; }

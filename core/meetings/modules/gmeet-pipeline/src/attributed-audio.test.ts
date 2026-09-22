@@ -65,8 +65,8 @@ const jitterManifest = await jitter.stop();
 assert.equal(jitterManifest.ranges[0].audio_duration_ms, 512);
 assert.equal(jitterManifest.ranges[0].end_ms, 506);
 
-// The published 250ms callback-gap contract is shared with the route validator.  1250 and 1300
-// remain one truthful range; 1600 is a real gap and must become a second range before upload.
+// The published 250ms whole-range clock/sample delta is shared with the route validator.  1250
+// and 1300 remain one truthful range; a third 1600 callback would accumulate 400ms and splits.
 for (const [captureMs, expected] of [[1_250, [[0, 350, 200]]], [1_300, [[0, 400, 200]]], [1_600, [[0, 100, 100], [600, 700, 100]]]] as const) {
   const control = createAttributedAudioRecorder(`gap-${captureMs}`, memoryStore(), { cadenceMs: 5_000 });
   await control.ready;
@@ -76,6 +76,14 @@ for (const [captureMs, expected] of [[1_250, [[0, 350, 200]]], [1_300, [[0, 400,
   assert.deepEqual(controlManifest.ranges.map(range => [range.start_ms, range.end_ms, range.audio_duration_ms]), expected);
   assert.equal(controlManifest.state, 'closed');
 }
+
+// Longer adjacent scheduling gaps keep each emitted range inside the same published bound.
+const cumulative = createAttributedAudioRecorder('cumulative-gap', memoryStore(), { cadenceMs: 5_000 });
+await cumulative.ready;
+for (const capture_ms of [1_000, 1_300, 1_600, 1_900, 2_200]) {
+  cumulative.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms, sample_rate: 1_000 });
+}
+assert.deepEqual((await cumulative.stop()).ranges.map(range => [range.start_ms, range.end_ms, range.audio_duration_ms]), [[0, 400, 200], [600, 1_000, 200], [1_200, 1_300, 100]]);
 
 // Rejected audio is split into valid durable missing rows instead of creating one metadata body
 // too large for the server validator (4 MiB + 4 MiB + two samples with a four-byte PCM budget).
