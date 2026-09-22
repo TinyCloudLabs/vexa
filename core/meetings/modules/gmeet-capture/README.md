@@ -13,6 +13,11 @@ pool (channel ≠ speaker), but the glow names the live speaker, so the downstre
 codec (live); the [bot](../../services/) wires it to its in-process sink (container). The `capture.v1`
 model + wire codec is [`@vexa/capture-codec`](../capture-codec/) (the SSOT).
 
+Capture ownership follows audio-track identity, not DOM-element identity. When Meet temporarily
+mirrors one `MediaStream` through multiple playing elements, those elements share one source,
+worklet, and channel; removing or replacing a mirror releases the track only after its final
+element reference leaves. All tracks share one `AudioContext`.
+
 The PCM worklet transfers each completed 4096-sample buffer through its `MessagePort`, then
 allocates the next block. Transfer detaches the sender's buffer, avoiding a second backing-store
 copy waiting for garbage collection on the audio thread. The receiver still gets the same
@@ -32,3 +37,5 @@ lib. Covered by `gate:node`, `gate:isolation`, `gate:exports`, `gate:readme`.
 [`src/pcm-capture.test.ts`](src/pcm-capture.test.ts) executes the shipped worklet program with
 real structured transfer semantics, checking exact sample continuity across several blocks and
 detachment of the sender's buffers. Browser memory and long-call acceptance are measured separately.
+The bot's `gmeet-capture-dedup.boundary.test.ts` runs the browser bundle in Chromium with two
+playing elements backed by one oscillator stream and pins single-owner replacement/removal cleanup.

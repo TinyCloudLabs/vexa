@@ -17,7 +17,7 @@
 import { createPcmCaptureNode } from './pcm-capture.js';
 
 export interface GmeetCaptureOptions {
-  /** One per-element PCM chunk (already 16 kHz). index is the stable track index. */
+  /** One per-track PCM chunk (already 16 kHz). index is the stable track index. */
   onAudio: (index: number, pcm: Float32Array) => void;
   log?: (msg: string) => void;
   targetSampleRate?: number;   // default 16000
@@ -48,14 +48,22 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
   let running = false;
   let rescanTimer: ReturnType<typeof setInterval> | null = null;
   interface Connection {
-    el: HTMLMediaElement;
     stream: MediaStream;
     track: MediaStreamTrack;
+    elements: Map<HTMLMediaElement, MediaStream>;
     source: MediaStreamAudioSourceNode;
     node: AudioWorkletNode | null;
     onEnded: () => void;
   }
-  const connections = new Map<HTMLMediaElement, Connection>();
+  interface ElementBinding {
+    stream: MediaStream;
+    connection: Connection;
+  }
+  // Capture resources belong to the audio track, not to a DOM element. Meet can
+  // temporarily mirror one MediaStream through several elements while recycling
+  // tiles; element-keyed ownership would capture identical PCM more than once.
+  const connections = new Map<MediaStreamTrack, Connection>();
+  const bindings = new Map<HTMLMediaElement, ElementBinding>();
   let context: AudioContext | null = null;
   let nextIndex = 0;
 
@@ -72,13 +80,25 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     // Remove the listener before disconnecting so a stop/close cascade cannot retain this
     // connection through the track. Every path (end, detach, replacement, failed init, stop)
     // comes through here; it is deliberately idempotent.
-    if (connections.get(connection.el) !== connection) return;
-    connections.delete(connection.el);
+    if (connections.get(connection.track) !== connection) return;
+    connections.delete(connection.track);
+    for (const el of connection.elements.keys()) {
+      if (bindings.get(el)?.connection === connection) bindings.delete(el);
+    }
+    connection.elements.clear();
     try { connection.track.removeEventListener('ended', connection.onEnded); } catch { /* */ }
     try { connection.node?.port.close(); } catch { /* */ }
     try { connection.node?.disconnect(); } catch { /* */ }
     try { connection.source.disconnect(); } catch { /* */ }
     log(`stream released (${reason})`);
+  }
+
+  function detachElement(el: HTMLMediaElement, binding: ElementBinding, reason: string): void {
+    if (bindings.get(el) !== binding) return;
+    bindings.delete(el);
+    binding.connection.elements.delete(el);
+    if (binding.connection.elements.size === 0) release(binding.connection, reason);
+    else log(`stream mirror detached (${reason}; ${binding.connection.elements.size} reference(s) remain)`);
   }
 
   function releaseAll(reason: string): void {
@@ -97,9 +117,18 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     try {
       const stream: MediaStream = (el as any).srcObject;
       if (!stream || stream.getAudioTracks().length === 0) return false;
-      const existing = connections.get(el);
-      if (existing?.stream === stream) return false;
-      if (existing) release(existing, 'replacement');
+      const track = stream.getAudioTracks()[0];
+      const existing = bindings.get(el);
+      if (existing?.stream === stream && existing.connection.track === track) return false;
+      if (existing) detachElement(el, existing, 'replacement');
+
+      const shared = connections.get(track);
+      if (shared) {
+        shared.elements.set(el, stream);
+        bindings.set(el, { stream, connection: shared });
+        log(`stream mirror attached (track ${track.id.substring(0, 8)}; ${shared.elements.size} reference(s))`);
+        return false;
+      }
 
       const ctx = ensureContext();
       const source = ctx.createMediaStreamSource(stream);
@@ -107,15 +136,15 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       // which duplicates/drops buffers under main-thread load — the captured-audio
       // stutter. connectElement is sync, so wire the node when addModule resolves.
       let seen = 0, emitted = 0; // L4 frame-flow diagnostic
-      const track = stream.getAudioTracks()[0];
       const connection: Connection = {
-        el, stream, track, source, node: null,
+        stream, track, elements: new Map([[el, stream]]), source, node: null,
         onEnded: () => release(connection, 'track ended'),
       };
-      connections.set(el, connection);
+      connections.set(track, connection);
+      bindings.set(el, { stream, connection });
       track.addEventListener('ended', connection.onEnded);
       createPcmCaptureNode(ctx, (data) => {
-        if (!running || connections.get(el) !== connection) return;
+        if (!running || connections.get(track) !== connection) return;
         seen++;
         let maxVal = 0;
         for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxVal) maxVal = a; }
@@ -123,7 +152,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         else if (seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${maxVal.toFixed(4)} ctx=${ctx.state}`);
       }).then((node) => {
         // stop/replacement can happen while addModule() is pending. Never attach a late node.
-        if (!running || connections.get(el) !== connection) {
+        if (!running || connections.get(track) !== connection) {
           try { node.port.close(); node.disconnect(); } catch { /* */ }
           return;
         }
@@ -164,11 +193,12 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       rescanTimer = setInterval(() => {
         if (!running) return;
         // Release first: a removed element or swapped srcObject must not pin its old source.
-        for (const connection of Array.from(connections.values())) {
-          const inDom = typeof document.contains !== 'function' || document.contains(connection.el);
+        for (const [el, binding] of Array.from(bindings.entries())) {
+          const connection = binding.connection;
+          const inDom = typeof document.contains !== 'function' || document.contains(el);
           const live = connection.track.readyState !== 'ended';
-          if (!inDom || !live || (connection.el as any).srcObject !== connection.stream)
-            release(connection, !inDom ? 'element removed' : !live ? 'track ended' : 'replacement');
+          if (!inDom || !live || (el as any).srcObject !== binding.stream)
+            detachElement(el, binding, !inDom ? 'element removed' : !live ? 'track ended' : 'replacement');
         }
         for (const el of findMediaElements()) if (connectElement(el, nextIndex)) nextIndex++;
       }, RESCAN);
