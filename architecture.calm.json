@@ -157,7 +157,7 @@
    "unique-id": "bot",
    "node-type": "service",
    "name": "bot",
-   "description": "spawned-per-meeting worker: join -> capture -> STT -> transcript.v1",
+   "description": "spawned-per-meeting worker: join -> capture -> attributed-audio.v1 -> transcript.v1",
    "metadata": [
     {
      "path": "core/meetings/services/bot"
@@ -632,6 +632,18 @@
    "metadata": [
     {
      "path": "core/meetings/contracts/service-authority.v1",
+     "domain": "meetings"
+    }
+   ]
+  },
+  {
+   "unique-id": "attributed-audio.v1",
+   "node-type": "contract",
+   "name": "attributed-audio.v1",
+   "description": "attributed-audio.v1 — sealed capture-owned durable speaker audio evidence (meetings)",
+   "metadata": [
+    {
+     "path": "core/meetings/contracts/attributed-audio.v1",
      "domain": "meetings"
     }
    ]
