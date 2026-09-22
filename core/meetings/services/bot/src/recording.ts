@@ -110,7 +110,9 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
 
-  const fail = (error: unknown): Error => error instanceof Error ? error : new Error(String(error));
+  // Upload failures may carry an object key, response body, or credential. The lifecycle error
+  // and bot logs use only this stable code; raw provider exceptions never become bot state.
+  const fail = (_error: unknown): Error => new Error('recording delivery failed (code operation_failed)');
   const drain = (): void => {
     if (uploading) return;
     const job = jobs.shift();
@@ -124,7 +126,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       } catch (error) {
         failure = fail(error);
         job.reject(failure);
-        log(`recording: chunk ${job.seq} (isFinal=${job.isFinal}) upload failed: ${failure.message}`);
+        log(`recording: chunk ${job.seq} upload failed (stage=recording-upload code=operation_failed)`);
         // Once durability is uncertain, never send a later final marker that would claim a
         // complete recording. Reject all admitted-but-undelivered chunks and free their bytes.
         for (const pending of jobs.splice(0)) {
@@ -170,7 +172,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
         retainedBytes -= pending.bytes.byteLength;
         pending.reject(failure);
       }
-      log(`recording: capture aborted: ${failure.message}`);
+      log('recording: capture aborted (stage=recording-capture code=operation_failed)');
     },
     async close(_key) {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one

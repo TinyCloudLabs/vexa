@@ -56,7 +56,7 @@ try {
   });
   assert.ok(recorder);
   await recorder.ready;
-  await assert.rejects(recorder.stop(), /attributed-audio close failed \(status 409\)/);
+  await assert.rejects(recorder.stop(), /attributed-audio close failed \(code http status 409\)/);
   assert.equal(recorder.retainedBytes(), 0);
 } finally {
   globalThis.fetch = originalFetch;
@@ -80,9 +80,35 @@ try {
   await recorder.ready;
   await assert.rejects(recorder.stop(), (error: unknown) => {
     const message = String(error);
-    return message === 'Error: attributed-audio close failed (status 502)'
+    return message === 'AttributedAudioRequestError: attributed-audio close failed (code http status 502)'
       && !message.includes('secret-bucket') && !message.includes('Authorization');
   });
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+// Network and JSON parser exceptions are equally untrusted. Neither reaches terminal state or a
+// log line verbatim; the only durable vocabulary is stage + code (+ HTTP status when present).
+globalThis.fetch = async () => { throw new Error('https://private.example/a.pcm Bearer secret transcript text'); };
+try {
+  const recorder = createHttpAttributedAudioRecorder({
+    platform: 'google_meet', meetingUrl: 'https://meet.test/a', botName: 'Vexa', redisUrl: 'redis://x',
+    transcribeEnabled: false, meeting_id: 1, connectionId: 's', attributedAudioUploadUrl: 'https://api.test/internal/attributed-audio/upload',
+  });
+  assert.ok(recorder);
+  await assert.rejects(recorder.ready, (error: unknown) => String(error) === 'AttributedAudioRequestError: attributed-audio manifest failed (code network)');
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+globalThis.fetch = async () => new Response('private parser body', { status: 200, headers: { 'content-type': 'application/json' } });
+try {
+  const recorder = createHttpAttributedAudioRecorder({
+    platform: 'google_meet', meetingUrl: 'https://meet.test/a', botName: 'Vexa', redisUrl: 'redis://x',
+    transcribeEnabled: false, meeting_id: 1, connectionId: 's', attributedAudioUploadUrl: 'https://api.test/internal/attributed-audio/upload',
+  });
+  assert.ok(recorder);
+  await assert.rejects(recorder.ready, (error: unknown) => String(error) === 'AttributedAudioRequestError: attributed-audio manifest failed (code invalid_response)');
 } finally {
   globalThis.fetch = originalFetch;
 }

@@ -122,7 +122,7 @@ export class MediaRecorderChunker implements RecordingTap {
     // can ever be delivered after a terminal failure. Drop those references immediately.
     for (const item of this.pending) this.pendingBytes -= item.blob.size;
     this.pending = [];
-    blog(`[record-chunker] terminal failure: ${this.failure.message}`);
+    blog('[record-chunker] terminal failure (code=operation_failed)');
     const recorder = this.recorder;
     try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
   }
@@ -191,7 +191,7 @@ export class MediaRecorderChunker implements RecordingTap {
         ? new MediaRecorder(this.opts.stream, { mimeType: chosen })
         : new MediaRecorder(this.opts.stream);
     } catch (err: any) {
-      blog(`[record-chunker] Failed to construct MediaRecorder: ${err?.message || err}`);
+      blog('[record-chunker] failed to construct MediaRecorder (code=operation_failed)');
       throw err;
     }
 
@@ -376,10 +376,22 @@ export class DynamicElementMixer {
 
   constructor(rescanMs = RESCAN_MS) {
     this.rescanMs = rescanMs;
-    this.ctx = new AudioContext();
-    (this.ctx as any).resume?.();
-    this.dest = this.ctx.createMediaStreamDestination();
-    this.stream = this.dest.stream;
+    const ctx = new AudioContext();
+    try {
+      (ctx as any).resume?.();
+      const dest = ctx.createMediaStreamDestination();
+      // Accessing a mocked/browser destination can itself throw. Keep all constructor steps inside
+      // the ownership fence so no partially allocated AudioContext survives a failed tap start.
+      const stream = dest.stream;
+      this.ctx = ctx;
+      this.dest = dest;
+      this.stream = stream;
+    } catch (error) {
+      try { (ctx as any).close?.(); } catch { /* allocation failure cleanup is best-effort */ }
+      this.ctx = null;
+      this.dest = null;
+      throw error;
+    }
   }
 
   /** How many elements are currently feeding the mix. */
@@ -429,13 +441,13 @@ export class DynamicElementMixer {
           source.connect(this.dest);
           this.attached.set(el, { ...attachment, source });
           blog(`[record-chunker] attached media element (${this.attached.size} attached)`);
-        } catch (e: any) {
+        } catch {
           if (attachment.owned) stopTracks(attachment.stream);
-          blog(`[record-chunker] could not attach media element: ${e?.message || e}`);
+          blog('[record-chunker] could not attach media element (code=operation_failed)');
         }
       }
-    } catch (e: any) {
-      blog(`[record-chunker] rescan failed (recording continues): ${e?.message || e}`);
+    } catch {
+      blog('[record-chunker] rescan failed (code=operation_failed)');
     }
   }
 

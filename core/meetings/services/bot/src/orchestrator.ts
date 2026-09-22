@@ -320,7 +320,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         // successful `is_final=true` marker.
         deps.recording?.abort?.(error);
       } catch (abortError) {
-        console.error(`[bot] recording: abort failed: ${String(abortError)}`);
+        console.error('[bot] recording: abort failed (stage=recording-abort code=operation_failed)');
         rememberTeardownFailure(abortError);
       }
     };
@@ -330,7 +330,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       let normalTimer: ReturnType<typeof setTimeout> | undefined;
       let signalTimer: ReturnType<typeof setTimeout> | undefined;
       const operation = Promise.resolve().then(() => deps.pipeline.stop()).then(() => true).catch((error) => {
-        console.error(`[bot] pipeline: stop failed: ${String(error)}`);
+        console.error('[bot] pipeline: stop failed (stage=pipeline-stop code=operation_failed)');
         rememberTeardownFailure(error);
         invalidateRecording(error);
         return true;
@@ -349,7 +349,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         const settled = await Promise.race([operation, ...deadlines]);
         if (!settled) {
           const error = new Error(`pipeline stop deadline reached after ${budgetMs}ms`);
-          console.error(`[bot] ${error.message}; continuing bounded teardown`);
+          console.error('[bot] pipeline: stop deadline reached (stage=pipeline-stop code=deadline)');
           rememberTeardownFailure(error);
           invalidateRecording(error);
         }
@@ -373,7 +373,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       try {
         const drained = await Promise.race([
           Promise.resolve(deps.recording.close(recordingKey)).then(() => true).catch((e) => {
-            console.error(`[bot] recording: close failed; recording remains incomplete: ${String(e)}`);
+            console.error('[bot] recording: close failed (stage=recording-close code=operation_failed)');
             rememberTeardownFailure(e);
             return true;
           }),
@@ -381,7 +381,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         ]);
         if (!drained) {
           const error = new Error(`recording upload drain exceeded ${budgetMs}ms`);
-          console.error(`[bot] ${error.message}; recording remains incomplete`);
+          console.error('[bot] recording: drain deadline reached (stage=recording-close code=deadline)');
           rememberTeardownFailure(error);
         }
       } finally {
@@ -583,7 +583,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     await leavePlatform(reason!);
 
     if (teardownFailure) {
-      const failureReason = `recording/capture teardown failed: ${teardownFailure.message}`;
+      const failureReason = 'recording/capture teardown failed (stage=teardown code=operation_failed)';
       console.error(`[bot] orchestrator: ${failureReason}`);
       await emit('failed', {
         failure_stage: 'active', completion_reason: 'join_failure', reason: failureReason, exit_code: 1,

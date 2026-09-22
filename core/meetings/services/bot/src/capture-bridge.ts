@@ -1505,9 +1505,9 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       });
       await w.__vexaRecordingTap.start();
     }
-  }, timesliceMs).catch((e) => {
-    console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`);
-    throw e;
+  }, timesliceMs).catch(() => {
+    console.error('[bot] recording bridge: page-side start failed (stage=recording-start code=operation_failed)');
+    throw new Error('recording bridge start failed');
   });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
@@ -1517,11 +1517,12 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       const w = (globalThis as any) as Record<string, any>;
         await w.__vexaRecordingTap?.stop?.();
       });
-    } catch (error) {
+    } catch {
       // The page producer, not the recording sink, knows that capture was incomplete. Carry that
       // fact across the bridge before teardown so close() cannot add an is_final success marker.
-      recording.abort(error);
-      throw error;
+      const fault = new Error('recording capture stop failed (code operation_failed)');
+      recording.abort(fault);
+      throw fault;
     }
   };
 }

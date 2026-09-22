@@ -55,12 +55,16 @@ class FakeSourceNode {
 let sourcesCreated = 0;
 class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
+  static failDestination = false;
   state = 'running';
   closeCalls = 0;
   constructor() { FakeAudioContext.instances.push(this); }
   resume() { /* */ }
   close() { this.closeCalls++; (this as any).state = 'closed'; }
-  createMediaStreamDestination() { return { stream: new FakeMediaStream() }; }
+  createMediaStreamDestination() {
+    if (FakeAudioContext.failDestination) throw new Error('private destination construction failure');
+    return { stream: new FakeMediaStream() };
+  }
   createMediaStreamSource(s: any) { sourcesCreated++; return new FakeSourceNode(s); }
 }
 (globalThis as any).AudioContext = FakeAudioContext;
@@ -190,6 +194,22 @@ async function main() {
     && failedStartCounts.listeners === 0 && failedStartCounts.intervals === 0 && failedStartCounts.retainedReferences === 0
     && connected.length === 0 && failedStartContext?.closeCalls === 1,
   'failed start: releases mixer resources and closes its context exactly once before pipeline stop');
+
+  // The destination allocation is after AudioContext allocation. Its failure used to strand that
+  // context because the mixer was never returned to createRecordingTap's catch/finally owner.
+  const destinationContextsBefore = FakeAudioContext.instances.length;
+  FakeAudioContext.failDestination = true;
+  const destinationFailureTap = createRecordingTap({ rescanMs: RESCAN, onChunk: () => true });
+  let destinationRejected = false;
+  try { await destinationFailureTap.start(); } catch { destinationRejected = true; }
+  FakeAudioContext.failDestination = false;
+  const destinationContext = FakeAudioContext.instances[destinationContextsBefore];
+  const destinationCounts = destinationFailureTap.releaseCounts?.();
+  check(destinationRejected && FakeAudioContext.instances.length === destinationContextsBefore + 1
+    && destinationContext?.closeCalls === 1 && !!destinationCounts
+    && destinationCounts.contexts === 0 && destinationCounts.sources === 0
+    && destinationCounts.intervals === 0 && destinationCounts.retainedReferences === 0,
+  'destination failure: every allocated context is closed and release telemetry returns to zero');
 
   // Video-only Meet tiles must not create a new capture track on every rescan.
   pageElements.length = 0;

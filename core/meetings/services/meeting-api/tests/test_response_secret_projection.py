@@ -256,6 +256,26 @@ def test_share_recipient_gets_no_owner_private_keys_from_the_transcript_detail()
     _assert_no_credentials(r.json()["data"], where="GET /transcripts/by-id (share recipient)")
 
 
+def test_share_recipient_gets_only_bounded_recording_summaries_from_transcript():
+    """The legacy top-level field is a response edge too, not an escape hatch around ``data``."""
+    rows = [
+        {"id": f"r-{n}", "status": "completed", "storage_path": f"s3://private/{n}",
+         "manifest": {"object_key": f"recordings/private/{n}"},
+         "media_files": [{"storage_path": f"recordings/private/{n}.webm"}]}
+        for n in range(60)
+    ]
+    store, client = _client({**ROW_DATA, "recordings": rows})
+    _share_with(client, VIEWER)
+    shared = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(VIEWER)})
+    owner = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(OWNER)})
+    assert shared.status_code == owner.status_code == 200
+    assert owner.json()["recordings"] == rows, "owner recording behavior is unchanged"
+    summaries = shared.json()["recordings"]
+    assert len(summaries) == 50
+    assert summaries[0] == {"id": "r-0", "status": "completed"}
+    assert "private" not in repr(summaries) and "manifest" not in repr(summaries)
+
+
 def test_bound_workspace_member_is_not_the_owner_either():
     """The third branch of the access union. Membership authorizes the meeting, not the owner's
     configuration — ``shared`` is true for them too."""

@@ -33,6 +33,19 @@ assert.ok(stalled.retainedBytes() <= 64); assert.ok(stalled.pendingTasks() <= 64
 const stopping = stalled.stop(); release(); await stopping; assert.equal(stalled.retainedBytes(), 0);
 assert.ok(stalledStore.rows.some(value => value.state === 'failed'), 'rejected voiced evidence is durably incomplete');
 
+// Bytes alone are not a concurrency bound: tiny ranges separated by capture gaps previously made
+// one stalled storage promise per callback. Admission rejects before allocating a third task.
+let releaseTasks!: () => void; const taskGate = new Promise<void>(resolve => { releaseTasks = resolve; });
+const taskStore = memoryStore(taskGate), taskBound = createAttributedAudioSink('task-bound', taskStore, 1024, 2);
+const tiny = (sequence: number) => ({ idempotency_key: `tiny-${sequence}`, speaker_key: 'channel:0', speaker_name: '', channel: 0,
+  turn_generation: sequence + 1, attribution: { source: 'unresolved' as const, confidence: 0 }, start_ms: sequence, end_ms: sequence + 1,
+  codec: 'pcm_f32le' as const, sample_rate: 1_000, channels: 1 as const });
+const p0 = taskBound.seal(tiny(0), [new Float32Array(1)]), p1 = taskBound.seal(tiny(1), [new Float32Array(1)]);
+assert.equal(taskBound.taskCount(), 2);
+assert.throws(() => taskBound.seal(tiny(2), [new Float32Array(1)]), /storage task admission exhausted/);
+releaseTasks(); await Promise.all([p0, p1]);
+assert.equal(taskBound.taskCount(), 0, 'settled task closures are compacted after durable accounting');
+
 // Restart reconciliation retains the origin and turns a prior sealed reservation into a failure.
 const recovered: AttributedAudioManifest = { version: 1, meeting_id: 'm3', clock_origin: 'first_admitted_capture_epoch_ms', clock_origin_ms: 7, state: 'open', ranges: [row({ version: 1, meeting_id: 'm3', sequence: 4, idempotency_key: 'old', speaker_key: 'channel:0', speaker_name: '', channel: 0, turn_generation: 3, attribution: { source: 'unresolved', confidence: 0 }, clock_origin_ms: 7, start_ms: 0, end_ms: 1, audio_duration_ms: 1, codec: 'pcm_f32le', sample_rate: 1000, channels: 1, byte_count: 4, sha256: '0'.repeat(64) }, 'sealed')] };
 const restart = memoryStore(); restart.load = async () => structuredClone(recovered); restart.rows.push(...structuredClone(recovered.ranges));
@@ -53,6 +66,8 @@ for (const count of [65, 3 * 60 * 60 / 5]) {
   const historyManifest = await history.close();
   assert.equal(historyManifest.ranges.length, count);
   assert.deepEqual(historyManifest.ranges.map(range => range.sequence), Array.from({ length: count }, (_, index) => index));
+  assert.equal(history.taskCount(), 0, 'settled historical ranges do not retain task state');
+  assert.equal(history.retainedMetadataCount(), count, 'telemetry counts the one retained manifest collection');
 }
 
 // A callback clock commonly jitters by a few milliseconds. Sample duration remains authoritative:
@@ -99,6 +114,16 @@ const missingManifest = await missing.stop();
 assert.ok(missingManifest.ranges.every(range => range.byte_count <= 32 * 1024 * 1024));
 assert.ok(missingManifest.ranges.every(range => range.state === 'failed'), JSON.stringify(missingManifest.ranges));
 assert.equal(missingManifest.state, 'closed');
+
+// Rejected frames separated by silence must split just like PCM frames. Their wall spans now match
+// the sample clock, so reserve and close receive two valid missing rows rather than one 1.1s lie.
+const missingGap = createAttributedAudioRecorder('missing-gap', memoryStore(), { cadenceMs: 5_000, budgetBytes: 0 });
+await missingGap.ready;
+missingGap.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms: 1_000, sample_rate: 1_000 });
+missingGap.feed({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(100), capture_ms: 2_000, sample_rate: 1_000 });
+const missingGapManifest = await missingGap.stop();
+assert.deepEqual(missingGapManifest.ranges.map(range => [range.start_ms, range.end_ms, range.audio_duration_ms, range.state]),
+  [[0, 100, 100, 'failed'], [1000, 1100, 100, 'failed']]);
 
 // Same-key retries compare before sequence allocation: pending and completed retries receive the
 // exact original promise/receipt, while a changed immutable payload is rejected.

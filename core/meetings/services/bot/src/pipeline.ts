@@ -537,17 +537,10 @@ export function createBotPipeline(
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */
 export type LiveStage = 'capture-start' | 'capture-stop' | 'recording-start' | 'engine-start';
 
-/**
- * Serialize a thrown value for a LOG LINE (#593 A1). Prefer the stack (names the throwing frame),
- * else `name: message`, else a safe JSON — NEVER `String(e)` (a DOM Event → "[object Event]", the
- * exact fidelity loss that hid the real #593 throw) and never bare `JSON.stringify` (throws on cycles).
- */
-export function serr(e: unknown): string {
-  const x = e as { message?: string; stack?: string; name?: string } | null | undefined;
-  if (x?.stack) return x.stack;
-  if (x?.message) return `${x.name ?? 'Error'}: ${x.message}`;
-  try { return `non-error throw: ${JSON.stringify(e)}`; }
-  catch { return `non-error throw: ${String(e)}`; }
+/** Error values can contain page URLs, transcript text, PCM metadata, credential-bearing bodies,
+ * or stack paths. Keep terminal-adjacent logs to the stable fault vocabulary. */
+export function serr(_e: unknown): string {
+  return 'code=operation_failed';
 }
 
 export interface LivePipelineDeps {

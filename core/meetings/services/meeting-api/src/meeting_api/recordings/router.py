@@ -180,7 +180,18 @@ async def _storage_size(storage: Storage, key: str) -> Optional[int]:
     sizer = getattr(storage, "size", None)
     if sizer is None:
         return None
-    return await sizer(key)
+    try:
+        return await sizer(key)
+    except Exception:
+        raise HTTPException(status_code=502, detail="recording retrieval failed")
+
+
+async def _storage_get(storage: Storage, key: str) -> bytes:
+    """Read recording bytes without reflecting object-store exception text."""
+    try:
+        return await storage.get(key)
+    except Exception:
+        raise HTTPException(status_code=502, detail="recording retrieval failed")
 
 
 async def _storage_get_range(storage: Storage, key: str, start: int, end: int) -> Optional[bytes]:
@@ -189,7 +200,10 @@ async def _storage_get_range(storage: Storage, key: str, start: int, end: int) -
     getter = getattr(storage, "get_range", None)
     if getter is None:
         return None
-    return await getter(key, start, end)
+    try:
+        return await getter(key, start, end)
+    except Exception:
+        raise HTTPException(status_code=502, detail="recording retrieval failed")
 
 
 def build_router(
@@ -286,6 +300,10 @@ def build_router(
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=502, detail="recording upload failed")
         return JSONResponse(content=receipt)
 
     async def _attributed_auth(authorization: Optional[str]) -> Optional[int]:
@@ -382,6 +400,10 @@ def build_router(
             )
         except SessionNotFound:
             raise HTTPException(status_code=404, detail="attributed audio range not found")
+        except Exception:
+            # Object stores can put keys, request paths, credentials, or response bodies in their
+            # exception text. Preserve the retrieval status class without reflecting any of it.
+            raise HTTPException(status_code=502, detail="attributed audio range retrieval failed")
         rng = _parse_range(request.headers.get("range"), len(data))
         if rng is None:
             return Response(content=data, media_type="application/octet-stream", headers={"Accept-Ranges": "bytes"})
@@ -563,12 +585,12 @@ def build_router(
         total = await _storage_size(storage, storage_path)
         full_body: Optional[bytes] = None
         if total is None:
-            full_body = await storage.get(storage_path)
+            full_body = await _storage_get(storage, storage_path)
             total = len(full_body)
 
         rng = _parse_range(range_header, total)  # may raise 416
         if rng is None:
-            data = full_body if full_body is not None else await storage.get(storage_path)
+            data = full_body if full_body is not None else await _storage_get(storage, storage_path)
             return Response(
                 content=data,
                 media_type=content_type,
@@ -581,7 +603,7 @@ def build_router(
             slice_bytes = await _storage_get_range(storage, storage_path, start, end)
         if slice_bytes is None:
             if full_body is None:
-                full_body = await storage.get(storage_path)
+                full_body = await _storage_get(storage, storage_path)
             slice_bytes = full_body[start : end + 1]
         return Response(
             content=slice_bytes,

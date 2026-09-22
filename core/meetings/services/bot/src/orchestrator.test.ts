@@ -229,9 +229,9 @@ async function main(): Promise<void> {
     let fireLeave: (a: { action: 'leave' }) => void = () => {};
     const o = createOrchestrator(inv(), {
       lifecycle: lc, join: mockJoin('admitted'),
-      pipeline: { async start() {}, async stop() { throw new Error('MediaRecorder stop timed out'); } },
+      pipeline: { async start() {}, async stop() { throw new Error('MediaRecorder stop timed out pcm-private-marker'); } },
       acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
-      recording: { async close() { throw new Error('recording producer overflow'); } },
+      recording: { async close() { throw new Error('recording producer overflow credential-private-marker'); } },
     });
     const running = o.run();
     setTimeout(() => fireLeave({ action: 'leave' }), 5);
@@ -242,6 +242,8 @@ async function main(): Promise<void> {
         && last(lc.events).reason?.includes('recording/capture teardown failed') === true,
       JSON.stringify(last(lc.events)));
     check('capture/recording teardown failure never synthesizes a completed terminal', !seq(lc.events).includes('completed'));
+    check('capture/recording teardown failure redacts producer exception text from terminal state',
+      !JSON.stringify(last(lc.events)).includes('private-marker'), JSON.stringify(last(lc.events)));
   }
 
   // ── producer-owned event time: admission/runtime billing survives callback delay ──

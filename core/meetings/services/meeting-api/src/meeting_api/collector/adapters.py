@@ -424,7 +424,7 @@ class SqlAlchemyTranscriptStore:
         native-keyed read constrains ``Meeting.user_id == user_id`` in SQL, and the by-id read
         evaluates an explicit owner branch inside its authorization check. Passing the decision down
         beats re-deriving it here, where the caller's ``user_id`` is not even in scope."""
-        from .projection import project_response_data
+        from .projection import project_response_data, project_transcript_recordings
 
         snap, seg_by_id, order = pg
         data = snap["data"]
@@ -459,7 +459,7 @@ class SqlAlchemyTranscriptStore:
             "status": snap["status"],
             "start_time": _iso_utc(snap["start_time"]),
             "end_time": _iso_utc(snap["end_time"]),
-            "recordings": data.get("recordings", []),
+            "recordings": project_transcript_recordings(data.get("recordings"), viewer_is_owner=viewer_is_owner),
             "notes": data.get("notes"),
             "data": project_response_data(data, viewer_is_owner=viewer_is_owner),
             "segments": segments,

@@ -109,6 +109,31 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
+def test_attributed_range_storage_get_error_is_bounded():
+    """The owner retrieval route preserves its gateway status without reflecting storage detail."""
+    repo, storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {
+        "version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "unsafe-get",
+        "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+        "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+        "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
+        "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest(),
+    }
+    from meeting_api.recordings.attributed import close_attributed_manifest, reserve_attributed_range, upload_reserved_attributed_range
+    asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    asyncio.run(upload_reserved_attributed_range(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta, data=pcm))
+    asyncio.run(close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID))
+
+    async def unsafe_get(_key):
+        raise RuntimeError("s3://private-bucket/path Authorization: Bearer credential PCM transcript text")
+    storage.get = unsafe_get
+    response = _client_for(repo, storage).get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": str(USER)})
+    assert response.status_code == 502
+    assert response.json() == {"detail": "attributed audio range retrieval failed"}
+    assert "private-bucket" not in response.text and "credential" not in response.text
+
+
 @pytest.mark.asyncio
 async def test_concurrent_close_and_late_identical_put_keeps_uploaded_object():
     """A duplicate whose PUT finishes after close must acknowledge the durable uploaded row."""

@@ -121,7 +121,7 @@ class InMemoryTranscriptStore:
         by-id read returns exactly that row's segments/notes. Mirrors the real store's viewer-aware
         response projection, ``viewer_is_owner`` included — the fake and the real store must agree on
         what a share recipient receives, since most of the suite drives the fake."""
-        from .projection import project_response_data
+        from .projection import project_response_data, project_transcript_recordings
 
         m = self._meetings[mid]
         by_id = dict(m["segments"])
@@ -146,7 +146,7 @@ class InMemoryTranscriptStore:
             "status": m["status"],
             "start_time": m["start_time"],
             "end_time": m["end_time"],
-            "recordings": m["data"].get("recordings", []),
+            "recordings": project_transcript_recordings(m["data"].get("recordings"), viewer_is_owner=viewer_is_owner),
             "notes": m["data"].get("notes"),
             "data": project_response_data(m["data"], viewer_is_owner=viewer_is_owner),
             "segments": [_segment_to_api(s) for s in segments],

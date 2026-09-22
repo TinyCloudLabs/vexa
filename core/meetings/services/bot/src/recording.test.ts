@@ -190,13 +190,15 @@ async function main(): Promise<void> {
     const sink = createBotRecordingSink({ inv: inv(), uploadChunk: upload, maxRetainedBytes: 16 });
     await sink.chunk('google_meet/overflow', 0, false, 'webm', new Uint8Array(8));
     // Mirrors the real browser boundary: a following 17-byte Blob cannot fit the 16-byte budget.
-    sink.abort(new Error('recording producer overflow: 17B event exceeds 16B pending budget'));
-    let rejected = false;
-    try { await sink.close('google_meet/overflow'); } catch { rejected = true; }
+    sink.abort(new Error('recording producer overflow private-object-key/17B credential-marker'));
+    let rejected = false, fault = '';
+    try { await sink.close('google_meet/overflow'); } catch (error) { rejected = true; fault = String(error); }
     check('producer overflow: bridge/sink close rejects truthfully', rejected && sink.resourceCounts().failed,
       JSON.stringify(sink.resourceCounts()));
     check('producer overflow: no synthetic successful final marker follows the accepted seq0',
       seen.length === 1 && !seen[0].isFinal && seen[0].len === 8, JSON.stringify(seen));
+    check('producer overflow: upload/capture exception is redacted before terminal state',
+      fault === 'Error: recording delivery failed (code operation_failed)' && !fault.includes('credential-marker'), fault);
   }
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──

@@ -193,12 +193,12 @@ async function main(): Promise<void> {
       `starts=${engine.starts} stops=${engine.stops}`);
   }
 
-  // 9) serr: full-fidelity serialization — the A1 fix for the {isTrusted:true} fidelity loss.
+  // 9) terminal-adjacent logging must never serialize thrown values (they may contain meeting data).
   {
     const e = new Error('config.json not found');
-    check('serr: Error → includes message', serr(e).includes('config.json not found'));
-    check('serr: Error → includes a stack frame', /\bat\b/.test(serr(e)));
-    check('serr: bare object → NOT flattened to [object …]', !serr({ isTrusted: true }).includes('[object'));
+    check('serr: Error → stable code only', serr(e) === 'code=operation_failed');
+    check('serr: Error → omits stack and message', !serr(e).includes('config.json') && !/\bat\b/.test(serr(e)));
+    check('serr: bare object → stable code only', serr({ isTrusted: true }) === 'code=operation_failed');
   }
 
   // 10) A bounded attributed-audio stop failure is visible as an incomplete capture outcome but

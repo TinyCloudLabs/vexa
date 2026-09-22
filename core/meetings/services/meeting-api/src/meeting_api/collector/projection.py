@@ -152,6 +152,39 @@ SENSITIVE_KEY_SUFFIXES = (
 # never capped.
 DEFAULT_LIST_LIMIT = 50
 
+# Transcript reads carry recordings at the top level for legacy clients.  Unlike ``data``, that
+# field bypassed the response projection entirely.  A transcript grant is not a recording grant:
+# recipients may learn that a recording exists, but not its storage topology, playback manifest,
+# or an unbounded history of operational rows.
+TRANSCRIPT_RECORDING_LIMIT = 50
+TRANSCRIPT_RECORDING_PUBLIC_KEYS = frozenset({
+    "id", "recording_id", "status", "created_at", "updated_at", "is_final", "media_type",
+})
+
+
+def project_transcript_recordings(recordings: Any, *, viewer_is_owner: bool) -> list[dict]:
+    """Shape the legacy top-level transcript ``recordings`` field for its reader.
+
+    Owners retain the established recording response unchanged.  A non-owner gets a small,
+    primitive-only existence summary; nested media files, manifests, object keys, URLs, and raw
+    history never cross a transcript-share or workspace-read boundary.
+    """
+    if not isinstance(recordings, list):
+        return []
+    if viewer_is_owner:
+        return recordings
+    projected: list[dict] = []
+    for recording in recordings[:TRANSCRIPT_RECORDING_LIMIT]:
+        if not isinstance(recording, dict):
+            continue
+        summary = {
+            key: value for key, value in recording.items()
+            if key in TRANSCRIPT_RECORDING_PUBLIC_KEYS and isinstance(value, (str, int, float, bool, type(None)))
+        }
+        if summary:
+            projected.append(summary)
+    return projected
+
 
 # #1222: the list orders by the MEETING EVENT time, not row-creation time. A calendar-managed row
 # is created at IMPORT time — possibly days before the meeting — so `created_at DESC` buried a
