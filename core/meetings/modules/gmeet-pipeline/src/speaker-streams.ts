@@ -116,7 +116,7 @@ export class SpeakerStreamManager {
   private silenceRmsThreshold: number;
   /** Audio carried forward from a flushed short segment — prepended to the next feedAudio call */
   private carryForward: Float32Array[] = [];
-  /** Generation at time of last submission — used to detect stale responses after fullReset */
+  /** Generation at time of last submission — used to detect stale responses after fullReset. */
   private submitGeneration: Map<string, number> = new Map();
 
   /** Called when unconfirmed audio needs transcription. */
@@ -431,6 +431,9 @@ export class SpeakerStreamManager {
     }
 
     this.buffers.delete(speakerId);
+    // A generation is meaningful only while its buffer exists. Keeping these entries made a
+    // long-lived bot retain one Map key per departed channel/turn.
+    this.submitGeneration.delete(speakerId);
   }
 
   hasSpeaker(speakerId: string): boolean {
@@ -471,6 +474,22 @@ export class SpeakerStreamManager {
     for (const speakerId of Array.from(this.buffers.keys())) {
       this.removeSpeaker(speakerId);
     }
+    this.carryForward = [];
+  }
+
+  /** Bounded state accounting for diagnostics and deterministic churn tests. */
+  resourceCounts(): { speakers: number; timers: number; generations: number; carriedSamples: number; retainedPcmBytes: number } {
+    let carriedSamples = 0;
+    let retainedSamples = 0;
+    for (const chunk of this.carryForward) carriedSamples += chunk.length;
+    for (const buffer of this.buffers.values()) for (const chunk of buffer.chunks) retainedSamples += chunk.length;
+    return {
+      speakers: this.buffers.size,
+      timers: this.timers.size,
+      generations: this.submitGeneration.size,
+      carriedSamples,
+      retainedPcmBytes: (carriedSamples + retainedSamples) * Float32Array.BYTES_PER_ELEMENT,
+    };
   }
 
   /**

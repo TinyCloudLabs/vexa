@@ -9,6 +9,7 @@ export function createResourceMonitor(opts: {
   nodeRss?: () => number;
   log?: (message: string) => void;
   intervalMs?: number;
+  retained?: () => Record<string, number | boolean>;
 } = {}) {
   const read = opts.read ?? ((path: string) => readFileSync(path, 'utf8'));
   const contents = (path: string): string | undefined => {
@@ -42,6 +43,7 @@ export function createResourceMonitor(opts: {
       ...(limit === undefined ? {} : { memory_limit_bytes: limit }),
       ...(kills === undefined ? {} : { oom_kill_count: kills }),
       ...(kills === undefined || initialOomKills === undefined ? {} : { oom_kill_delta: Math.max(0, kills - initialOomKills) }),
+      ...(opts.retained ? opts.retained() : {}),
     };
   };
   const report = () => {

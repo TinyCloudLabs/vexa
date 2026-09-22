@@ -298,9 +298,10 @@ export interface RecorderOptions {
 const DEFAULT_DIR = process.env.VEXA_CAPTURE_SIGNAL_DIR ?? '/tmp/captured-signal';
 const DEFAULT_FLUSH_MS = 2000;
 const DEFAULT_MAX_BUFFER = 1 << 20; // 1 MiB of pending JSONL
-/** 250 MB ≈ an hour of tape at the observed ~4 MB/min. The pod's ephemeral-storage request is the
- *  real bound; this keeps one pathological meeting from ever reaching it. */
-export const DEFAULT_MAX_TAPE_BYTES = 250 * 1024 * 1024;
+/** Capture-signal diagnostics are opt-in. Zero means no diagnostic tape is retained by default. */
+export const DEFAULT_MAX_TAPE_BYTES = 0;
+/** Bound applied once the explicit diagnostic switch enables a tape. */
+export const DEFAULT_ENABLED_MAX_TAPE_BYTES = 250 * 1024 * 1024;
 
 export function resolveMaxTapeBytes(
   raw: string | undefined = process.env.VEXA_CAPTURE_SIGNAL_MAX_BYTES,
@@ -311,8 +312,8 @@ export function resolveMaxTapeBytes(
   // (Same rule as meeting-api's env_flag: an unrecognized value is not an explicit opt-out, and a
   // set-but-empty env line — which .env files produce constantly — must read as unset.)
   if (!Number.isFinite(n) || n <= 0) {
-    signalEvent('cap-invalid', { raw, using: DEFAULT_MAX_TAPE_BYTES });
-    return DEFAULT_MAX_TAPE_BYTES;
+    signalEvent('cap-invalid', { raw, using: DEFAULT_ENABLED_MAX_TAPE_BYTES });
+    return DEFAULT_ENABLED_MAX_TAPE_BYTES;
   }
   return n;
 }
@@ -433,13 +434,15 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
   const maxBuffer = opts.maxBufferBytes ?? DEFAULT_MAX_BUFFER;
 
   // ── the size cap ──────────────────────────────────────────────────────────────────────────────
-  // Fixture collection is default ON, so EVERY prod meeting writes into the pod's ephemeral
+  // Fixture collection is explicitly enabled, so a diagnostic meeting writes into the pod's ephemeral
   // storage. Unbounded, one pathological meeting (a 6-hour room, a wedged leave) fills the disk —
   // and a bot that dies of a full disk is a lost MEETING, not just a lost fixture. So the tape has
   // a ceiling, and reaching it stops the TAPE and nothing else: no throw into capture, no leave, no
   // change to transcription or recording. A capped tape is a shorter fixture; a dead bot is an
   // incident.
-  const maxBytes = opts.maxBytes ?? resolveMaxTapeBytes();
+  // The composition root calls this only after VEXA_CAPTURE_SIGNAL/captureSignalEnabled opted in.
+  // Direct callers retain the bounded diagnostic default; an unset process never creates it.
+  const maxBytes = opts.maxBytes ?? (resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES);
   let written = writer ? headerLine.length : 0;
   let capped = false;
 

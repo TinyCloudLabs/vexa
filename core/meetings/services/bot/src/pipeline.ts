@@ -118,6 +118,20 @@ export interface BotPipeline extends Pipeline {
   readonly hintCounters?: HintCounters;
 }
 
+/** Recording-only meetings still capture page audio, but have no business creating turn timers,
+ * transcription queues, prompts, or PCM windows. Keep this at the composition boundary so the
+ * live-STT implementation never has to carry a disabled-mode branch. */
+function createRecordingOnlyPipeline(): BotPipeline {
+  return {
+    async start() { /* capture/recording own their own lifecycle */ },
+    async stop() { /* no STT state was allocated */ },
+    feedAudio() { /* intentionally discard PCM after the recording tap has consumed it */ },
+    feedMixedAudio() { /* intentionally discard PCM */ },
+    recordHint() { /* no transcript attribution without live STT */ },
+    hintCounters: { received: 0, matched: 0, missed: 0 },
+  };
+}
+
 /** The lane segments are the SEALED transcript.v1 view — structurally identical to the bot's
  *  contracts.ts TranscriptSegment (same SSOT schema). Map defensively so a future drift in
  *  either view is a compile error here, not a silent wire mismatch. */
@@ -497,6 +511,7 @@ export function createBotPipeline(
     onObservation?: (source: string, obs: Record<string, unknown>, tMs?: number) => void;
   } = {},
 ): BotPipeline {
+  if (inv.transcribeEnabled === false) return createRecordingOnlyPipeline();
   const transcribe = opts.transcribe ?? createTranscribe(inv);
   if (inv.platform === 'teams') {
     return createTeamsBotPipeline(

@@ -38,7 +38,9 @@ import type { RecordingSink } from './ports.js';
  *  as they arrive from the page-side recorder. */
 export interface BotRecordingSink extends RecordingSink {
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
-  chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void;
+  chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): Promise<void>;
+  /** Application-owned delivery state. Values settle to zero after a successful or failed close. */
+  resourceCounts(): { retainedBytes: number; queuedChunks: number; failed: boolean };
 }
 
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
@@ -53,7 +55,13 @@ export interface RecordingSinkOptions {
    *  receiver). Default = HTTP upload to inv.recordingUploadUrl via RecordingService.uploadChunk. */
   uploadChunk?: ChunkUploader;
   log?: (msg: string) => void;
+  /** Maximum bytes admitted to Node-owned recording delivery. Default: 16 MiB. */
+  maxRetainedBytes?: number;
 }
+
+/** The bot must never turn a slow uploader into an unbounded in-memory recording. */
+export const DEFAULT_MAX_RECORDING_RETAINED_BYTES = 16 * 1024 * 1024;
+const MAX_QUEUED_RECORDING_CHUNKS = 128;
 
 /** The default chunk uploader: POST each chunk to meeting-api's internal upload endpoint via the
  *  shipped RecordingService.uploadChunk (multipart, retry+backoff, structured chunk-loss logging).
@@ -80,31 +88,105 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
 export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecordingSink {
   const log = opts.log ?? (() => { /* silent by default */ });
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
+  const maxRetainedBytes = opts.maxRetainedBytes ?? DEFAULT_MAX_RECORDING_RETAINED_BYTES;
+  if (!Number.isSafeInteger(maxRetainedBytes) || maxRetainedBytes <= 0) throw new Error('recording maxRetainedBytes must be a positive integer');
 
-  let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
+  interface Job {
+    seq: number; isFinal: boolean; format: RecordingMasterFormat; bytes: Uint8Array;
+    resolve: () => void; reject: (error: Error) => void;
+  }
+  const jobs: Job[] = [];
+  const waiters: Array<() => void> = [];
+  let retainedBytes = 0;
+  let uploading = false;
+  let admitting = 0;
+  let closed = false;
+  let failure: Error | null = null;
   let anyChunk = false;                                // did the tap ever deliver a chunk?
-  let finalSent = false;                               // has an is_final chunk been sent? (fallback guard)
+  let finalRequested = false;                          // has an is_final chunk been admitted? (fallback guard)
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
 
-  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void => {
+  const wake = (): void => { while (waiters.length) waiters.shift()!(); };
+  const fail = (error: unknown): Error => error instanceof Error ? error : new Error(String(error));
+  const drain = (): void => {
+    if (uploading) return;
+    const job = jobs.shift();
+    if (!job) return;
+    uploading = true;
+    void (async () => {
+      try {
+        if (failure) throw failure;
+        await upload(job.seq, job.isFinal, job.format, job.bytes);
+        job.resolve();
+      } catch (error) {
+        failure = fail(error);
+        job.reject(failure);
+        log(`recording: chunk ${job.seq} (isFinal=${job.isFinal}) upload failed: ${failure.message}`);
+        // Once durability is uncertain, never send a later final marker that would claim a
+        // complete recording. Reject all admitted-but-undelivered chunks and free their bytes.
+        for (const pending of jobs.splice(0)) {
+          retainedBytes -= pending.bytes.byteLength;
+          pending.reject(failure);
+        }
+      } finally {
+        retainedBytes -= job.bytes.byteLength;
+        uploading = false;
+        wake();
+        drain();
+      }
+    })();
+  };
+
+  const waitForCapacity = async (bytes: number): Promise<void> => {
+    while (!failure && (retainedBytes + bytes > maxRetainedBytes || jobs.length + (uploading ? 1 : 0) >= MAX_QUEUED_RECORDING_CHUNKS)) {
+      await new Promise<void>((resolve) => waiters.push(resolve));
+    }
+    if (failure) throw failure;
+  };
+
+  const enqueue = async (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): Promise<void> => {
+    if (closed) throw new Error('recording sink is closed');
+    if (failure) throw failure;
+    if (bytes.byteLength > maxRetainedBytes) throw new Error(`recording chunk ${seq} exceeds ${maxRetainedBytes}-byte admission budget`);
+    // Publish ingress state synchronously. Browser/MediaRecorder callers may invoke chunk() and
+    // close() in the same turn; close must see that already-arrived part and synthesize its final.
     anyChunk = true;
-    if (isFinal) finalSent = true;
+    if (isFinal) finalRequested = true;
     if (seq > maxSeq) maxSeq = seq;
     lastFormat = format;
-    queue = queue
-      .then(() => upload(seq, isFinal, format, bytes))
-      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); });
+    admitting++;
+    try {
+      await waitForCapacity(bytes.byteLength);
+      retainedBytes += bytes.byteLength;
+      const admitted = new Promise<void>((resolve, reject) => jobs.push({ seq, isFinal, format, bytes, resolve, reject }));
+      drain();
+      await admitted;
+    } finally {
+      admitting--;
+      wake();
+    }
   };
 
   return {
-    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
-    close: (_key) => {
+    chunk: (_key, seq, isFinal, format, bytes) => enqueue(seq, isFinal, format, bytes),
+    async close(_key) {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
       // (no phantom recording), and at most once (a real is_final already set finalSent).
-      if (anyChunk && !finalSent) enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
-      return queue;
+      if (closed) {
+        if (failure) throw failure;
+        return;
+      }
+      if (anyChunk && !finalRequested && !failure) await enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      closed = true;
+      // Callers may already be backpressured in chunk(); wait for those admitted jobs without
+      // retaining a promise chain per chunk. A failing upload rejects close truthfully.
+      while ((uploading || jobs.length || admitting) && !failure) await new Promise<void>((resolve) => waiters.push(resolve));
+      if (failure) throw failure;
+    },
+    resourceCounts() {
+      return { retainedBytes, queuedChunks: jobs.length + (uploading ? 1 : 0), failed: !!failure };
     },
   };
 }
