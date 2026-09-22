@@ -103,6 +103,21 @@ class InMemoryRecordingRepo:
         self._meetings[meeting_id]["recordings"] = list(new_recordings)
         return result
 
+    async def mutate_meeting_data(self, meeting_id: int, mutator):
+        self._meetings.setdefault(meeting_id, {"user_id": None, "recordings": []})
+        meeting = self._meetings[meeting_id]
+        data = dict(meeting.get("data") or {})
+        next_data, result = mutator(data)
+        meeting["data"] = dict(next_data)
+        return result
+
+    async def attributed_manifest_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
+        meeting = self._meetings.get(meeting_id)
+        if not meeting or meeting.get("user_id") != user_id:
+            return None
+        value = (meeting.get("data") or {}).get("attributed_audio_manifest")
+        return dict(value) if isinstance(value, dict) else None
+
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")
 
