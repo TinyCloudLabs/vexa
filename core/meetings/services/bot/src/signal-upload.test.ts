@@ -25,7 +25,7 @@ import {
   uploadSignalTapes,
   type TapePart,
 } from './signal-upload.js';
-import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
+import { captureSignalEnabled, createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
 import type { Invocation } from './config.js';
 import type { CapturedFrame } from './ports.js';
 import type { CsrcRecord, ObservationRecord, TeamsCaptionRecord } from './capture-bridge.js';
@@ -94,6 +94,11 @@ console.log('\n── tape size cap ──');
   check('cap invalid value stays disabled', resolveMaxTapeBytes('lots') === DEFAULT_MAX_TAPE_BYTES);
   check('cap invalid <= 0 stays disabled', resolveMaxTapeBytes('0') === DEFAULT_MAX_TAPE_BYTES);
   check('explicit cap honored', resolveMaxTapeBytes('1024') === 1024);
+  check('diagnostics require identity explicit true plus a positive cap',
+    captureSignalEnabled(inv({ captureSignalEnabled: true }), '1024')
+      && !captureSignalEnabled(inv({ captureSignalEnabled: true }), '')
+      && !captureSignalEnabled(inv({ captureSignalEnabled: false }), '1024')
+      && !captureSignalEnabled(inv({}), '1024'));
 }
 
 // ── the Teams CC sidecar ────────────────────────────────────────────────────────────────────────

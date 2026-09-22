@@ -32,7 +32,7 @@ import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redi
 import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
-import { createCaptureSignalRecorder, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
+import { captureSignalEnabled, createCaptureSignalRecorder, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { createResourceMonitor } from './resources.js';
@@ -202,7 +202,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // enables it without a control plane (the local hot-loop path).
   const captureSignalMaxBytes = resolveMaxTapeBytes();
   const signalRecorder: CaptureSignalRecorder | null =
-    inv.captureSignalEnabled === true && captureSignalMaxBytes > 0
+    captureSignalEnabled(inv)
       ? createCaptureSignalRecorder(inv, { maxBytes: captureSignalMaxBytes })
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
@@ -317,10 +317,15 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     log: (message) => console.log(message),
     retained: () => {
       const counts = recording?.resourceCounts();
+      const liveStt = botPipeline?.resourceCounts?.();
       return {
         recording_retained_bytes: counts?.retainedBytes ?? 0,
         recording_queued_chunks: counts?.queuedChunks ?? 0,
-        live_stt_retained_bytes: inv.transcribeEnabled === false ? 0 : 0,
+        ...(inv.transcribeEnabled === false
+          ? { live_stt_retained_state: 'disabled' }
+          : liveStt
+            ? { live_stt_retained_state: 'measured', live_stt_retained_bytes: liveStt.retainedPcmBytes }
+            : { live_stt_retained_state: 'unavailable' }),
       };
     },
   });

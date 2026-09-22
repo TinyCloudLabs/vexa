@@ -79,7 +79,6 @@ export class MediaRecorderChunker implements RecordingTap {
   private pending: Array<{ blob: Blob; seq: number }> = [];
   private pendingBytes = 0;
   private processing = false;
-  private pausedForBackpressure = false;
   private failure: Error | null = null;
   private resolveFinalChunk: (() => void) | null = null;
   private rejectFinalChunk: ((error: Error) => void) | null = null;
@@ -122,15 +121,6 @@ export class MediaRecorderChunker implements RecordingTap {
     try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch { /* terminal state is reported by stop() */ }
   }
 
-  private maybeResume(): void {
-    const recorder = this.recorder;
-    if (!this.pausedForBackpressure || this.failure || !recorder || recorder.state !== 'paused') return;
-    // Resume only after the queued Blob ownership is below half the cap. This gives the recorder
-    // room for its next timeslice instead of pause/resume thrashing around one byte of headroom.
-    if (this.pendingBytes > this.maxPendingBytes() / 2) return;
-    try { recorder.resume(); this.pausedForBackpressure = false; } catch (error) { this.fail(error); }
-  }
-
   private maxPendingBytes(): number {
     return this.opts.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
   }
@@ -138,12 +128,11 @@ export class MediaRecorderChunker implements RecordingTap {
   private pump(): void {
     if (this.processing || this.failure) return;
     const next = this.pending.shift();
-    if (!next) { this.maybeResume(); return; }
+    if (!next) return;
     this.processing = true;
     void this.deliver(next).finally(() => {
       this.pendingBytes -= next.blob.size;
       this.processing = false;
-      this.maybeResume();
       this.pump();
     });
   }
@@ -216,9 +205,10 @@ export class MediaRecorderChunker implements RecordingTap {
       }
 
       if (this.failure) return;
-      // The browser cannot await an event listener. Admit its Blob synchronously, pause the
-      // recorder before another timeslice can arrive, and fail terminally if one event itself is
-      // larger than the declared ownership budget. No admitted Blob is ever discarded.
+      // The browser cannot await an event listener. Admit its Blob synchronously while the owned
+      // delivery queue has room. MediaRecorder stays continuous: pausing after every upload loses
+      // meeting audio under a slow acknowledgement. Once the genuinely byte-bounded queue is full,
+      // fail and stop instead of silently omitting the interval that arrived while paused.
       if (event.data.size > maxPendingBytes || this.pendingBytes + event.data.size > maxPendingBytes) {
         this.fail(new Error(`recording producer overflow: ${event.data.size}B event exceeds ${maxPendingBytes}B pending budget`));
         return;
@@ -226,9 +216,6 @@ export class MediaRecorderChunker implements RecordingTap {
       const seq = this.chunkSeq++;
       this.pending.push({ blob: event.data, seq });
       this.pendingBytes += event.data.size;
-      if (recorder.state === 'recording') {
-        try { recorder.pause(); this.pausedForBackpressure = true; } catch (error) { this.fail(error); return; }
-      }
       this.pump();
     };
 
@@ -243,7 +230,8 @@ export class MediaRecorderChunker implements RecordingTap {
       try {
         const finalSeq = this.chunkSeq;
         this.chunkSeq = finalSeq + 1;
-        await this.opts.onChunk({ base64: "", chunkSeq: finalSeq, isFinal: true, mimeType: this.mimeType });
+        const acknowledged = await this.opts.onChunk({ base64: "", chunkSeq: finalSeq, isFinal: true, mimeType: this.mimeType });
+        if (!acknowledged) throw new Error(`recording final chunk ${finalSeq} was rejected by the bridge`);
         blog(`[record-chunker] final chunk emitted (seq=${finalSeq})`);
       } catch (err: any) {
         this.fail(err);

@@ -39,6 +39,8 @@ import type { RecordingSink } from './ports.js';
 export interface BotRecordingSink extends RecordingSink {
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
   chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): Promise<void>;
+  /** Mark page-side production as incomplete so close() cannot fabricate a completion marker. */
+  abort(reason: unknown): void;
   /** Application-owned delivery state. Values settle to zero after a successful or failed close. */
   resourceCounts(): { retainedBytes: number; queuedChunks: number; failed: boolean };
 }
@@ -160,6 +162,16 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
 
   return {
     chunk: (_key, seq, isFinal, format, bytes) => enqueue(seq, isFinal, format, bytes),
+    abort(reason) {
+      if (!failure) failure = fail(reason);
+      // A browser-side producer failure means an admitted part may be missing. Reject queued work
+      // and deliberately leave the server-side recording incomplete; no close fallback is allowed.
+      for (const pending of jobs.splice(0)) {
+        retainedBytes -= pending.bytes.byteLength;
+        pending.reject(failure);
+      }
+      log(`recording: capture aborted: ${failure.message}`);
+    },
     async close(_key) {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
