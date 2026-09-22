@@ -115,10 +115,10 @@ function joinEvidenceFor(
   detail: string | undefined,
 ): Partial<LifecycleEvent> {
   try {
-    const evidence = buildJoinEvidence(outcome, stage, {
-      ...(signals ?? {}),
-      ...(detail !== undefined ? { detail } : {}),
-    });
+    // Classification reads the driver's signals at the source, but its raw detail is never
+    // serialized.  Replace only the returned evidence detail after classification.
+    const evidence = buildJoinEvidence(outcome, stage, signals ?? {});
+    if (evidence && detail !== undefined) evidence.detail = detail;
     return evidence ? { join_evidence: evidence } : {};
   } catch {
     return {};
