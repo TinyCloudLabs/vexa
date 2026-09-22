@@ -37,4 +37,28 @@ try {
 } finally {
   globalThis.fetch = originalFetch;
 }
+
+// The durable producer's real HTTP close boundary is not a best-effort success.  A server-side
+// 409 remains an active-phase fault until cleanup and must therefore make the later lifecycle exit
+// fail instead of publishing an empty closed manifest.
+globalThis.fetch = async (input, init) => {
+  if (init?.method === 'GET') {
+    return Response.json({ version: 1, meeting_id: '1', clock_origin: 'first_admitted_capture_epoch_ms', clock_origin_ms: 0, state: 'open', ranges: [] });
+  }
+  if (String(input).endsWith('/close')) return new Response('ledger conflict', { status: 409 });
+  return Response.json({});
+};
+try {
+  const recorder = createHttpAttributedAudioRecorder({
+    platform: 'google_meet', meetingUrl: 'https://meet.test/a', botName: 'Vexa', redisUrl: 'redis://x',
+    transcribeEnabled: false, recordingEnabled: true, attributedAudioEnabled: true,
+    meeting_id: 1, connectionId: 's', attributedAudioUploadUrl: 'https://api.test/internal/attributed-audio/upload',
+  });
+  assert.ok(recorder);
+  await recorder.ready;
+  await assert.rejects(recorder.stop(), /attributed-audio request failed \(409\)/);
+  assert.equal(recorder.retainedBytes(), 0);
+} finally {
+  globalThis.fetch = originalFetch;
+}
 console.log('attributed HTTP adapter memory and timeout fence passes');

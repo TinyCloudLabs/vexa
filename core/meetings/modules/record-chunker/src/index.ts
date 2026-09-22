@@ -33,6 +33,8 @@ export interface RecordingChunk {
 export interface RecordingTap {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** Owned browser-side state, exposed for lifecycle regressions and diagnostics. */
+  releaseCounts?(): { mixers: number; contexts: number; sources: number; listeners: number; intervals: number; retainedReferences: number };
 }
 
 /** Options a host passes to a lane recording tap. */
@@ -363,8 +365,8 @@ function probeElementStream(el: any): ElementStream | null {
  * same rescan and must never crash the recording.
  */
 export class DynamicElementMixer {
-  private ctx: AudioContext;
-  private dest: MediaStreamAudioDestinationNode;
+  private ctx: AudioContext | null;
+  private dest: MediaStreamAudioDestinationNode | null;
   /** element → the stream/source we attached for it (dedupe + detach bookkeeping). */
   private attached = new Map<any, ElementStream & { source: MediaStreamAudioSourceNode }>();
   private timer: any = null;
@@ -383,9 +385,20 @@ export class DynamicElementMixer {
   /** How many elements are currently feeding the mix. */
   get attachedCount(): number { return this.attached.size; }
 
+  resourceCounts(): { contexts: number; sources: number; listeners: number; intervals: number; retainedReferences: number } {
+    return {
+      contexts: this.ctx ? 1 : 0,
+      sources: this.attached.size,
+      listeners: this.attached.size,
+      intervals: this.timer ? 1 : 0,
+      retainedReferences: this.attached.size + (this.ctx ? 1 : 0) + (this.dest ? 1 : 0),
+    };
+  }
+
   /** One pass: detach dead sources, attach new audio-bearing elements. Never throws. */
   scan(): void {
     try {
+      if (!this.ctx || !this.dest) return;
       // Autoplay policy can leave a gesture-less AudioContext suspended → silent mix.
       if ((this.ctx as any).state === "suspended") (this.ctx as any).resume?.();
 
@@ -439,7 +452,9 @@ export class DynamicElementMixer {
       if (a.owned) stopTracks(a.stream);
     }
     this.attached.clear();
-    try { (this.ctx as any).close?.(); } catch { /* */ }
+    try { (this.ctx as any)?.close?.(); } catch { /* */ }
+    this.dest = null;
+    this.ctx = null;
   }
 }
 
@@ -486,10 +501,31 @@ export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTa
       await chunker.start();
     },
     async stop(): Promise<void> {
-      await chunker?.stop();   // flush the final chunk BEFORE tearing the mix down
-      chunker = null;
-      mixer?.stop();
-      mixer = null;
+      let failure: unknown;
+      try {
+        await chunker?.stop();   // flush the final chunk BEFORE tearing the mix down
+      } catch (error) {
+        failure = error;
+      } finally {
+        // A failed final upload/MediaRecorder stop must not retain page mixer resources.  The
+        // original failure is rethrown after every source, interval, AudioContext and reference
+        // owned by this tap has been released.
+        chunker = null;
+        mixer?.stop();
+        mixer = null;
+      }
+      if (failure) throw failure;
+    },
+    releaseCounts() {
+      const counts = mixer?.resourceCounts();
+      return {
+        mixers: mixer ? 1 : 0,
+        contexts: counts?.contexts ?? 0,
+        sources: counts?.sources ?? 0,
+        listeners: counts?.listeners ?? 0,
+        intervals: counts?.intervals ?? 0,
+        retainedReferences: counts?.retainedReferences ?? 0,
+      };
     },
   };
 }

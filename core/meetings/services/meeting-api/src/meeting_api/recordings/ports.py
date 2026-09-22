@@ -89,8 +89,12 @@ class RecordingRepo(Protocol):
         """Atomically mutate the complete meeting JSONB payload under the row lock."""
         ...
 
-    async def attributed_manifest_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
-        """Owner-scoped attributed manifest; None deliberately conflates absent and unauthorized."""
+    async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
+        """Owner-scoped attributed manifest plus its deletion tombstone, if any.
+
+        Public retrieval must fail closed while cleanup owns the artifact, whereas the internal
+        deletion path still needs the retained manifest and deterministic object keys.
+        """
         ...
 
     async def owner_of(self, meeting_id: int) -> Optional[int]:

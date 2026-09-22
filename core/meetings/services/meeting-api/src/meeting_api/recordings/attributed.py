@@ -167,6 +167,11 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
             raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming.get("idempotency_key")), None)
+        # A completed PUT owns its deterministic key even after close.  A duplicate HTTP request
+        # is acknowledgement-only: touching storage here could overwrite or compensating-delete
+        # the object named by the durable uploaded row.
+        if found and _same_range(found, incoming) and found.get("state") == "uploaded":
+            return data_json, dict(found)
         if manifest.get("state") != "open" or not found or not _same_range(found, incoming):
             raise AttributedConflict("attributed range was not durably reserved")
         if found.get("state") == "failed":
@@ -219,6 +224,7 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
             # cleanup evidence. A repeat of the public completed-meeting deletion discovers it
             # before terminalizing the same tombstone again.
             def retain_cleanup_evidence(data_json):
+                deletion = data_json.get("artifact_deletion") or {}
                 manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
                 found = next((r for r in manifest["ranges"]
                               if r.get("idempotency_key") == incoming["idempotency_key"]), None)
@@ -231,6 +237,20 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
                 manifest["state"] = "closed"
                 next_data = dict(data_json)
                 next_data["attributed_audio_manifest"] = manifest
+                # A legacy recording delete has already removed its public row by the time this
+                # late acknowledgement discovers a failed compensating delete. Restore only its
+                # tombstoned retry handle; the next same-id delete re-snapshots and removes this
+                # deterministic object rather than leaving cleanup evidence unreachable.
+                legacy = deletion.get("legacy_recording") if isinstance(deletion, dict) else None
+                if deletion.get("state") == "completed" and isinstance(legacy, dict):
+                    rows = list(next_data.get("recordings") or [])
+                    if not any(row.get("id") == legacy.get("id") for row in rows):
+                        rows.append({**legacy, "deletion_pending": True})
+                    next_data["recordings"] = rows
+                    retrying = dict(deletion)
+                    retrying["state"] = "pending"
+                    retrying.pop("completed_at", None)
+                    next_data["artifact_deletion"] = retrying
                 return next_data, None
 
             await repo.mutate_meeting_data(meeting_id, retain_cleanup_evidence)
@@ -308,13 +328,19 @@ def public_manifest(manifest: dict) -> dict:
 
 
 async def attributed_manifest_for_owner(repo, *, user_id: int, meeting_id: int) -> dict:
-    manifest = await repo.attributed_manifest_for_owner(user_id, meeting_id)
+    artifact = await repo.attributed_artifacts_for_owner(user_id, meeting_id)
+    if artifact and (artifact.get("artifact_deletion") or {}).get("state") in ("pending", "completed"):
+        raise SessionNotFound("attributed audio manifest not found")
+    manifest = artifact.get("manifest") if artifact else None
     if not manifest: raise SessionNotFound("attributed audio manifest not found")
     return public_manifest(manifest)
 
 
 async def attributed_range_for_owner(repo, storage, *, user_id: int, meeting_id: int, sequence: int) -> bytes:
-    manifest = await repo.attributed_manifest_for_owner(user_id, meeting_id)
+    artifact = await repo.attributed_artifacts_for_owner(user_id, meeting_id)
+    if artifact and (artifact.get("artifact_deletion") or {}).get("state") in ("pending", "completed"):
+        raise SessionNotFound("attributed audio range not found")
+    manifest = artifact.get("manifest") if artifact else None
     if not manifest or manifest.get("state") != "closed": raise SessionNotFound("attributed audio range not found")
     value = next((r for r in manifest.get("ranges", []) if r.get("sequence") == sequence and r.get("state") == "uploaded"), None)
     path = value.get("storage_path") if isinstance(value, dict) else None

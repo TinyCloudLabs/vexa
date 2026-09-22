@@ -54,7 +54,9 @@ class FakeSourceNode {
 }
 let sourcesCreated = 0;
 class FakeAudioContext {
+  static instances: FakeAudioContext[] = [];
   state = 'running';
+  constructor() { FakeAudioContext.instances.push(this); }
   resume() { /* */ }
   close() { (this as any).state = 'closed'; }
   createMediaStreamDestination() { return { stream: new FakeMediaStream() }; }
@@ -143,6 +145,25 @@ async function main() {
   const before = connected.length;
   await sleep(RESCAN * 3);
   check(connected.length === before, 'stop: rescan halted (no attach after stop)');
+
+  // A failed final delivery must still release every page-side recording owner.  This drives the
+  // real createRecordingTap composition rather than stopping a mixer in isolation.
+  pageElements.length = 0;
+  pageElements.push(new FakeMediaElement(new FakeMediaStream()));
+  const failedTap = createRecordingTap({
+    rescanMs: RESCAN, timesliceMs: 1000, onChunk: (chunk) => !chunk.isFinal,
+  });
+  await failedTap.start();
+  await sleep(RESCAN * 2);
+  let stopRejected = false;
+  try { await failedTap.stop(); } catch { stopRejected = true; }
+  const failedCounts = failedTap.releaseCounts?.();
+  await sleep(RESCAN * 2);
+  check(stopRejected && !!failedCounts
+    && failedCounts.mixers === 0 && failedCounts.contexts === 0 && failedCounts.sources === 0
+    && failedCounts.listeners === 0 && failedCounts.intervals === 0 && failedCounts.retainedReferences === 0
+    && connected.length === 0,
+  'failed stop: finally releases mixer/context/sources/listeners/intervals/references');
 
   // Video-only Meet tiles must not create a new capture track on every rescan.
   pageElements.length = 0;

@@ -15,7 +15,7 @@ class MeetingNotTerminal(Exception):
     """The recording exists, but its meeting lifecycle may still produce more artifacts."""
 
 
-def _artifact_deletion(state: str, prior: Optional[dict] = None) -> dict:
+def _artifact_deletion(state: str, prior: Optional[dict] = None, *, cleanup_version: Optional[int] = None) -> dict:
     """The shared tombstone/fence shape used by every completed-artifact delete path."""
     value = {
         "state": state,
@@ -27,6 +27,7 @@ def _artifact_deletion(state: str, prior: Optional[dict] = None) -> dict:
         value["requested_at"] = (prior or {}).get("requested_at") or now
     else:
         value["completed_at"] = now
+    value["cleanup_version"] = cleanup_version if cleanup_version is not None else int((prior or {}).get("cleanup_version") or 0)
     return value
 
 
@@ -105,10 +106,21 @@ async def delete_owned_recording(
     def _prepare_artifact(data: dict):
         next_data = dict(data)
         prior = next_data.get("artifact_deletion")
-        next_data["artifact_deletion"] = _artifact_deletion("pending", prior if isinstance(prior, dict) else None)
-        return next_data, next_data.get("attributed_audio_manifest")
+        version = int((prior or {}).get("cleanup_version") or 0) + 1
+        next_data["artifact_deletion"] = _artifact_deletion(
+            "pending", prior if isinstance(prior, dict) else None, cleanup_version=version,
+        )
+        # The legacy route is addressed by recording id.  Keep that retry handle inside the
+        # tombstone until its snapshot is known complete, so a late rejected PUT can restore the
+        # cleanup owner even after the first pass removed the public recording row.
+        next_data["artifact_deletion"]["legacy_recording"] = dict(recording)
+        return next_data, {
+            "manifest": next_data.get("attributed_audio_manifest"),
+            "cleanup_version": version,
+        }
 
-    manifest = await repo.mutate_meeting_data(meeting_id, _prepare_artifact)
+    cleanup_plan = await repo.mutate_meeting_data(meeting_id, _prepare_artifact)
+    manifest = cleanup_plan["manifest"]
     deleted_keys = await delete_recording_objects(storage, recording)
     # Attributed PCM belongs to the same completed meeting artifact. Delete objects first so a
     # storage fault leaves its manifest available for retry rather than lying about cleanup.
@@ -119,12 +131,26 @@ async def delete_owned_recording(
     # intact for the same endpoint to retry.
     def _complete_artifact(data: dict):
         next_data = dict(data)
+        deletion = next_data.get("artifact_deletion") or {}
+        # Storage was deleted from the plan above.  If a rejected late PUT restored a deterministic
+        # key after that snapshot, retain both its ledger and this pending tombstone for retry.
+        # Otherwise an object can outlive every durable cleanup owner.
+        if (deletion.get("state") != "pending"
+                or deletion.get("cleanup_version") != cleanup_plan["cleanup_version"]
+                or next_data.get("attributed_audio_manifest") != cleanup_plan["manifest"]):
+            return next_data, False
         next_data["recordings"] = [r for r in next_data.get("recordings", []) if r.get("id") != recording_id]
         next_data.pop("attributed_audio_manifest", None)
-        next_data["artifact_deletion"] = _artifact_deletion("completed")
-        return next_data, None
+        completed_deletion = _artifact_deletion(
+            "completed", deletion, cleanup_version=cleanup_plan["cleanup_version"],
+        )
+        completed_deletion["legacy_recording"] = dict(recording)
+        next_data["artifact_deletion"] = completed_deletion
+        return next_data, True
 
-    await repo.mutate_meeting_data(meeting_id, _complete_artifact)
+    completed = await repo.mutate_meeting_data(meeting_id, _complete_artifact)
+    if not completed:
+        raise RuntimeError("recording artifact cleanup changed after its storage snapshot; retry required")
     return {
         "status": "deleted",
         "recording_id": recording_id,

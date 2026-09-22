@@ -109,6 +109,57 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_concurrent_close_and_late_identical_put_keeps_uploaded_object():
+    """A close racing a duplicate PUT must acknowledge the durable row, never delete its key."""
+    repo, storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "closed-duplicate",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
+            "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import (
+        close_attributed_manifest, reserve_attributed_range, upload_reserved_attributed_range,
+    )
+    reserved = await reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta)
+    first = await upload_reserved_attributed_range(repo, storage, token_meeting_id=MEETING_ID,
+                                                   session_uid=SESSION_UID, range_data=meta, data=pcm)
+    closed, duplicate = await asyncio.gather(
+        close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID),
+        upload_reserved_attributed_range(repo, storage, token_meeting_id=MEETING_ID,
+                                         session_uid=SESSION_UID, range_data=meta, data=pcm),
+    )
+    assert closed["state"] == "closed"
+    assert duplicate == first
+    assert storage.blobs[reserved["storage_path"]] == pcm
+    assert storage.deleted == [], "the late duplicate must not compensate-delete an uploaded row's key"
+
+
+@pytest.mark.parametrize("state", ["pending", "completed"])
+def test_owner_attributed_retrieval_is_fenced_by_artifact_tombstone(state):
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": f"tombstone-{state}",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000,
+            "channels": 1, "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    headers = {"authorization": f"Bearer {token}"}
+    assert client.post("/internal/attributed-audio/reserve", headers=headers,
+                       data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)}).status_code == 200
+    assert client.post("/internal/attributed-audio/upload", headers=headers,
+                       data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
+                       files={"file": ("range.pcm", pcm, "application/octet-stream")}).status_code == 200
+    assert client.post("/internal/attributed-audio/close", headers=headers,
+                       data={"session_uid": SESSION_UID}).status_code == 200
+    repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": state}
+    assert client.get(f"/meetings/{MEETING_ID}/attributed-audio", headers={"x-user-id": str(USER)}).status_code == 404
+    assert client.get(f"/meetings/{MEETING_ID}/attributed-audio/ranges/0", headers={"x-user-id": str(USER)}).status_code == 404
+
+
 def test_attributed_fences_late_upload_and_uses_sample_clock_with_jitter():
     repo, storage = _seeded()
     client = _client_for(repo, storage)
@@ -425,8 +476,8 @@ def test_late_ack_cleanup_failure_retains_ledger_until_legacy_delete_retries_it(
     assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
 
 
-async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_public_retry():
-    """Public deletes retain a late rejected PUT's ledger until their retry deletes its object."""
+async def test_legacy_delete_race_restores_late_put_cleanup_evidence_for_same_route_retry():
+    """The recording-id delete retains its own retry handle for a late rejected PUT."""
     from meeting_api import create_app
     from meeting_api.collector.fakes import InMemoryTranscriptStore
 
@@ -531,7 +582,6 @@ async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_publ
             data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)},
             files={"file": ("range.pcm", pcm, "application/octet-stream")},
         ))
-        deleting_meeting = None
         try:
             await asyncio.wait_for(storage.before_write.wait(), timeout=1)
             # Exact public legacy route: it completes before the delayed PUT writes any object.
@@ -540,11 +590,6 @@ async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_publ
             )).status_code == 200
             storage.release_write.set()
             await asyncio.wait_for(storage.before_compensation.wait(), timeout=1)
-            # Exact public completed-meeting route snapshots the now-empty plan and reaches finalization.
-            deleting_meeting = asyncio.create_task(client.delete(
-                f"/meetings/{MEETING_ID}", headers=owner_headers
-            ))
-            await asyncio.wait_for(repo.finalization_reached.wait(), timeout=1)
             storage.release_compensation.set()
             put_response = await asyncio.wait_for(put, timeout=1)
         finally:
@@ -552,26 +597,21 @@ async def test_completed_delete_race_restores_late_put_cleanup_evidence_for_publ
             storage.release_compensation.set()
             repo.release_finalization.set()
 
-        assert deleting_meeting is not None
-        meeting_response = await asyncio.wait_for(deleting_meeting, timeout=1)
-
         assert put_response.status_code == 409, put_response.text
-        assert meeting_response.status_code == 204, meeting_response.text
 
         retained = repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
         assert retained["state"] == "closed"
         assert retained["ranges"][0]["storage_path"] == key
         assert key in storage.blobs
-        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
+        assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "pending"
+        assert repo._meetings[MEETING_ID]["data"]["recordings"][0]["id"] == recording_id
 
-        # The public retry sees that durable evidence, removes the late object and ledger, and remains
-        # idempotent without allowing either to reappear.
-        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
+        # The same legacy front door can now find its restored durable cleanup handle and remove
+        # the late object; without the snapshot/version fence it had returned 404 here.
+        assert (await client.delete(f"/recordings/{recording_id}", headers=owner_headers)).status_code == 200
         assert key not in storage.blobs
         assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
         assert repo._meetings[MEETING_ID]["data"]["artifact_deletion"]["state"] == "completed"
-        assert (await client.delete(f"/meetings/{MEETING_ID}", headers=owner_headers)).status_code == 204
-        assert key not in storage.blobs
 
 
 def test_delete_recording_storage_failure_keeps_metadata_retryable():

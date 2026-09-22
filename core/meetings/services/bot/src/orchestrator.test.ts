@@ -715,6 +715,40 @@ async function main(): Promise<void> {
     check('#593: both subsystem faults surfaced loud (capture + engine)', faults.includes('capture-start') && faults.includes('engine-start'), faults.join(','));
   }
 
+  // An attributed recording is an artifact contract rather than an ordinary, degradable capture
+  // aid.  Its initialization fault must keep the admitted bot seated for cleanup, then retain a
+  // failed lifecycle/exit result instead of manufacturing a completed empty recording.
+  {
+    const lc = recordingSink();
+    const leaveReasons: string[] = [];
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async leave(reason) { leaveReasons.push(String(reason)); },
+      async withdraw() { /* */ },
+    };
+    const pipeline = createLivePipeline({
+      startCapture: async () => { throw new Error('attributed manifest reserve rejected'); },
+      startRecording: async () => async () => {},
+      engine: noopPipeline(),
+      captureFaultTerminal: true,
+      onFault: () => {},
+      retry: { attempts: 1, delayMs: 0 },
+    });
+    const o = createOrchestrator(inv({ transcribeEnabled: false, recordingEnabled: true, attributedAudioEnabled: true }), {
+      lifecycle: lc, join, pipeline, acts: noopActs((f) => { fireLeave = f; }), aloneness: noopAloneness(),
+    });
+    const running = o.run();
+    setTimeout(() => fireLeave({ action: 'leave' }), 10);
+    const result = await running;
+    check('attributed init failure: remains seated until a normal leave', !leaveReasons.includes('pipeline_start_failed'), leaveReasons.join(','));
+    check('attributed init failure: lifecycle and exit retain failure after cleanup',
+      result.status === 'failed' && result.exitCode === 1 && last(lc.events).status === 'failed'
+        && last(lc.events).failure_stage === 'active' && !seq(lc.events).includes('completed'),
+      JSON.stringify({ result, events: lc.events }));
+  }
+
   // ── #530 reachability gate: BOTH channels down → refuse to join, exit 3, typed terminal ──
   // The FIRST `joining` emit is load-bearing. A sink whose emitReachable reports `unreachable` +
   // a secondary probe that reports redis down ⇒ the bot must NOT navigate to the meeting; it

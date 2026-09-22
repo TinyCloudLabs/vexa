@@ -116,12 +116,17 @@ class InMemoryRecordingRepo:
             meeting["recordings"] = list(next_data["recordings"])
         return result
 
-    async def attributed_manifest_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
+    async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
         meeting = self._meetings.get(meeting_id)
         if not meeting or meeting.get("user_id") != user_id:
             return None
-        value = (meeting.get("data") or {}).get("attributed_audio_manifest")
-        return dict(value) if isinstance(value, dict) else None
+        data = meeting.get("data") or {}
+        value = data.get("attributed_audio_manifest")
+        return {
+            "manifest": dict(value) if isinstance(value, dict) else None,
+            "artifact_deletion": dict(data["artifact_deletion"])
+            if isinstance(data.get("artifact_deletion"), dict) else None,
+        }
 
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")

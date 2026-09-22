@@ -207,7 +207,7 @@ class SqlAlchemyRecordingRepo:
             await db.commit()
             return result
 
-    async def attributed_manifest_for_owner(self, user_id, meeting_id):
+    async def attributed_artifacts_for_owner(self, user_id, meeting_id):
         from sqlalchemy import select
         from ..sessions.models import Meeting
 
@@ -218,7 +218,11 @@ class SqlAlchemyRecordingRepo:
             if m is None or not isinstance(m.data, dict):
                 return None
             value = m.data.get("attributed_audio_manifest")
-            return dict(value) if isinstance(value, dict) else None
+            deletion = m.data.get("artifact_deletion")
+            return {
+                "manifest": dict(value) if isinstance(value, dict) else None,
+                "artifact_deletion": dict(deletion) if isinstance(deletion, dict) else None,
+            }
 
     async def owner_of(self, meeting_id):
         from sqlalchemy import select

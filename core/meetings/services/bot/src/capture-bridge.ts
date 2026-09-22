@@ -1369,7 +1369,10 @@ export async function startCaptureBridge(
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
       mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006) }).catch((e) => {
-    console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
+    console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`);
+    // The regular capture lane may degrade in place, but an enabled durable attributed producer
+    // cannot later close an empty-success manifest after its page initialization failed.
+    if (attributed) throw e;
   });
 
   // Captions are OFF by default now: the bot does not touch the meeting's UI to get a name source
@@ -1384,7 +1387,9 @@ export async function startCaptureBridge(
   return async () => {
     if (countersTimer) clearInterval(countersTimer);
     activity?.unavailable();
-    await page.evaluate(() => {
+    let pageFailure: unknown;
+    try {
+      await page.evaluate(() => {
       const w = (globalThis as any) as Record<string, any>;
       try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
@@ -1412,7 +1417,13 @@ export async function startCaptureBridge(
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
-    }).catch(() => { /* page already gone */ });
+      });
+    } catch (error) {
+      pageFailure = error;
+    }
+    // A page that did not tear down has an unknown final capture boundary.  Do not manufacture a
+    // closed empty manifest; the retained active-phase fault makes the terminal lifecycle fail.
+    if (pageFailure && attributed) throw pageFailure;
     // Seal the last voiced turn, drain all admitted requests, then close the durable manifest.
     // A rejected close is intentionally surfaced to the pipeline teardown instead of fabricating
     // a closed manifest that omits an admitted range.

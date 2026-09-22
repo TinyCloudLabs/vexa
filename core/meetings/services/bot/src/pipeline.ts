@@ -561,6 +561,9 @@ export interface LivePipelineDeps {
   onFault: (stage: LiveStage, e: unknown) => void;
   /** Bounded retry for engine start (the pyannote model load). Default 3 attempts, 2s apart. */
   retry?: { attempts: number; delayMs: number };
+  /** An enabled attributed producer makes capture initialization/close part of the artifact
+   * contract. Its fault is recoverable while active, but terminal success is forbidden. */
+  captureFaultTerminal?: boolean;
 }
 
 /**
@@ -588,6 +591,14 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   let stopRecording: (() => Promise<void>) | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  // Active-phase capture faults are recoverable while the bot is seated, but they are not a
+  // successful artifact outcome.  Keep the first cause through every cleanup step and make the
+  // orchestrator's terminal lifecycle/exit truthful after teardown completes.
+  let terminalFault: unknown = null;
+  const captureFault = (stage: LiveStage, error: unknown): void => {
+    if (deps.captureFaultTerminal && terminalFault === null) terminalFault = error;
+    onFault(stage, error);
+  };
 
   // Engine start with bounded background retry: the FIRST attempt is awaited by start() (so start()
   // resolves promptly — the bot is already seated); later attempts fire on a timer without ever
@@ -616,7 +627,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
         if (stopped) await stop().catch(() => { /* stop won while capture was attaching */ });
         else stopCapture = stop;
       }
-      catch (e) { if (!stopped) onFault('capture-start', e); }
+      catch (e) { if (!stopped) captureFault('capture-start', e); }
       if (stopped) return;
       // recording-start — best-effort.
       if (startRecording) {
@@ -636,19 +647,20 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       const sc = stopCapture; stopCapture = null;
-      if (sc) await sc().catch((e) => { onFault('capture-stop', e); });
+      if (sc) await sc().catch((e) => { captureFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;
       let recordingFailure: unknown;
       if (sr) {
         try { await sr(); }
         catch (error) {
           recordingFailure = error;
-          onFault('recording-start', error);
+          captureFault('recording-start', error);
         }
       }
       await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
       // An incomplete MediaRecorder delivery is not a degraded successful meeting. The
       // orchestrator converts this to a failed terminal lifecycle event after all cleanup.
+      if (terminalFault !== null) throw terminalFault;
       if (recordingFailure) throw recordingFailure;
     },
   };
