@@ -1,1 +1,1 @@
-- **Keep Google Meet attributed-audio evidence bounded and durable (TinyCloudLabs/vexa#8).** Capture ranges now preserve long meeting history, report bounded incomplete outcomes under stalled uploads, and erase attributed objects with either completed-meeting deletion route.
+- **Keep Google Meet attributed-audio evidence bounded and durable (TinyCloudLabs/vexa#8).** Capture ranges now preserve long meeting history, fence deletion races, report page-boundary and stalled-upload incompleteness, and require a producer-version acknowledgement before attributed capture is trusted.

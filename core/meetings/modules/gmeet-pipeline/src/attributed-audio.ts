@@ -51,8 +51,11 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     const index = manifest.ranges.findIndex(value => value.idempotency_key === range.idempotency_key);
     if (index >= 0) manifest.ranges[index] = clone(range); else manifest.ranges.push(clone(range));
   };
-  const immutable = (input: SealInput, byteCount: number, sha256: string, audioDurationMs: number): ImmutableRange => ({
-    ...input, version: 1, meeting_id: meetingId, sequence: nextSequence++,
+  // Constructing a retry must not allocate an identity.  In particular, callers commonly retry
+  // while the first reserve is in flight; consuming a sequence for that comparison creates a
+  // fictional gap in the durable ledger.
+  const immutable = (input: SealInput, byteCount: number, sha256: string, audioDurationMs: number, sequence: number): ImmutableRange => ({
+    ...input, version: 1, meeting_id: meetingId, sequence,
     idempotency_key: input.idempotency_key ?? `${meetingId}:${input.speaker_key}:${input.turn_generation}:${input.start_ms}:${input.end_ms}`,
     clock_origin_ms: manifest.clock_origin_ms, byte_count: byteCount, sha256, audio_duration_ms: audioDurationMs,
   });
@@ -98,19 +101,20 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     if (!Number.isFinite(audioDurationMs) || audioDurationMs < 0) throw new Error('invalid attributed-audio duration');
     const sha256 = pcm ? digest(pcm) : (input.sha256 ?? '0'.repeat(64));
     const key = input.idempotency_key ?? `${meetingId}:${input.speaker_key}:${input.turn_generation}:${input.start_ms}:${input.end_ms}`;
-    const proposed = immutable(input, byteCount, sha256, audioDurationMs);
     const duplicate = tasks.get(key);
     if (duplicate) {
+      const proposed = immutable(input, byteCount, sha256, audioDurationMs, duplicate.range.sequence);
       if (!sameImmutable(duplicate.range, proposed)) throw new Error('attributed-audio idempotency key conflicts with pending payload');
       return duplicate.task;
     }
     const prior = manifest.ranges.find(value => value.idempotency_key === key);
     if (prior) {
+      const proposed = immutable(input, byteCount, sha256, audioDurationMs, prior.sequence);
       if (!sameImmutable(prior as ImmutableRange, proposed)) throw new Error('attributed-audio idempotency key conflicts with durable ledger');
       return Promise.resolve(clone(prior));
     }
     if (pcm) { if (bufferedBytes + byteCount > budgetBytes) throw new Error('attributed-audio PCM budget exceeded before durable handoff'); bufferedBytes += byteCount; }
-    const range = proposed;
+    const range = immutable(input, byteCount, sha256, audioDurationMs, nextSequence++);
     manifest.ranges.push({ ...range, state: 'sealed' });
     return run(range, pcm);
   };
@@ -210,6 +214,19 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
   };
   return {
     feed, ready,
+    /** A page-side admission fence stopped capture before its PCM crossed into Node.  Record the
+     * loss as a durable failed range rather than pretending that a complete manifest exists. */
+    incomplete(frame: Omit<AttributedAudioFrame, 'pcm'>): Promise<AttributedAudioRange> {
+      const start = relative(frame.capture_ms);
+      const turn = (generation.get(frame.channel) ?? 0) + 1; generation.set(frame.channel, turn);
+      return sink.fail({
+        idempotency_key: `${meetingId}:page-boundary:${frame.channel}:${turn}:${start}`,
+        speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name,
+        channel: frame.channel, turn_generation: turn, attribution: frame.attribution,
+        start_ms: start, end_ms: start, audio_duration_ms: 0, codec: 'pcm_f32le',
+        sample_rate: frame.sample_rate, channels: 1, byte_count: 0, sha256: '0'.repeat(64),
+      });
+    },
     async stop(): Promise<AttributedAudioManifest> { stopping = true; for (const channel of [...active.keys()]) flush(channel); for (const channel of [...missing.keys()]) flushMissing(channel); await sink.ready; return sink.close(); },
     retainedBytes: () => sink.bufferedBytes() + activeBytes(), pendingTasks: () => sink.taskCount(), metadataCount: () => missing.size + active.size,
   };

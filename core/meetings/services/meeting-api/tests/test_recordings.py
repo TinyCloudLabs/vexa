@@ -135,6 +135,58 @@ def test_attributed_fences_late_upload_and_uses_sample_clock_with_jitter():
     assert post("/internal/attributed-audio/reserve", gap).status_code == 409
 
 
+def test_attributed_deletion_fences_reservation_upload_and_empty_close_clock():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    headers = {"authorization": f"Bearer {token}"}
+    # A silent close is still schema-valid: numeric 0 explicitly means no capture was admitted.
+    empty = client.post("/internal/attributed-audio/close", headers=headers, data={"session_uid": SESSION_UID})
+    assert empty.status_code == 200 and empty.json()["clock_origin_ms"] == 0
+    import jsonschema
+    schema_path = __file__.split("/core/meetings/")[0] + "/core/meetings/contracts/attributed-audio.v1/attributed-audio.schema.json"
+    jsonschema.Draft202012Validator(json.load(open(schema_path))).validate(empty.json())
+
+    # A deletion tombstone is a write fence, including a missing manifest (which must not be
+    # recreated by a delayed bot/restart request).
+    repo, storage = _seeded(); client = _client_for(repo, storage)
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "fenced",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+    response = client.post("/internal/attributed-audio/reserve", headers=headers,
+                           data={"session_uid": SESSION_UID, "range_metadata": json.dumps(meta)})
+    assert response.status_code == 409
+    assert "attributed_audio_manifest" not in repo._meetings[MEETING_ID]["data"]
+
+
+def test_attributed_reservation_persists_key_and_late_ack_deletes_object():
+    repo, storage = _seeded()
+    pcm = b"\0\0\0\0"
+    meta = {"version": 1, "meeting_id": str(MEETING_ID), "sequence": 0, "idempotency_key": "late-ack",
+            "speaker_key": "channel:0", "speaker_name": "", "channel": 0, "turn_generation": 1,
+            "attribution": {"source": "unresolved", "confidence": 0}, "clock_origin_ms": 1,
+            "start_ms": 0, "end_ms": 1, "audio_duration_ms": 1, "codec": "pcm_f32le", "sample_rate": 1000, "channels": 1,
+            "byte_count": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
+    from meeting_api.recordings.attributed import reserve_attributed_range, upload_reserved_attributed_range, AttributedConflict
+    reserved = asyncio.run(reserve_attributed_range(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta))
+    assert reserved["storage_path"].startswith(f"attributed-audio/{USER}/{MEETING_ID}/")
+
+    class DeleteDuringUpload(InMemoryStorage):
+        async def upload(self, key, data, content_type=None):
+            await super().upload(key, data, content_type=content_type)
+            repo._meetings[MEETING_ID].setdefault("data", {})["artifact_deletion"] = {"state": "pending"}
+
+    racing = DeleteDuringUpload()
+    with pytest.raises(AttributedConflict):
+        asyncio.run(upload_reserved_attributed_range(repo, racing, token_meeting_id=MEETING_ID,
+                    session_uid=SESSION_UID, range_data=meta, data=pcm))
+    assert racing.blobs == {}, "an upload whose acknowledgement loses to deletion cannot orphan PCM"
+
+
 def test_delete_recording_is_owner_scoped_storage_first_and_removes_metadata():
     repo, storage = _seeded()
     repo._meetings[MEETING_ID]["status"] = "completed"

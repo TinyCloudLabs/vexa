@@ -6,8 +6,8 @@
   "required": ["version", "meeting_id", "clock_origin", "clock_origin_ms", "state", "ranges"],
   "properties": {
     "version": {"const": 1}, "meeting_id": {"type": "string"},
-    "clock_origin": {"const": "first_admitted_capture_epoch_ms"},
-    "clock_origin_ms": {"type": "number", "minimum": 0},
+    "clock_origin": {"const": "first_admitted_capture_epoch_ms", "description": "Epoch of the first admitted capture; a closed manifest with no admitted capture uses numeric 0."},
+    "clock_origin_ms": {"type": "number", "minimum": 0, "description": "0 is the deterministic no-capture origin for a silent closed manifest."},
     "state": {"enum": ["open", "closed"]}, "ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}}
   },
   "$defs": {"range": {"type": "object", "additionalProperties": false,

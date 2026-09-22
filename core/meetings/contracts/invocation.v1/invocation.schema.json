@@ -43,6 +43,7 @@
         "captureSignalEnabled": { "type": "boolean", "description": "tee the raw captured-signal.v1 stream (audio frames + speaker events) to durable storage for offline replay (O-TEL-1); the transcript/recording paths are unaffected either way" },
         "attributedAudioEnabled": { "type": "boolean", "description": "enable canonical Google Meet capture-bound attributed PCM independently of STT" },
         "attributedAudioUploadUrl": { "type": "string", "format": "uri", "description": "internal canonical attributed PCM sink" },
+        "attributedAudioRequiredVersion": { "type": "integer", "minimum": 1, "description": "producer contract version the bot must acknowledge in lifecycle status before PTX relies on attributed capture" },
         "captureModes": { "type": "array", "items": { "type": "string" } },
         "recordingUploadUrl": { "type": "string", "format": "uri", "description": "recording sink" },
         "automaticLeave": { "$ref": "#/$defs/AutomaticLeave" },

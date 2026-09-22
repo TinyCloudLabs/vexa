@@ -28,7 +28,10 @@ def _manifest(meeting_id: int, prior: Optional[dict] = None) -> dict:
     value.setdefault("version", 1)
     value.setdefault("meeting_id", str(meeting_id))
     value.setdefault("clock_origin", "first_admitted_capture_epoch_ms")
-    value.setdefault("clock_origin_ms", None)
+    # A closed silent meeting has no first captured frame.  Version 1 represents that explicit
+    # no-capture origin as numeric zero, never JSON null (which violates the published schema).
+    if value.get("clock_origin_ms") is None:
+        value["clock_origin_ms"] = 0
     value.setdefault("state", "open")
     value.setdefault("ranges", [])
     return value
@@ -114,8 +117,15 @@ async def reserve_attributed_range(repo, *, token_meeting_id: Optional[int], ses
     incoming["meeting_id"] = str(meeting_id)
     incoming["state"] = "sealed"
     incoming.pop("path", None); incoming.pop("storage_path", None)
+    owner = await repo.owner_of(meeting_id)
+    # This candidate key is durable before bytes leave the bot.  A crash after the object PUT and
+    # before its acknowledgement is therefore still visible to deletion/reconciliation.
+    object_key = f"attributed-audio/{owner or 0}/{meeting_id}/{session_uid}/{incoming['sequence']:06d}-{incoming['sha256']}.pcm"
 
     def reserve(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         if manifest["state"] != "open":
             old = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming["idempotency_key"]), None)
@@ -127,10 +137,14 @@ async def reserve_attributed_range(repo, *, token_meeting_id: Optional[int], ses
             return data_json, (dict(old), False)
         if any(r.get("sequence") == incoming["sequence"] for r in manifest["ranges"]):
             raise AttributedConflict("attributed sequence is already reserved")
-        if manifest["clock_origin_ms"] is None: manifest["clock_origin_ms"] = incoming["clock_origin_ms"]
+        # Numeric zero is the closed-empty sentinel.  An open manifest with no ranges has not
+        # admitted its first frame yet, so its first reservation replaces that sentinel.
+        if not manifest["ranges"] and manifest["clock_origin_ms"] == 0:
+            manifest["clock_origin_ms"] = incoming["clock_origin_ms"]
         if manifest["clock_origin_ms"] != incoming["clock_origin_ms"]:
             raise AttributedConflict("attributed clock origin conflicts with manifest")
         incoming["path"] = f"/meetings/{meeting_id}/attributed-audio/ranges/{incoming['sequence']}"
+        incoming["storage_path"] = object_key
         manifest["ranges"].append(incoming)
         next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
         return next_data, (dict(incoming), True)
@@ -148,6 +162,9 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
     incoming = dict(range_data); incoming.pop("state", None); incoming.pop("path", None); incoming.pop("storage_path", None)
 
     def find_reserved(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming.get("idempotency_key")), None)
         if manifest.get("state") != "open" or not found or not _same_range(found, incoming):
@@ -157,12 +174,16 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         return data_json, dict(found)
     reserved = (await repo.mutate_meeting_data(meeting_id, find_reserved))
     if reserved.get("state") == "uploaded": return reserved
-    owner = await repo.owner_of(meeting_id)
-    key = f"attributed-audio/{owner or 0}/{meeting_id}/{session_uid}/{incoming['sequence']:06d}-{incoming['sha256']}.pcm"
+    key = reserved.get("storage_path")
+    if not isinstance(key, str):
+        raise AttributedConflict("attributed reservation omitted deterministic object key")
     try:
         await storage.upload(key, data, content_type="application/octet-stream")
     except Exception:
         def fail(data_json):
+            deletion = data_json.get("artifact_deletion") or {}
+            if deletion.get("state") in ("pending", "completed"):
+                return data_json, None
             manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
             found = next(r for r in manifest["ranges"] if r.get("idempotency_key") == incoming["idempotency_key"])
             # A concurrent successful retry is final; a failed retry must not downgrade it.
@@ -173,6 +194,9 @@ async def upload_reserved_attributed_range(repo, storage, *, token_meeting_id: O
         raise
 
     def acknowledge(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         if manifest.get("state") != "open":
             raise AttributedConflict("attributed audio manifest is closed or deleted")
@@ -201,6 +225,9 @@ async def fail_reserved_attributed_range(repo, *, token_meeting_id: Optional[int
     _validate(range_data)
     incoming = dict(range_data); incoming.pop("state", None); incoming.pop("path", None); incoming.pop("storage_path", None)
     def fail(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         found = next((r for r in manifest["ranges"] if r.get("idempotency_key") == incoming.get("idempotency_key")), None)
         if not found or not _same_range(found, incoming):
@@ -216,6 +243,9 @@ async def fail_reserved_attributed_range(repo, *, token_meeting_id: Optional[int
 async def attributed_manifest_for_session(repo, *, token_meeting_id: Optional[int], session_uid: str) -> dict:
     meeting_id = await _session_meeting(repo, token_meeting_id=token_meeting_id, session_uid=session_uid)
     def read(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         return data_json, public_manifest(manifest)
     return await repo.mutate_meeting_data(meeting_id, read)
@@ -235,6 +265,9 @@ async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], se
     expected = set(expected_sequences or [])
     if any(not isinstance(value, int) or value < 0 for value in expected): raise AttributedConflict("invalid admitted sequence ledger")
     def close(data_json):
+        deletion = data_json.get("artifact_deletion") or {}
+        if deletion.get("state") in ("pending", "completed"):
+            raise AttributedConflict("attributed audio artifact deletion is in progress")
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         present = {r.get("sequence") for r in manifest["ranges"]}
         if not expected.issubset(present): raise AttributedConflict("server ledger omits client-admitted ranges")
