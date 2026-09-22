@@ -310,14 +310,29 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     const rememberTeardownFailure = (error: unknown): void => {
       if (!teardownFailure) teardownFailure = error instanceof Error ? error : new Error(String(error));
     };
+    let recordingInvalidated = false;
+    const invalidateRecording = (error: unknown): void => {
+      if (recordingInvalidated) return;
+      recordingInvalidated = true;
+      try {
+        // A failed or unbounded pipeline stop leaves the capture tail unknowable. Invalidate the
+        // producer-side sink BEFORE close() so close cannot turn a partial recording into a
+        // successful `is_final=true` marker.
+        deps.recording?.abort?.(error);
+      } catch (abortError) {
+        console.error(`[bot] recording: abort failed: ${String(abortError)}`);
+        rememberTeardownFailure(abortError);
+      }
+    };
     const stopPipeline = async (): Promise<void> => {
       const budgetMs = pipelineStopBudgetMs(signalBoundedTeardown, opts.pipelineStopMs);
       const signalBudgetMs = opts.signalPipelineStopMs ?? DEFAULT_PIPELINE_STOP_MS;
       let normalTimer: ReturnType<typeof setTimeout> | undefined;
       let signalTimer: ReturnType<typeof setTimeout> | undefined;
-      const operation = deps.pipeline.stop().then(() => true).catch((error) => {
+      const operation = Promise.resolve().then(() => deps.pipeline.stop()).then(() => true).catch((error) => {
         console.error(`[bot] pipeline: stop failed: ${String(error)}`);
         rememberTeardownFailure(error);
+        invalidateRecording(error);
         return true;
       });
       const deadlines: Array<Promise<boolean>> = [
@@ -336,6 +351,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
           const error = new Error(`pipeline stop deadline reached after ${budgetMs}ms`);
           console.error(`[bot] ${error.message}; continuing bounded teardown`);
           rememberTeardownFailure(error);
+          invalidateRecording(error);
         }
       } finally {
         if (normalTimer) clearTimeout(normalTimer);

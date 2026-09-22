@@ -28,10 +28,11 @@ import {
   type MeetingResult,
 } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
+import { createBotRecordingSink } from './recording.js';
 import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
 import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
-import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
+import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, Pipeline, TranscriptSink, PrimaryReachability } from './ports.js';
 import type { Invocation } from './config.js';
 import { noopAloneness, controlledAloneness, noopPipeline, noopActs } from './test-doubles.js';
 
@@ -381,6 +382,34 @@ async function main(): Promise<void> {
     check('recording-drain: incomplete teardown is bounded and emits failed',
       res.status === 'failed' && Date.now() - started < 500 && left === 1);
     check('browser teardown noise: detached observer preserves failed terminal', detached && last(lc.events).status === 'failed');
+  }
+
+  // A pipeline that cannot stop has an unknowable capture tail. Invalidate the real recording
+  // owner before bounded close so it retains neither queued bytes nor a fabricated final marker.
+  for (const stopKind of ['deadline', 'rejection'] as const) {
+    const lc = recordingSink();
+    const uploads: Array<{ seq: number; final: boolean; bytes: number }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), maxRetainedBytes: 16,
+      uploadChunk: async (seq, final, _format, bytes) => { uploads.push({ seq, final, bytes: bytes.byteLength }); },
+    });
+    await sink.chunk('google_meet/teardown', 0, false, 'webm', new Uint8Array(8));
+    const pipeline: Pipeline = {
+      async start() {},
+      async stop() {
+        if (stopKind === 'deadline') return new Promise<void>(() => {});
+        throw new Error('capture shutdown rejected');
+      },
+    };
+    const result = await createOrchestrator(inv(), {
+      lifecycle: lc, join: mockJoin('admitted'), pipeline, acts: noopActs(), aloneness: noopAloneness(), recording: sink,
+    }).run({ maxActiveMs: 2, pipelineStopMs: 5, recordingDrainMs: 5 });
+    check(`recording invalidation (${stopKind}): bounded teardown emits failed`,
+      result.status === 'failed' && last(lc.events).status === 'failed');
+    check(`recording invalidation (${stopKind}): admitted seq0 stays non-final with no synthetic final`,
+      JSON.stringify(uploads) === JSON.stringify([{ seq: 0, final: false, bytes: 8 }]), JSON.stringify(uploads));
+    check(`recording invalidation (${stopKind}): sink releases all retained bytes`,
+      sink.resourceCounts().retainedBytes === 0 && sink.resourceCounts().failed, JSON.stringify(sink.resourceCounts()));
   }
 
   // An ordinary Stop may already be inside its long transcript drain when Docker sends SIGTERM.

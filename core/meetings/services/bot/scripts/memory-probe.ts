@@ -16,6 +16,7 @@ import { getJoinBrowserArgs, joinMeeting, leaveGoogleMeet } from "@vexa/join";
 import { startCaptureBridge, startRecording } from "../src/capture-bridge.js";
 import { createResourceMonitor } from "../src/resources.js";
 import { createBotRecordingSink } from "../src/recording.js";
+import { createBotPipeline, type BotPipeline } from "../src/pipeline.js";
 // Defaults to a synthetic fixture. An explicitly supplied room tests real Meet
 // capture/recording, with local sinks; it is not a deployed end-to-end bot test.
 const liveMeetUrl = process.env.VEXA_TEST_MEET_URL;
@@ -37,6 +38,11 @@ const seconds = Number(
 assert(
   Number.isSafeInteger(seconds) && seconds >= 15 && seconds <= 10_800,
   "duration must be 15–10800 seconds",
+);
+const sttProbeEnabled = process.env.VEXA_TEST_MEMORY_STT === "1";
+assert(
+  seconds !== 10_800 || sttProbeEnabled,
+  "10800-second probe requires VEXA_TEST_MEMORY_STT=1 and an available PCM measurement",
 );
 const videoCount = Number(
   process.argv[4] ?? process.env.VEXA_TEST_MEMORY_VIDEOS ?? 0,
@@ -72,10 +78,20 @@ let finalSeen = false;
 let partsAfterFinal = 0;
 const resources = createResourceMonitor();
 let recordingSink: ReturnType<typeof createBotRecordingSink> | undefined;
-// The probe deliberately injects a recording-only pipeline. Keep its accounting as a resource
-// source, rather than spelling a fictional STT number into measurements.
-const liveSttResources = { retainedBytes: 0 };
-const liveSttRetainedBytes = (): number => liveSttResources.retainedBytes;
+let sttPipeline: BotPipeline | undefined;
+let sawRetainedSttPcm = false;
+
+type LiveSttMeasurement =
+  | { state: "disabled" }
+  | { state: "unavailable" }
+  | { state: "measured"; retainedBytes: number };
+
+const readLiveSttMeasurement = (): LiveSttMeasurement => {
+  if (!sttProbeEnabled) return { state: "disabled" };
+  const owner = sttPipeline?.resourceCounts;
+  if (!owner) return { state: "unavailable" };
+  return { state: "measured", retainedBytes: owner().retainedPcmBytes };
+};
 try {
   const launched = await launchPersistentBrowser({
     dataDir: profile,
@@ -251,8 +267,33 @@ try {
     nativeMeetingId: "fixture",
     botName: liveMeetUrl ? "TinyCloud RAM test" : "Vexa",
     redisUrl: "redis://localhost:6379",
-    transcribeEnabled: false,
+    transcribeEnabled: sttProbeEnabled,
   };
+  if (inv.transcribeEnabled) {
+    // This is the production GMeet pipeline and its actual PCM window owner. The fixture keeps
+    // STT local/deterministic, but never substitutes a probe-local counter for that owner.
+    sttPipeline = createBotPipeline(inv as any, {
+      async publish() {},
+      async finalize() {},
+    }, {
+      transcribe: async (pcm) => ({
+        text: '', language: 'en', duration: pcm.length / 16_000, segments: [],
+      }),
+    });
+    await sttPipeline.start();
+    sttPipeline.feedAudio(-1, 'Probe', new Float32Array(16_000).fill(0.1), Date.now());
+    const control = readLiveSttMeasurement();
+    assert.equal(control.state, 'measured', 'enabled STT exposes its production PCM owner');
+    assert(control.retainedBytes > 0, 'enabled STT positive control retains PCM before stop');
+    sawRetainedSttPcm = true;
+  }
+  if (seconds === 10_800) {
+    assert.equal(
+      readLiveSttMeasurement().state,
+      'measured',
+      '10800-second probe requires VEXA_TEST_MEMORY_STT=1 and an available PCM measurement',
+    );
+  }
   // Count captureStream fallbacks without retaining their tracks. In particular,
   // a video-only tile must not acquire new live capture tracks on every rescan.
   await page.evaluate(() => {
@@ -285,11 +326,12 @@ try {
       {
         async start() {},
         async stop() {},
-        feedAudio(channel: number) {
+        feedAudio(channel: number, glowName: string | undefined, pcm: Float32Array, tsMs: number) {
           frames++;
           framesByChannel.set(channel, (framesByChannel.get(channel) ?? 0) + 1);
+          sttPipeline?.feedAudio(channel, glowName, pcm, tsMs);
         },
-        feedMixedAudio() {},
+        feedMixedAudio(pcm: Float32Array, tsMs: number) { sttPipeline?.feedMixedAudio(pcm, tsMs); },
         recordHint() {},
       } as any,
     );
@@ -461,7 +503,7 @@ try {
       captureResources,
       recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
       recordingQueuedChunks: recordingSink?.resourceCounts().queuedChunks ?? 0,
-      liveSttRetainedBytes: liveSttRetainedBytes(),
+      liveStt: readLiveSttMeasurement(),
       captureStreams,
       heapUsage,
       ...heap,
@@ -480,16 +522,20 @@ try {
   stopRecording = null;
   await stopCapture?.();
   stopCapture = null;
+  await sttPipeline?.stop();
   await page.evaluate(() => clearInterval((window as any).fixture?.churnTimer)).catch(() => {});
   const postStop = {
     capture: await page.evaluate(
       () => (window as any).__vexaGmeetCapture?.resourceCounts?.() ?? { contexts: 0, sources: 0, worklets: 0, tracks: 0 },
     ).catch(() => ({ contexts: -1, sources: -1, worklets: -1, tracks: -1 })),
     recordingRetainedBytes: recordingSink?.resourceCounts().retainedBytes ?? 0,
-    liveSttRetainedBytes: liveSttRetainedBytes(),
+    liveStt: readLiveSttMeasurement(),
   };
   assert.equal(postStop.recordingRetainedBytes, 0, 'recording delivery releases retained bytes after stop');
-  assert.equal(postStop.liveSttRetainedBytes, 0, 'injected live-STT resource source releases bytes after stop');
+  if (postStop.liveStt.state === 'measured') {
+    assert(sawRetainedSttPcm, 'enabled STT positive control observed retained PCM before stop');
+    assert.equal(postStop.liveStt.retainedBytes, 0, 'production live-STT PCM owner releases bytes after stop');
+  }
   assert.deepEqual(postStop.capture, { contexts: 0, sources: 0, worklets: 0, tracks: 0 }, 'capture contexts, sources, worklets and tracks are released after stop');
   if (mode !== "recording" && mode !== "idle") {
     if (liveMeetUrl) {
@@ -526,7 +572,9 @@ try {
     parts: seqs.length,
     finalSeen,
     postStop,
-    verdict: postStop.recordingRetainedBytes === 0 && postStop.liveSttRetainedBytes === 0 ? 'pass' : 'fail',
+    verdict: postStop.recordingRetainedBytes === 0
+      && (postStop.liveStt.state !== 'measured' || (sawRetainedSttPcm && postStop.liveStt.retainedBytes === 0))
+      ? 'pass' : 'fail',
   });
   if (liveMeetUrl)
     await leaveGoogleMeet(page, undefined, "controlled_test_complete");
@@ -534,6 +582,7 @@ try {
   resources.stop();
   await stopRecording?.().catch(() => {});
   await stopCapture?.().catch(() => {});
+  await sttPipeline?.stop().catch(() => {});
   await context?.close().catch(() => {});
   await new Promise<void>((r) => server.close(() => r()));
   rmSync(profile, { recursive: true, force: true });
