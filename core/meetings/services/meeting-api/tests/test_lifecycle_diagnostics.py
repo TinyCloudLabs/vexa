@@ -234,6 +234,34 @@ def test_terminal_diagnostics_redact_and_bound_adversarial_payloads():
     assert marker not in repr(hook_data)
 
 
+def test_terminal_diagnostics_omit_nested_credential_keys_before_persistence():
+    """Innocuous values prove this is a key policy, not a value-regex accident."""
+    client, _app, deliveries = _client()
+    final = _drive(
+        client, JOINING, ACTIVE,
+        {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
+         "reason": "capture initialization failed",
+         "bot_resources": {
+             "api_key": "alpha", "access_token": "bravo", "token": "charlie",
+             "authorization": "delta", "secret_hash": "echo", "db_password": "foxtrot",
+             "nested": {
+                 "auth_userdata_path": "session-ref",
+                 "attributed_audio_manifest": {"ranges": [{"storage_path": "object-ref"}]},
+                 "phase": "capture", "attempt": 2,
+             },
+         }},
+    )[-1]
+    persisted = final["data"]["bot_resources"]
+    for carrier in (persisted, deliveries[-1]["data"]["meeting"]["data"]):
+        rendered = repr(carrier)
+        for forbidden in ("api_key", "access_token", "token", "authorization", "secret_hash",
+                          "db_password", "auth_userdata_path", "attributed_audio_manifest",
+                          "storage_path", "alpha", "bravo", "charlie", "delta", "echo",
+                          "foxtrot", "session-ref", "object-ref"):
+            assert forbidden not in rendered
+    assert persisted["nested"] == {"phase": "capture", "attempt": 2}
+
+
 # ── the DEGRADED meeting: completed, but with no transcript and a reason why ────────────────────
 # A backend that refuses every chunk used to produce a meeting indistinguishable from a silent
 # room: the bot's faults were typed and attributed all the way to its composition root and then

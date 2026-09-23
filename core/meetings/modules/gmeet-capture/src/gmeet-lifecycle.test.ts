@@ -66,7 +66,7 @@ const unsafe = el(new Stream('unsafe', new Track('unsafe-track')));
 elements.push(unsafe); present.add(unsafe);
 const logs: string[] = [];
 const failingCapture = createGmeetCapture({ onAudio() {}, log: (line) => logs.push(line), rescanMs: 1, findRetries: 1 });
-await failingCapture.start(); await wait();
+await assert.rejects(failingCapture.start(), /worklet initialization failed/);
 assert(logs.some((line) => line === 'worklet init failed code=worklet_init_failed'));
 assert(!logs.join('\n').includes('private.example') && !logs.join('\n').includes('Bearer secret'));
 assert.deepEqual(failingCapture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0, references: 0 });

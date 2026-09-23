@@ -115,7 +115,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
     return context;
   }
 
-  function connectElement(el: HTMLMediaElement, index: number): boolean {
+  async function connectElement(el: HTMLMediaElement, index: number): Promise<boolean> {
     try {
       const stream: MediaStream = (el as any).srcObject;
       if (!stream || stream.getAudioTracks().length === 0) return false;
@@ -136,7 +136,9 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       const source = ctx.createMediaStreamSource(stream);
       // AudioWorklet (audio-thread) instead of the deprecated ScriptProcessor,
       // which duplicates/drops buffers under main-thread load — the captured-audio
-      // stutter. connectElement is sync, so wire the node when addModule resolves.
+      // stutter.  Crucially, initial capture does not report ready until this resolves:
+      // an enabled attributed recorder must not later close an empty-success manifest
+      // when Chromium rejected the worklet module.
       let seen = 0, emitted = 0; // L4 frame-flow diagnostic
       const connection: Connection = {
         stream, track, elements: new Map([[el, stream]]), source, node: null,
@@ -145,32 +147,35 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       connections.set(track.id, connection);
       bindings.set(el, { stream, connection });
       track.addEventListener('ended', connection.onEnded);
-      createPcmCaptureNode(ctx, (data) => {
+      let node: AudioWorkletNode;
+      try {
+        node = await createPcmCaptureNode(ctx, (data) => {
         if (!running || connections.get(track.id) !== connection) return;
         seen++;
         let maxVal = 0;
         for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxVal) maxVal = a; }
         if (maxVal > SILENCE) { emitted++; if (emitted === 1 || emitted % 100 === 0) log(`stream ${index} AUDIO seen=${seen} emitted=${emitted} max=${maxVal.toFixed(3)}`); opts.onAudio(index, data); } // worklet already yields a fresh copy
         else if (seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${maxVal.toFixed(4)} ctx=${ctx.state}`);
-      }).then((node) => {
-        // stop/replacement can happen while addModule() is pending. Never attach a late node.
-        if (!running || connections.get(track.id) !== connection) {
-          try { node.port.close(); node.disconnect(); } catch { /* */ }
-          return;
-        }
-        connection.node = node;
-        source.connect(node);
-        node.connect(ctx.destination);
-      }).catch(() => {
+        });
+      } catch {
         release(connection, 'worklet init failed');
         log('worklet init failed code=worklet_init_failed');
-      });
+        throw new Error('gmeet capture worklet initialization failed');
+      }
+      // stop/replacement can happen while addModule() is pending. Never attach a late node.
+      if (!running || connections.get(track.id) !== connection) {
+        try { node.port.close(); node.disconnect(); } catch { /* */ }
+        return false;
+      }
+      connection.node = node;
+      source.connect(node);
+      node.connect(ctx.destination);
 
       log(`stream ${index} connected (track ${track.id.substring(0, 8)})`);
       return true;
-    } catch {
+    } catch (error) {
       log(`stream ${index} error code=capture_connect_failed`);
-      return false;
+      throw error;
     }
   }
 
@@ -202,7 +207,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       if (!running) return;
 
       for (let i = 0; i < mediaElements.length; i++) {
-        if (connectElement(mediaElements[i], i)) nextIndex = i + 1;
+        if (await connectElement(mediaElements[i], i)) nextIndex = i + 1;
       }
       nextIndex = Math.max(nextIndex, mediaElements.length);
 
@@ -213,7 +218,13 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         // otherwise release A while the earlier element changes to B, before its later A mirror
         // is visited and attached. Only after that pre-registration may replacements release.
         retainLiveOwners(mediaElements);
-        for (const el of mediaElements) if (connectElement(el, nextIndex)) nextIndex++;
+        for (const el of mediaElements) {
+          // Later joiners initialize asynchronously.  The initial scan is awaited above so the
+          // bridge can fail terminally before it reports readiness; a later failure is still
+          // made visible as a page fault rather than becoming an unhandled rejection.
+          void connectElement(el, nextIndex).then((connected) => { if (connected) nextIndex++; })
+            .catch(() => log('worklet init failed code=worklet_init_failed'));
+        }
         // A removed element or swapped srcObject must not pin its old source once all surviving
         // references have been reconciled.
         for (const [el, binding] of Array.from(bindings.entries())) {

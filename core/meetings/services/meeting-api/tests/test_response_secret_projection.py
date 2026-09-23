@@ -38,6 +38,7 @@ delivery after a read has been served.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,11 +47,13 @@ from meeting_api.collector import create_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.projection import (
     OWNER_ONLY_KEYS,
+    RESPONSE_MAX_SERIALIZED_BYTES,
     RESPONSE_OMIT_KEYS,
     SENSITIVE_OMIT_KEYS,
     is_sensitive_key,
     project_list_data,
     project_response_data,
+    project_transcript_recordings,
 )
 
 OWNER, VIEWER, STRANGER, WS_MEMBER = 41, 42, 43, 44
@@ -309,7 +312,7 @@ def test_share_recipient_gets_only_bounded_recording_summaries_from_transcript()
     shared = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(VIEWER)})
     owner = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(OWNER)})
     assert shared.status_code == owner.status_code == 200
-    assert owner.json()["recordings"] == rows, "owner recording behavior is unchanged"
+    assert owner.json()["recordings"] == rows[:50], "owner recordings are explicitly bounded"
     summaries = shared.json()["recordings"]
     assert len(summaries) == 50
     assert summaries[0] == {"id": "r-0", "status": "completed"}
@@ -393,6 +396,52 @@ def test_credential_shaped_keys_are_dropped_by_default_for_the_owner_too():
     keep = {"token_count": 12, "secret_santa_notes": "x", "tokens_used": 3}
     assert project_response_data(keep, viewer_is_owner=True) == keep
     assert project_response_data(keep) == keep
+
+
+def test_nested_credentials_and_internal_artifacts_are_omitted_for_every_projection():
+    """Key-shaped secrets are omitted recursively even when their values look harmless."""
+    data = {
+        "title": "useful title",
+        "diagnostic": {
+            "api_key": "alpha", "access_token": "bravo", "token": "charlie",
+            "authorization": "delta", "secret_hash": "echo", "db_password": "foxtrot",
+            "nested": {
+                "auth_userdata_path": "session-ref",
+                "attributed_audio_manifest": {"ranges": [{"storage_path": "object-ref"}]},
+                "phase": "capture", "attempt": 2,
+            },
+        },
+    }
+    for project in (project_response_data, project_list_data):
+        for owner in (True, False):
+            projected = project(data, viewer_is_owner=owner)
+            rendered = repr(projected)
+            for forbidden in ("api_key", "access_token", "token", "authorization", "secret_hash",
+                              "db_password", "auth_userdata_path", "attributed_audio_manifest",
+                              "storage_path", "alpha", "bravo", "charlie", "delta", "echo",
+                              "foxtrot", "session-ref", "object-ref"):
+                assert forbidden not in rendered, (project.__name__, owner, forbidden, projected)
+            assert projected["diagnostic"]["nested"] == {"phase": "capture", "attempt": 2}
+
+
+def test_projection_limits_are_small_and_deterministic_for_untrusted_shapes():
+    huge = {f"diagnostic_{i:05d}": "x" * 1024 for i in range(10_000)}
+    huge["k" * 10_000] = "oversized key"
+    data = {"title": "still useful", "custom": huge}
+    first = project_response_data(data, viewer_is_owner=True)
+    second = project_response_data(data, viewer_is_owner=True)
+    assert first == second
+    assert len(json.dumps(first, separators=(",", ":")).encode()) <= RESPONSE_MAX_SERIALIZED_BYTES
+    assert "k" * 10_000 not in repr(first)
+    assert first["title"] == "still useful"
+
+
+def test_recording_summary_strings_share_the_projection_ceiling():
+    recordings = [{"id": "rec-1", "status": "s" * 1_000_000, "media_type": "audio"}]
+    for owner in (True, False):
+        projected = project_transcript_recordings(recordings, viewer_is_owner=owner)
+        assert len(json.dumps(projected, separators=(",", ":")).encode()) <= RESPONSE_MAX_SERIALIZED_BYTES
+        assert projected[0]["status"] == "s" * 1024
 
 
 def test_response_omissions_cover_the_delivery_paths_internal_keys():

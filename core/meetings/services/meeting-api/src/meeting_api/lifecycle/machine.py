@@ -29,6 +29,23 @@ _UNSAFE_DIAGNOSTIC = re.compile(
     r"private[_ -]?transcript|authorization|provider[-_ ]?body|bearer\s+|https?://|\b(?:s3|gs)://",
     re.IGNORECASE,
 )
+_DURABLE_OMIT_KEYS = frozenset({
+    "webhook_secret", "webhook_secrets", "share_grants", "auth_userdata_path",
+    "attributed_audio_manifest", "artifact_deletion",
+})
+_CREDENTIAL_KEY_SUFFIXES = (
+    "secret", "secrets", "token", "tokens", "password", "credential", "credentials",
+    "api_key", "apikey", "private_key", "signing_key", "access_key", "authorization",
+)
+
+
+def _is_credential_key(key: str) -> bool:
+    """Omit credential-shaped producer keys before diagnostics reach durable JSONB."""
+    lowered = key.lower()
+    return (lowered in _DURABLE_OMIT_KEYS
+            or any(lowered == suffix or lowered.endswith("_" + suffix)
+                   for suffix in _CREDENTIAL_KEY_SUFFIXES)
+            or lowered.startswith(("secret_hash", "secret_value", "password_", "credential_", "authorization_")))
 
 
 def _safe_diagnostic_text(value: Any, *, limit: int = _DIAGNOSTIC_TEXT_LIMIT) -> str:
@@ -56,7 +73,8 @@ def _sanitize_diagnostic(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, dict):
         clean: Dict[str, Any] = {}
         for key, item in list(value.items())[:_DIAGNOSTIC_ITEMS_LIMIT]:
-            if not isinstance(key, str) or _UNSAFE_DIAGNOSTIC.search(key):
+            if (not isinstance(key, str) or _UNSAFE_DIAGNOSTIC.search(key)
+                    or _is_credential_key(key)):
                 continue
             clean[_safe_diagnostic_text(key, limit=96)] = _sanitize_diagnostic(item, depth=depth + 1)
         return clean
