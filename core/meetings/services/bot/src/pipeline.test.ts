@@ -196,6 +196,23 @@ async function main(): Promise<void> {
     check('transcribe disabled: no live-STT resource owner is allocated', pipe.resourceCounts === undefined);
   }
 
+  // Canonical attributed Meet PCM is deferred evidence. It must not also allocate a live STT
+  // lane when a caller omitted transcription settings or explicitly requested them.
+  for (const transcribeEnabled of [undefined, true] as const) {
+    let calls = 0;
+    const sink = captureSink();
+    const pipe = createBotPipeline(baseInv({ transcribeEnabled, attributedAudioEnabled: true }), sink, {
+      config: FAST,
+      transcribe: async () => { calls++; return { text: 'must not publish', language: 'en', duration: 0, segments: [] }; },
+    });
+    await pipe.start();
+    pipe.feedAudio(0, 'Alice', FRAME, 1_000);
+    await pipe.stop();
+    check(`attributed Meet (${String(transcribeEnabled)}): synthetic PCM makes no STT calls or publications`,
+      calls === 0 && sink.published.length === 0 && pipe.resourceCounts === undefined,
+      JSON.stringify({ calls, published: sink.published.length, resources: pipe.resourceCounts?.() }));
+  }
+
   // ── 4) createTranscribe threads invocation.transcriptionModel → the STT wire (#522) ──
   // The one hop the bot owns: invocation.v1 → TranscriptionClient config. Observed at the wire
   // (stubbed fetch, real client), so the whole bot-side thread is closed, not just the client.

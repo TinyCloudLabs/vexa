@@ -278,7 +278,7 @@ def _capture_join_evidence(
             return None
         stage = rec.failure_stage.value if rec.failure_stage is not None else None
         return evidence_from_event(
-            event, stage=stage, reached_lobby=reached_lobby, reason_text=rec.reason
+            event, stage=stage, reached_lobby=reached_lobby, reason_text=event.get("reason")
         )
     except Exception:  # noqa: BLE001 — evidence is a report about a finished run; never fail on it
         return None

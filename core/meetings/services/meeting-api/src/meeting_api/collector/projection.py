@@ -141,6 +141,8 @@ NON_OWNER_DIAGNOSTIC_SUFFIXES = ("_logs", "_history", "_evidence", "_details", "
 NON_OWNER_VALUE_LIST_LIMIT = 8
 NON_OWNER_VALUE_DEPTH_LIMIT = 8
 NON_OWNER_TEXT_LIMIT = 512
+DIAGNOSTIC_VALUE_LIST_LIMIT = 32
+DIAGNOSTIC_VALUE_DEPTH_LIMIT = 4
 _UNSAFE_RESPONSE_TEXT = re.compile(
     r"private[_ -]?transcript|authorization|provider[-_ ]?body|bearer\s+|https?://|\b(?:s3|gs)://",
     re.IGNORECASE,
@@ -321,6 +323,68 @@ def project_non_owner_value(value: Any, *, depth: int = 0) -> Any:
     return value if isinstance(value, (int, float, bool, type(None))) else None
 
 
+def project_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound and redact a persisted diagnostic on every response edge, including its owner."""
+    if depth >= DIAGNOSTIC_VALUE_DEPTH_LIMIT:
+        return "[truncated diagnostic]"
+    if isinstance(value, str):
+        if _UNSAFE_RESPONSE_TEXT.search(value):
+            return "[redacted diagnostic]"
+        return value[:NON_OWNER_TEXT_LIMIT]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        return {
+            key[:96]: project_diagnostic_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:DIAGNOSTIC_VALUE_LIST_LIMIT]
+            if isinstance(key, str) and not _UNSAFE_RESPONSE_TEXT.search(key)
+        }
+    if isinstance(value, (list, tuple)):
+        return [project_diagnostic_value(item, depth=depth + 1)
+                for item in list(value)[-DIAGNOSTIC_VALUE_LIST_LIMIT:]]
+    return "[redacted diagnostic]"
+
+
+def _project_attributed_audio_capability(value: Any) -> Optional[dict]:
+    """Expose only the small version acknowledgement contract, never producer diagnostics."""
+    if not isinstance(value, dict):
+        return None
+    requested = value.get("requested_version")
+    status = value.get("status")
+    if not isinstance(requested, int) or isinstance(requested, bool) or not 1 <= requested <= 100:
+        return None
+    if status == "pending":
+        return {"requested_version": requested, "status": status}
+    supported = value.get("supported_version")
+    if (status not in ("supported", "unsupported") or not isinstance(supported, int)
+            or isinstance(supported, bool) or not 1 <= supported <= 100):
+        return None
+    return {"requested_version": requested, "supported_version": supported, "status": status}
+
+
+def sanitize_response_diagnostics(value: Any) -> Any:
+    """Sanitize known diagnostic subtrees without changing ordinary owner-visible content."""
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "attributed_audio_capability":
+            capability = _project_attributed_audio_capability(item)
+            if capability is not None:
+                result[key] = capability
+        elif is_non_owner_diagnostic_key(key):
+            result[key] = project_diagnostic_value(item)
+        elif isinstance(item, dict):
+            result[key] = sanitize_response_diagnostics(item)
+        elif isinstance(item, list):
+            result[key] = [sanitize_response_diagnostics(row) for row in item]
+        else:
+            result[key] = item
+    return result
+
+
 def omitted_keys(*, viewer_is_owner: bool) -> frozenset:
     """The explicit key set a response drops for this viewer.
 
@@ -360,6 +424,7 @@ def project_response_data(
         k: v for k, v in projected.items()
         if k not in omit and not is_sensitive_key(k)
     }
+    result = sanitize_response_diagnostics(result)
     return result if viewer_is_owner else project_non_owner_value(result)
 
 
@@ -389,6 +454,7 @@ def project_list_data(
                  and k not in omit and not is_sensitive_key(k)}
     if isinstance(sources, list):
         projected["calendar_sources"] = sources
+    projected = sanitize_response_diagnostics(projected)
     return projected if viewer_is_owner else project_non_owner_value(projected)
 
 

@@ -1181,21 +1181,21 @@ def test_passcode_is_not_written_onto_non_teams_join_urls(monkeypatch):
 
 # ── O-TEL-1: what the spawn resolves when identity answers, and when it does not ─────────────────
 
-async def test_spawn_defaults_capture_signal_off_when_identity_is_unreachable(monkeypatch):
-    """Diagnostics are opt-in: an unavailable identity service cannot start a tape."""
+async def test_spawn_preserves_missing_capture_signal_for_bot_env_fallback(monkeypatch):
+    """Missing identity context must not override the local VEXA_CAPTURE_SIGNAL fallback."""
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     await request_bot(repo, runtime, user_id=USER, platform="google_meet",
                       native_meeting_id="ctx-unreachable", redis_url="redis://redis:6379/0",
                       token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
-    assert inv["captureSignalEnabled"] is False
+    assert "captureSignalEnabled" not in inv
 
 
 @pytest.mark.parametrize("ctx,expected,slug", [
     ({"capture_signal": True}, True, "on"),
     ({"capture_signal": False}, False, "off"),
-    ({}, False, "absent"),                   # an older admin-api has no opt-in → disabled
+    ({}, None, "absent"),                    # no identity choice → bot may use its local fallback
     ({"capture_signal": "false"}, False, "str"),  # malformed contract value → disabled
 ])
 async def test_spawn_threads_capture_signal_from_bot_context(monkeypatch, ctx, expected, slug):
@@ -1213,4 +1213,30 @@ async def test_spawn_threads_capture_signal_from_bot_context(monkeypatch, ctx, e
                       native_meeting_id=f"ctx-{slug}", redis_url="redis://redis:6379/0",
                       token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
-    assert inv["captureSignalEnabled"] is expected
+    if expected is None:
+        assert "captureSignalEnabled" not in inv
+    else:
+        assert inv["captureSignalEnabled"] is expected
+
+
+@pytest.mark.parametrize("requested", [None, True], ids=["omitted", "true"])
+async def test_attributed_google_meet_forces_live_transcription_off(monkeypatch, requested):
+    """Attributed PCM is deferred evidence and cannot share the live STT lane."""
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "http://stt.test")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    kwargs = {} if requested is None else {"transcribe_enabled": requested}
+    result = await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                               native_meeting_id=f"attributed-{requested}", redis_url="redis://redis:6379/0",
+                               token_secret=SECRET, attributed_audio_enabled=True, **kwargs)
+    invocation = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert invocation["transcribeEnabled"] is False
+    assert result["data"]["transcribe_enabled"] is False
+
+
+async def test_feature_disabled_google_meet_keeps_requested_live_transcription(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "http://stt.test")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    await request_bot(repo, runtime, user_id=USER, platform="google_meet", native_meeting_id="ordinary-live-stt",
+                      redis_url="redis://redis:6379/0", token_secret=SECRET, transcribe_enabled=True)
+    invocation = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert invocation["transcribeEnabled"] is True

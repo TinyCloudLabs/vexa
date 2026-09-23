@@ -68,6 +68,25 @@ def test_attributed_producer_ack_is_explicit_not_a_spawn_flag():
         assert repo._meetings[row["id"]]["data"]["attributed_audio_capability"]["status"] == expected
 
 
+def test_attributed_producer_ack_is_strictly_allowlisted():
+    """Lifecycle payload extras cannot turn the capability acknowledgement into a diagnostic blob."""
+    import asyncio
+
+    repo = InMemoryMeetingRepo()
+    row = asyncio.run(repo.create_meeting(user_id=1, platform="google_meet", native_meeting_id="strict",
+                                           data={"attributed_audio_capability": {"requested_version": 1, "status": "pending"}}))
+    session = "ack-strict"; asyncio.run(repo.create_session(meeting_id=row["id"], session_uid=session))
+    client = TestClient(create_app(meeting_repo=repo))
+    marker = "PRIVATE_TRANSCRIPT https://private.example Authorization: Bearer secret"
+    event = {"connection_id": session, "status": "joining", "attributed_audio_capability": {
+        "requested_version": 1, "supported_version": 1, "status": "supported", "error": marker,
+        "nested": {"body": marker},
+    }}
+    assert client.post(ENDPOINT, json=event).status_code == 200
+    stored = repo._meetings[row["id"]]["data"]["attributed_audio_capability"]
+    assert stored == {"requested_version": 1, "supported_version": 1, "status": "supported"}
+
+
 # ── ① rehydration: empty store + DB at 'active' → terminal 'completed' is 200 (not 409) ───────────
 
 def test_rehydration_terminal_after_restart_is_200(goldens):

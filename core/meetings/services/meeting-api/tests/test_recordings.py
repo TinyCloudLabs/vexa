@@ -109,6 +109,22 @@ def test_attributed_pcm_is_idempotent_closed_and_owner_retrievable():
     assert client.get("/meetings/1/attributed-audio/ranges/0", headers={"x-user-id": "999"}).status_code == 404
 
 
+def test_attributed_close_receipt_is_bounded_while_owner_manifest_keeps_every_range():
+    """The bot close response is small even when PTX needs the full durable ledger later."""
+    from meeting_api.recordings.attributed import attributed_manifest_for_owner, close_attributed_manifest
+
+    repo, _storage = _seeded()
+    ranges = [{"sequence": n, "state": "failed"} for n in range(10_000)]
+    repo._meetings[MEETING_ID].setdefault("data", {})["attributed_audio_manifest"] = {
+        "version": 1, "meeting_id": str(MEETING_ID), "state": "open", "clock_origin_ms": 1, "ranges": ranges,
+    }
+    receipt = asyncio.run(close_attributed_manifest(repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID))
+    assert receipt["state"] == "closed" and receipt["range_count"] == 10_000
+    assert receipt["failed_count"] == 10_000 and "ranges" not in receipt
+    manifest = asyncio.run(attributed_manifest_for_owner(repo, user_id=USER, meeting_id=MEETING_ID))
+    assert len(manifest["ranges"]) == 10_000
+
+
 def test_attributed_range_storage_get_error_is_bounded():
     """The owner retrieval route preserves its gateway status without reflecting storage detail."""
     repo, storage = _seeded()
@@ -348,9 +364,9 @@ def test_attributed_deletion_fences_reservation_upload_and_empty_close_clock():
     # A silent close is still schema-valid: numeric 0 explicitly means no capture was admitted.
     empty = client.post("/internal/attributed-audio/close", headers=headers, data={"session_uid": SESSION_UID})
     assert empty.status_code == 200 and empty.json()["clock_origin_ms"] == 0
-    import jsonschema
-    schema_path = __file__.split("/core/meetings/")[0] + "/core/meetings/contracts/attributed-audio.v1/attributed-audio.schema.json"
-    jsonschema.Draft202012Validator(json.load(open(schema_path))).validate(empty.json())
+    # Close is a bounded bot receipt, not the durable attributed-audio.v1 manifest. The owner
+    # endpoint remains the contract-bearing route for the complete ledger.
+    assert empty.json()["range_count"] == 0 and "ranges" not in empty.json()
 
     # A deletion tombstone is a write fence, including a missing manifest (which must not be
     # recreated by a delayed bot/restart request).

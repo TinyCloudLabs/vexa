@@ -198,6 +198,24 @@ def test_share_projection_recursively_removes_and_bounds_diagnostic_siblings():
     assert len(repr(projected)) < 10_000
 
 
+def test_owner_projection_sanitizes_persisted_diagnostics_and_capability():
+    marker = "PRIVATE_TRANSCRIPT https://private.example Authorization: Bearer secret provider body"
+    data = {
+        "bot_logs": [marker] * 10_000,
+        "last_error": {"error_details": marker, "nested": {"detail": marker}},
+        "attributed_audio_capability": {"requested_version": 1, "supported_version": 1,
+                                        "status": "supported", "provider_body": marker},
+    }
+    projected = project_response_data(data, viewer_is_owner=True)
+    assert marker not in repr(projected)
+    assert len(projected["bot_logs"]) == 32
+    assert projected["attributed_audio_capability"] == {
+        "requested_version": 1, "supported_version": 1, "status": "supported",
+    }
+    shared = project_response_data(data, viewer_is_owner=False)
+    assert shared["attributed_audio_capability"] == projected["attributed_audio_capability"]
+
+
 @pytest.mark.parametrize("path_for", [
     lambda store: f"/transcripts/by-id/{_mid(store)}",
     lambda store: f"/transcripts/{PLAT}/{NID}",

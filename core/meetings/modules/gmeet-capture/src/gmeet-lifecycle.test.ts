@@ -10,8 +10,8 @@ class Track {
 class Stream { constructor(readonly id: string, readonly track: Track) {} getAudioTracks() { return [this.track] as any; } }
 class Source { disconnected = 0; connect() {} disconnect() { this.disconnected++; } }
 class Context {
-  static all: Context[] = []; state = 'running'; sources: Source[] = []; closed = 0;
-  audioWorklet = { addModule: async (_url: string) => {} };
+  static all: Context[] = []; static failWorklet = false; state = 'running'; sources: Source[] = []; closed = 0;
+  audioWorklet = { addModule: async (_url: string) => { if (Context.failWorklet) throw new Error('https://private.example Authorization: Bearer secret'); } };
   constructor(_opts?: unknown) { Context.all.push(this); }
   resume = async () => {};
   createMediaStreamSource = (_stream: unknown) => { const source = new Source(); this.sources.push(source); return source as any; };
@@ -60,4 +60,15 @@ capture.stop(); capture.stop();
 assert.deepEqual(capture.resourceCounts(), { contexts: 0, sources: 0, worklets: 0, tracks: 0, references: 0 });
 assert.equal(Context.all.length, 1, 'churn shares one AudioContext');
 assert.equal(Context.all[0].closed, 1, 'stop closes the shared context once');
+
+Context.failWorklet = true;
+const unsafe = el(new Stream('unsafe', new Track('unsafe-track')));
+elements.push(unsafe); present.add(unsafe);
+const logs: string[] = [];
+const failingCapture = createGmeetCapture({ onAudio() {}, log: (line) => logs.push(line), rescanMs: 1, findRetries: 1 });
+await failingCapture.start(); await wait();
+assert(logs.some((line) => line === 'worklet init failed code=worklet_init_failed'));
+assert(!logs.join('\n').includes('private.example') && !logs.join('\n').includes('Bearer secret'));
+assert.deepEqual(failingCapture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0, references: 0 });
+failingCapture.stop();
 console.log('PASS gmeet lifecycle: mirrors deduplicate and end/remove/replacement/stop release every owned resource');

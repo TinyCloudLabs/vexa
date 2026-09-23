@@ -209,8 +209,29 @@ def test_bot_logs_trimmed_oldest_first():
     kept = bodies[-1]["data"]["bot_logs"]
     assert bodies[-1]["data"]["bot_logs_truncated"] is True
     assert len(kept) < len(lines)
-    assert kept[-1] == lines[-1]  # newest survives
+    assert kept[-1].startswith(lines[-1][:512])  # newest survives, safely bounded
     assert kept[0] != lines[0]    # oldest dropped
+
+
+def test_terminal_diagnostics_redact_and_bound_adversarial_payloads():
+    """Producer-controlled terminal diagnostics never persist or project raw meeting material."""
+    marker = "PRIVATE_TRANSCRIPT https://private.example Authorization: Bearer secret provider body"
+    client, app, deliveries = _client()
+    final = _drive(
+        client, JOINING, ACTIVE,
+        {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
+         "reason": marker, "error_details": marker,
+         "bot_logs": [marker] * 10_000 + [marker + "x" * 20_000],
+         "bot_resources": {"nested": [{"detail": marker}] * 10_000},
+         "stt_fault": {"detail": marker, "many": [marker] * 10_000}},
+    )[-1]
+    persisted = final["data"]
+    assert marker not in repr(persisted)
+    assert len(persisted["bot_logs"]) == 32
+    assert max(map(len, persisted["bot_logs"])) <= 512
+    assert len(repr(persisted)) < 20_000
+    hook_data = deliveries[-1]["data"]["meeting"]["data"]
+    assert marker not in repr(hook_data)
 
 
 # ── the DEGRADED meeting: completed, but with no transcript and a reason why ────────────────────

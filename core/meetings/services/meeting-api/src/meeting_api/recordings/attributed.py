@@ -331,6 +331,8 @@ async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], se
             "version": manifest.get("version"),
             "meeting_id": manifest.get("meeting_id"),
             "state": manifest.get("state"),
+            "clock_origin": manifest.get("clock_origin"),
+            "clock_origin_ms": manifest.get("clock_origin_ms"),
             "range_count": len(ranges),
             "uploaded_count": sum(1 for row in ranges if row.get("state") == "uploaded"),
             "failed_count": sum(1 for row in ranges if row.get("state") == "failed"),

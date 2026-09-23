@@ -83,6 +83,24 @@ async function main(): Promise<void> {
     check('permanent: gave up after exactly `retries` attempts', calls.length === 3, String(calls.length));
   }
 
+  // Transport exceptions can carry callback URLs, response bodies, or authorization material.
+  // The operator log is a stable code, never a stringification of the thrown value.
+  {
+    const marker = 'https://private.example Authorization: Bearer secret provider body';
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+    try {
+      const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl: async () => { throw new Error(marker); }, retries: 1, sleep: noSleep });
+      await sink.emit(EVENT);
+      await sink.emitReachable!(EVENT);
+    } finally {
+      console.error = original;
+    }
+    check('transport failures log only generic stable codes', lines.length === 2 && lines.every((line) =>
+      !line.includes(marker) && /code=network_error/.test(line)), JSON.stringify(lines));
+  }
+
   // ── permanent non-2xx: every attempt 503 → also swallowed, bounded attempts ──
   {
     const calls: Recorded[] = [];

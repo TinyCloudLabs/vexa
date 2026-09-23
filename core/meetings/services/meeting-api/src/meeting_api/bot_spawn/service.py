@@ -225,8 +225,10 @@ def _transcription_from_context(ctx: dict) -> dict:
 
 def _capture_signal_from_context(ctx: dict) -> Optional[bool]:
     """Return an explicit identity choice, or preserve the legacy bot-side fallback when absent."""
+    if "capture_signal" not in ctx:
+        return None
     value = ctx.get("capture_signal")
-    return value if isinstance(value, bool) else None
+    return value if isinstance(value, bool) else False
 
 
 def _bot_name_from_context(ctx: dict) -> Optional[str]:

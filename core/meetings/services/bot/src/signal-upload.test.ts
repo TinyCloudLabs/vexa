@@ -99,6 +99,12 @@ console.log('\n── tape size cap ──');
       && !captureSignalEnabled(inv({ captureSignalEnabled: true }), '')
       && !captureSignalEnabled(inv({ captureSignalEnabled: false }), '1024')
       && !captureSignalEnabled(inv({}), '1024'));
+  const prior = process.env.VEXA_CAPTURE_SIGNAL;
+  process.env.VEXA_CAPTURE_SIGNAL = '1';
+  check('missing invocation context preserves VEXA_CAPTURE_SIGNAL=1 fallback',
+    captureSignalEnabled(inv({}), '1024') && !captureSignalEnabled(inv({ captureSignalEnabled: false }), '1024'));
+  if (prior === undefined) delete process.env.VEXA_CAPTURE_SIGNAL;
+  else process.env.VEXA_CAPTURE_SIGNAL = prior;
 }
 
 // ── the Teams CC sidecar ────────────────────────────────────────────────────────────────────────
