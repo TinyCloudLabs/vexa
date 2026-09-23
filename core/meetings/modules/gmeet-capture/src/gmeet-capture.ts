@@ -68,6 +68,10 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
   const bindings = new Map<HTMLMediaElement, ElementBinding>();
   let context: AudioContext | null = null;
   let nextIndex = 0;
+  // Initial worklet failures reject start(). A worklet can also fail much later, after a rescan
+  // discovers a new participant; retain that fault until the bridge tears capture down so an
+  // attributed session cannot be closed as a successful empty artifact.
+  let initializationFailure: Error | null = null;
 
   function findMediaElements(): HTMLMediaElement[] {
     return Array.from(document.querySelectorAll('audio, video')).filter((el: any) =>
@@ -160,7 +164,8 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       } catch {
         release(connection, 'worklet init failed');
         log('worklet init failed code=worklet_init_failed');
-        throw new Error('gmeet capture worklet initialization failed');
+        initializationFailure ??= new Error('gmeet capture worklet initialization failed');
+        throw initializationFailure;
       }
       // stop/replacement can happen while addModule() is pending. Never attach a late node.
       if (!running || connections.get(track.id) !== connection) {
@@ -220,10 +225,16 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         retainLiveOwners(mediaElements);
         for (const el of mediaElements) {
           // Later joiners initialize asynchronously.  The initial scan is awaited above so the
-          // bridge can fail terminally before it reports readiness; a later failure is still
-          // made visible as a page fault rather than becoming an unhandled rejection.
-          void connectElement(el, nextIndex).then((connected) => { if (connected) nextIndex++; })
-            .catch(() => log('worklet init failed code=worklet_init_failed'));
+          // bridge can fail terminally before it reports readiness. Reserve the channel before
+          // that await: two distinct tracks discovered by this one scan otherwise both capture
+          // the same mutable nextIndex and merge PCM/speaker identity when they resolve.
+          const stream: MediaStream | undefined = (el as any).srcObject;
+          const track = stream?.getAudioTracks()[0];
+          const index = track && !connections.has(track.id) ? nextIndex++ : nextIndex;
+          void connectElement(el, index).catch(() => {
+            initializationFailure ??= new Error('gmeet capture worklet initialization failed');
+            log('worklet init failed code=worklet_init_failed');
+          });
         }
         // A removed element or swapped srcObject must not pin its old source once all surviving
         // references have been reconciled.
@@ -248,6 +259,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       try { void ctx?.close(); } catch { /* ignore */ }
       nextIndex = 0;
       log('capture stopped');
+      if (initializationFailure) throw initializationFailure;
     },
 
     streamCount(): number { return connections.size; },

@@ -10,8 +10,11 @@ class Track {
 class Stream { constructor(readonly id: string, readonly track: Track) {} getAudioTracks() { return [this.track] as any; } }
 class Source { disconnected = 0; connect() {} disconnect() { this.disconnected++; } }
 class Context {
-  static all: Context[] = []; static failWorklet = false; state = 'running'; sources: Source[] = []; closed = 0;
-  audioWorklet = { addModule: async (_url: string) => { if (Context.failWorklet) throw new Error('https://private.example Authorization: Bearer secret'); } };
+  static all: Context[] = []; static failWorklet = false; static delayWorklet: Promise<void> | null = null; state = 'running'; sources: Source[] = []; closed = 0;
+  audioWorklet = { addModule: async (_url: string) => {
+    if (Context.failWorklet) throw new Error('https://private.example Authorization: Bearer secret');
+    await Context.delayWorklet;
+  } };
   constructor(_opts?: unknown) { Context.all.push(this); }
   resume = async () => {};
   createMediaStreamSource = (_stream: unknown) => { const source = new Source(); this.sources.push(source); return source as any; };
@@ -61,7 +64,42 @@ assert.deepEqual(capture.resourceCounts(), { contexts: 0, sources: 0, worklets: 
 assert.equal(Context.all.length, 1, 'churn shares one AudioContext');
 assert.equal(Context.all[0].closed, 1, 'stop closes the shared context once');
 
+// Late discovery is asynchronous: both worklets wait here, which used to let both callbacks
+// capture the same nextIndex before either continuation incremented it.
+let releaseLateWorklets!: () => void;
+Context.delayWorklet = new Promise<void>((resolve) => { releaseLateWorklets = resolve; });
+const lateChannels: number[] = [];
+const lateCapture = createGmeetCapture({
+  onAudio(index) { lateChannels.push(index); }, rescanMs: 1, findRetries: 1, findDelayMs: 1, silenceThreshold: 0,
+});
+await lateCapture.start();
+const lateA = el(new Stream('late-a', new Track('late-a-track')));
+const lateB = el(new Stream('late-b', new Track('late-b-track')));
+elements.push(lateA, lateB); present.add(lateA); present.add(lateB);
+await wait(10);
+assert.deepEqual(lateCapture.resourceCounts(), { contexts: 1, sources: 2, worklets: 0, tracks: 2, references: 2 },
+  'two late tracks reserve separate owners before either worklet initializes');
+Context.delayWorklet = null;
+releaseLateWorklets();
+await wait(10);
+for (const node of WorkletNode.all.slice(-2)) node.port.onmessage({ data: new Float32Array([1]) });
+assert.deepEqual(lateChannels.sort((a, b) => a - b), [0, 1],
+  'two tracks found in one asynchronous rescan emit distinct channels');
+lateCapture.stop();
+present.delete(lateA); present.delete(lateB);
+
+// A late worklet rejection is not a benign silent/no-track state. It survives the rescan and is
+// re-thrown by teardown, which is the page-side signal the bridge carries to terminal lifecycle.
 Context.failWorklet = true;
+const lateFailure = createGmeetCapture({ onAudio() {}, rescanMs: 1, findRetries: 1, findDelayMs: 1 });
+await lateFailure.start();
+const rejectedLate = el(new Stream('rejected-late', new Track('rejected-late-track')));
+elements.push(rejectedLate); present.add(rejectedLate);
+await wait(10);
+assert.throws(() => lateFailure.stop(), /worklet initialization failed/,
+  'late worklet rejection remains terminal at capture teardown');
+present.delete(rejectedLate);
+
 const unsafe = el(new Stream('unsafe', new Track('unsafe-track')));
 elements.push(unsafe); present.add(unsafe);
 const logs: string[] = [];
@@ -70,5 +108,5 @@ await assert.rejects(failingCapture.start(), /worklet initialization failed/);
 assert(logs.some((line) => line === 'worklet init failed code=worklet_init_failed'));
 assert(!logs.join('\n').includes('private.example') && !logs.join('\n').includes('Bearer secret'));
 assert.deepEqual(failingCapture.resourceCounts(), { contexts: 1, sources: 0, worklets: 0, tracks: 0, references: 0 });
-failingCapture.stop();
+assert.throws(() => failingCapture.stop(), /worklet initialization failed/);
 console.log('PASS gmeet lifecycle: mirrors deduplicate and end/remove/replacement/stop release every owned resource');
