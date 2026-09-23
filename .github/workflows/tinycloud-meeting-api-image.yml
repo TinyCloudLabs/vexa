@@ -33,6 +33,18 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The meeting-api contract suite executes the real TypeScript attributed-audio recorder.
+      # Install its pinned workspace toolchain before pytest exercises that cross-runtime seam.
+      - uses: pnpm/action-setup@v4
+        if: matrix.component == 'meeting-api'
+      - uses: actions/setup-node@v4
+        if: matrix.component == 'meeting-api'
+        with: { node-version: 22, cache: pnpm }
+      - name: Install recorder workspace dependencies
+        if: matrix.component == 'meeting-api'
+        run: pnpm install --frozen-lockfile
+        env: { ONNXRUNTIME_NODE_INSTALL: skip }
+
       - name: Test ${{ matrix.component }}
         working-directory: ${{ matrix.directory }}
         run: |
