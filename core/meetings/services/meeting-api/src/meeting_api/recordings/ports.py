@@ -85,6 +85,18 @@ class RecordingRepo(Protocol):
         a concurrent chunk-upload / finalize clobbered the other (lost update). Returns ``result``."""
         ...
 
+    async def mutate_meeting_data(self, meeting_id: int, mutator):
+        """Atomically mutate the complete meeting JSONB payload under the row lock."""
+        ...
+
+    async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
+        """Owner-scoped attributed manifest plus its deletion tombstone, if any.
+
+        Public retrieval must fail closed while cleanup owns the artifact, whereas the internal
+        deletion path still needs the retained manifest and deterministic object keys.
+        """
+        ...
+
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         """The ``user_id`` that owns ``meeting_id`` — used to scope ``GET /recordings`` listing."""
         ...

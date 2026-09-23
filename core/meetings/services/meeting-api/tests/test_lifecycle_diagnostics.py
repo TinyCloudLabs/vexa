@@ -209,8 +209,57 @@ def test_bot_logs_trimmed_oldest_first():
     kept = bodies[-1]["data"]["bot_logs"]
     assert bodies[-1]["data"]["bot_logs_truncated"] is True
     assert len(kept) < len(lines)
-    assert kept[-1] == lines[-1]  # newest survives
+    assert kept[-1].startswith(lines[-1][:512])  # newest survives, safely bounded
     assert kept[0] != lines[0]    # oldest dropped
+
+
+def test_terminal_diagnostics_redact_and_bound_adversarial_payloads():
+    """Producer-controlled terminal diagnostics never persist or project raw meeting material."""
+    marker = "PRIVATE_TRANSCRIPT https://private.example Authorization: Bearer secret provider body"
+    client, app, deliveries = _client()
+    final = _drive(
+        client, JOINING, ACTIVE,
+        {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
+         "reason": marker, "error_details": marker,
+         "bot_logs": [marker] * 10_000 + [marker + "x" * 20_000],
+         "bot_resources": {"nested": [{"detail": marker}] * 10_000},
+         "stt_fault": {"detail": marker, "many": [marker] * 10_000}},
+    )[-1]
+    persisted = final["data"]
+    assert marker not in repr(persisted)
+    assert len(persisted["bot_logs"]) == 32
+    assert max(map(len, persisted["bot_logs"])) <= 512
+    assert len(repr(persisted)) < 20_000
+    hook_data = deliveries[-1]["data"]["meeting"]["data"]
+    assert marker not in repr(hook_data)
+
+
+def test_terminal_diagnostics_omit_nested_credential_keys_before_persistence():
+    """Innocuous values prove this is a key policy, not a value-regex accident."""
+    client, _app, deliveries = _client()
+    final = _drive(
+        client, JOINING, ACTIVE,
+        {"connection_id": "sess-uid", "status": "failed", "exit_code": 1,
+         "reason": "capture initialization failed",
+         "bot_resources": {
+             "api_key": "alpha", "access_token": "bravo", "token": "charlie",
+             "authorization": "delta", "secret_hash": "echo", "db_password": "foxtrot",
+             "nested": {
+                 "auth_userdata_path": "session-ref",
+                 "attributed_audio_manifest": {"ranges": [{"storage_path": "object-ref"}]},
+                 "phase": "capture", "attempt": 2,
+             },
+         }},
+    )[-1]
+    persisted = final["data"]["bot_resources"]
+    for carrier in (persisted, deliveries[-1]["data"]["meeting"]["data"]):
+        rendered = repr(carrier)
+        for forbidden in ("api_key", "access_token", "token", "authorization", "secret_hash",
+                          "db_password", "auth_userdata_path", "attributed_audio_manifest",
+                          "storage_path", "alpha", "bravo", "charlie", "delta", "echo",
+                          "foxtrot", "session-ref", "object-ref"):
+            assert forbidden not in rendered
+    assert persisted["nested"] == {"phase": "capture", "attempt": 2}
 
 
 # ── the DEGRADED meeting: completed, but with no transcript and a reason why ────────────────────

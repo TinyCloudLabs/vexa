@@ -45,6 +45,32 @@ function fakeUploader(): { seen: Seen[]; upload: ChunkUploader } {
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 async function main(): Promise<void> {
+  // ── 0) bounded admission: a slow uploader applies backpressure at chunk(), not an unbounded
+  // promise chain. Once released, every admitted chunk is delivered and retained bytes settle. ──
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: number[] = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), maxRetainedBytes: 16,
+      uploadChunk: async (seq) => { await blocked; delivered.push(seq); },
+    });
+    const first = sink.chunk('google_meet/bound', 0, false, 'webm', new Uint8Array(12));
+    await flush();
+    let secondRejected = false;
+    const second = sink.chunk('google_meet/bound', 1, false, 'webm', new Uint8Array(12)).catch(() => { secondRejected = true; });
+    await flush();
+    check('backpressure: retained bytes never exceed admission budget', sink.resourceCounts().retainedBytes <= 16,
+      JSON.stringify(sink.resourceCounts()));
+    check('atomic admission: same-tick second 12-byte chunk is rejected before it can retain 24 bytes', secondRejected,
+      JSON.stringify(sink.resourceCounts()));
+    release();
+    await Promise.all([first, second]);
+    await sink.close('google_meet/bound');
+    check('backpressure: admitted data is delivered before the close fallback marker', delivered.join(',') === '0,1', delivered.join(','));
+    check('backpressure: close returns retained bytes to zero', sink.resourceCounts().retainedBytes === 0,
+      JSON.stringify(sink.resourceCounts()));
+  }
   for (const explicitFinal of [false, true]) {
     let release: () => void = () => {};
     const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -59,6 +85,26 @@ async function main(): Promise<void> {
     release();
     await closing;
     check('drain: data and final acknowledged before close resolves', delivered.join(',') === '0,1');
+  }
+  // close() freezes new ingress, but it must not jump its fallback marker ahead of chunks that
+  // were already admitted in the same turn while seq0's uploader was stalled.
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: Array<{ seq: number; final: boolean }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(), uploadChunk: async (seq, final) => { await blocked; delivered.push({ seq, final }); },
+    });
+    const zero = sink.chunk('google_meet/close-order', 0, false, 'webm', new Uint8Array([0]));
+    const one = sink.chunk('google_meet/close-order', 1, false, 'webm', new Uint8Array([1]));
+    const closing = sink.close('google_meet/close-order');
+    await flush();
+    release();
+    await Promise.all([zero, one, closing]);
+    check('close order: blocked seq0, queued seq1, then fallback final',
+      delivered.map((x) => `${x.seq}:${x.final}`).join(',') === '0:false,1:false,2:true', JSON.stringify(delivered));
+    check('close order: counters return to zero after drained close', sink.resourceCounts().retainedBytes === 0,
+      JSON.stringify(sink.resourceCounts()));
   }
   // ── 1) each timeslice uploads IMMEDIATELY, in seq order, bytes forwarded ─────────────────────
   {
@@ -136,6 +182,23 @@ async function main(): Promise<void> {
     sink.close('google_meet/never');
     await flush();
     check('empty session: close is a no-op (no upload)', seen.length === 0, String(seen.length));
+  }
+
+  // ── 6b) page producer failure is terminal: close must not manufacture a final marker ─────────
+  {
+    const { seen, upload } = fakeUploader();
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: upload, maxRetainedBytes: 16 });
+    await sink.chunk('google_meet/overflow', 0, false, 'webm', new Uint8Array(8));
+    // Mirrors the real browser boundary: a following 17-byte Blob cannot fit the 16-byte budget.
+    sink.abort(new Error('recording producer overflow private-object-key/17B credential-marker'));
+    let rejected = false, fault = '';
+    try { await sink.close('google_meet/overflow'); } catch (error) { rejected = true; fault = String(error); }
+    check('producer overflow: bridge/sink close rejects truthfully', rejected && sink.resourceCounts().failed,
+      JSON.stringify(sink.resourceCounts()));
+    check('producer overflow: no synthetic successful final marker follows the accepted seq0',
+      seen.length === 1 && !seen[0].isFinal && seen[0].len === 8, JSON.stringify(seen));
+    check('producer overflow: upload/capture exception is redacted before terminal state',
+      fault === 'Error: recording delivery failed (code operation_failed)' && !fault.includes('credential-marker'), fault);
   }
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──

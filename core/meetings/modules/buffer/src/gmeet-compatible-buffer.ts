@@ -518,6 +518,7 @@ export class GmeetCompatibleBuffer {
     }
 
     this.buffers.delete(speakerId);
+    this.submitGeneration.delete(speakerId);
   }
 
   hasSpeaker(speakerId: string): boolean {
@@ -572,6 +573,21 @@ export class GmeetCompatibleBuffer {
     for (const speakerId of Array.from(this.buffers.keys())) {
       this.removeSpeaker(speakerId);
     }
+    this.carryForward = [];
+  }
+
+  resourceCounts(): { speakers: number; timers: number; generations: number; carriedSamples: number; retainedPcmBytes: number } {
+    let carriedSamples = 0;
+    let retainedSamples = 0;
+    for (const chunk of this.carryForward) carriedSamples += chunk.length;
+    for (const buffer of this.buffers.values()) for (const chunk of buffer.chunks) retainedSamples += chunk.length;
+    return {
+      speakers: this.buffers.size,
+      timers: this.timers.size,
+      generations: this.submitGeneration.size,
+      carriedSamples,
+      retainedPcmBytes: (carriedSamples + retainedSamples) * Float32Array.BYTES_PER_ELEMENT,
+    };
   }
 
   /**

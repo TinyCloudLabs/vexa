@@ -223,16 +223,12 @@ def _transcription_from_context(ctx: dict) -> dict:
     return transcription if isinstance(transcription, dict) else {}
 
 
-def _capture_signal_from_context(ctx: dict) -> bool:
-    """Whether this spawn tapes its raw captured-signal stream — DEFAULT ON.
-
-    admin-api resolves user > platform_settings > default-on and ALWAYS states the key, so anything
-    other than an explicit ``False`` here means we could not read a decision: unreachable identity,
-    an older admin-api that predates the field, or an unset ADMIN_API_URL. All of those default ON,
-    because prod meetings are the fixture source and a transient identity blip must not silently
-    turn collection off fleet-wide. The kill switch is an explicit ``false``, nothing else.
-    """
-    return ctx.get("capture_signal") is not False
+def _capture_signal_from_context(ctx: dict) -> Optional[bool]:
+    """Return an explicit identity choice, or preserve the legacy bot-side fallback when absent."""
+    if "capture_signal" not in ctx:
+        return None
+    value = ctx.get("capture_signal")
+    return value if isinstance(value, bool) else False
 
 
 def _bot_name_from_context(ctx: dict) -> Optional[str]:
@@ -419,6 +415,7 @@ async def request_bot(
     transcription_tier: str = "realtime",
     recording_enabled: bool = False,
     transcribe_enabled: bool = True,
+    attributed_audio_enabled: bool = False,
     automatic_leave: Optional[dict] = None,
     continue_meeting: bool = False,
     max_concurrent: Optional[int] = None,
@@ -444,6 +441,10 @@ async def request_bot(
     means no cap was provided, so no pre-check.
     """
     authority = authority or AllowAllServiceAuthority()
+    # Canonical attributed Google Meet PCM is deferred evidence. It cannot also start local
+    # Whisper/live publication, even if transcription was omitted or requested by the caller.
+    if platform == "google_meet" and attributed_audio_enabled:
+        transcribe_enabled = False
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(
         platform, native_meeting_id, teams_base_host=teams_base_host
@@ -681,6 +682,9 @@ async def request_bot(
             data_patch={
                 "transcribe_enabled": transcribe_enabled,
                 "recording_enabled": recording_enabled,
+                "attributed_audio_enabled": attributed_audio_enabled,
+                "attributed_audio_capability": ({"requested_version": 1, "status": "pending"}
+                                                 if attributed_audio_enabled and platform == "google_meet" else None),
                 "transcription_provider": transcription_provider,
                 "service_authority": authority_record,
             },
@@ -691,6 +695,11 @@ async def request_bot(
             meeting_data["constructed_meeting_url"] = constructed_url
         meeting_data["transcribe_enabled"] = transcribe_enabled
         meeting_data["recording_enabled"] = recording_enabled
+        meeting_data["attributed_audio_enabled"] = attributed_audio_enabled
+        if attributed_audio_enabled and platform == "google_meet":
+            # Pending is deliberately distinct from supported: only the bot's lifecycle callback
+            # can replace it with an acknowledgement, so a mixed fleet cannot be mistaken for one.
+            meeting_data["attributed_audio_capability"] = {"requested_version": 1, "status": "pending"}
         if transcription_provider is not None:
             meeting_data["transcription_provider"] = transcription_provider
         meeting_data["service_authority"] = authority_record
@@ -766,6 +775,10 @@ async def request_bot(
         # O-TEL-1: the tape is INDEPENDENT of recording_enabled — a meeting the user never asked to
         # record still yields a fixture. Both ride the same upload endpoint below.
         capture_signal_enabled=capture_signal_enabled,
+        attributed_audio_enabled=attributed_audio_enabled if platform == "google_meet" else None,
+        attributed_audio_upload_url=(f"{meeting_api_url}/internal/attributed-audio/upload"
+                                     if attributed_audio_enabled and platform == "google_meet" else None),
+        attributed_audio_required_version=(1 if attributed_audio_enabled and platform == "google_meet" else None),
         recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
         authenticated=True if authenticated else None,
         userdata_s3_path=auth_userdata_path,

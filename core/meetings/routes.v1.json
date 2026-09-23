@@ -57,6 +57,20 @@
     },
     {
       "method": "GET",
+      "path": "/meetings/{meeting_id}/attributed-audio",
+      "scopes": [
+        "tx"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/meetings/{meeting_id}/attributed-audio/ranges/{sequence}",
+      "scopes": [
+        "tx"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/meetings",
       "scopes": [
         "tx"

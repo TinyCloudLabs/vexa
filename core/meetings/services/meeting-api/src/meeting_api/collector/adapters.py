@@ -424,7 +424,7 @@ class SqlAlchemyTranscriptStore:
         native-keyed read constrains ``Meeting.user_id == user_id`` in SQL, and the by-id read
         evaluates an explicit owner branch inside its authorization check. Passing the decision down
         beats re-deriving it here, where the caller's ``user_id`` is not even in scope."""
-        from .projection import project_response_data
+        from .projection import project_response_data, project_transcript_recordings
 
         snap, seg_by_id, order = pg
         data = snap["data"]
@@ -459,7 +459,7 @@ class SqlAlchemyTranscriptStore:
             "status": snap["status"],
             "start_time": _iso_utc(snap["start_time"]),
             "end_time": _iso_utc(snap["end_time"]),
-            "recordings": data.get("recordings", []),
+            "recordings": project_transcript_recordings(data.get("recordings"), viewer_is_owner=viewer_is_owner),
             "notes": data.get("notes"),
             "data": project_response_data(data, viewer_is_owner=viewer_is_owner),
             "segments": segments,
@@ -1597,6 +1597,7 @@ class SqlAlchemyTranscriptStore:
             return True
 
     async def prepare_completed_artifact_deletion(self, user_id, meeting_id) -> "Optional[dict]":
+        from copy import deepcopy
         from datetime import datetime, timezone
 
         from sqlalchemy import select
@@ -1618,24 +1619,27 @@ class SqlAlchemyTranscriptStore:
             already_deleted = bool(
                 prior and prior.get("state", "completed") == "completed"
             )
-            if not already_deleted:
-                data["artifact_deletion"] = {
-                    "state": "pending",
-                    "requested_at": prior.get("requested_at")
-                    or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "scope": "primary_transcript_and_recording_storage",
-                    "backup_residuals": "expire_under_deployment_retention_policy",
-                }
-                meeting.data = data
-                flag_modified(meeting, "data")
-                await db.commit()
+            cleanup_version = int(prior.get("cleanup_version") or 0) + 1
+            data["artifact_deletion"] = {
+                "state": "pending",
+                "requested_at": prior.get("requested_at")
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "scope": "primary_transcript_and_recording_storage",
+                "backup_residuals": "expire_under_deployment_retention_policy",
+                "cleanup_version": cleanup_version,
+            }
+            meeting.data = data
+            flag_modified(meeting, "data")
+            await db.commit()
             return {
                 "meeting_id": meeting.id,
-                "recordings": list(data.get("recordings") or []),
+                "recordings": deepcopy(list(data.get("recordings") or [])),
+                "attributed_audio_manifest": deepcopy(data.get("attributed_audio_manifest")),
+                "cleanup_version": cleanup_version,
                 "already_deleted": already_deleted,
             }
 
-    async def finalize_completed_artifact_deletion(self, user_id, meeting_id) -> "Optional[bool]":
+    async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None) -> "Optional[bool]":
         from datetime import datetime, timezone
 
         from sqlalchemy import delete, select
@@ -1652,15 +1656,28 @@ class SqlAlchemyTranscriptStore:
                 return None
             if meeting.status not in ("completed", "failed"):
                 return False
-            await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
-            for key in ("recordings", "processed", "notes", "share_grants", "transcript_viewers"):
+            cleanup_plan = cleanup_plan or {}
+            deletion = data.get("artifact_deletion") or {}
+            if (deletion.get("state") != "pending"
+                    or deletion.get("cleanup_version") != cleanup_plan.get("cleanup_version")):
+                return False
+            await db.execute(delete(Transcription).where(Transcription.meeting_id == meeting_id))
+            # The objects deleted above came from this request's snapshot.  A concurrent rejected
+            # PUT can restore a deterministic attributed ledger after that snapshot; preserving a
+            # mismatched value makes the next public delete discover and remove it.
+            if data.get("recordings") == cleanup_plan.get("recordings"):
+                data.pop("recordings", None)
+            if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
+                data.pop("attributed_audio_manifest", None)
+            for key in ("processed", "notes", "share_grants", "transcript_viewers"):
                 data.pop(key, None)
             data["artifact_deletion"] = {
                 "state": "completed",
                 "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "scope": "primary_transcript_and_recording_storage",
                 "backup_residuals": "expire_under_deployment_retention_policy",
+                "cleanup_version": cleanup_plan["cleanup_version"],
             }
             meeting.data = data
             flag_modified(meeting, "data")

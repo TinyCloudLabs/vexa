@@ -23,7 +23,7 @@
  * lazy redis connect.
  */
 import { createClient } from 'redis';
-import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
+import { liveSttEnabled, loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
 import { createOrchestrator, DEFAULT_PIPELINE_STOP_MS } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
@@ -32,7 +32,7 @@ import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redi
 import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
-import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
+import { captureSignalEnabled, createCaptureSignalRecorder, DEFAULT_ENABLED_MAX_TAPE_BYTES, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { createResourceMonitor } from './resources.js';
@@ -200,9 +200,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
+  const captureSignalMaxBytes = resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES;
   const signalRecorder: CaptureSignalRecorder | null =
-    (inv.captureSignalEnabled ?? env.VEXA_CAPTURE_SIGNAL === '1')
-      ? createCaptureSignalRecorder(inv)
+    captureSignalEnabled(inv)
+      ? createCaptureSignalRecorder(inv, { maxBytes: captureSignalMaxBytes })
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
   // The bot's own commentary, teed beside the tape. Started HERE — before the browser launches —
@@ -291,6 +292,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
+      captureFaultTerminal: !!inv.attributedAudioEnabled,
       onFault: (stage, e) => {
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
       },
@@ -312,7 +314,22 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     ? { probeSecondary: () => pingRedis(inv.redisUrl) }
     : undefined;
 
-  const resources = createResourceMonitor({ log: (message) => console.log(message) });
+  const resources = createResourceMonitor({
+    log: (message) => console.log(message),
+    retained: () => {
+      const counts = recording?.resourceCounts();
+      const liveStt = botPipeline?.resourceCounts?.();
+      return {
+        recording_retained_bytes: counts?.retainedBytes ?? 0,
+        recording_queued_chunks: counts?.queuedChunks ?? 0,
+        ...(!liveSttEnabled(inv)
+          ? { live_stt_retained_state: 'disabled' }
+          : liveStt
+            ? { live_stt_retained_state: 'measured', live_stt_retained_bytes: liveStt.retainedPcmBytes }
+            : { live_stt_retained_state: 'unavailable' }),
+      };
+    },
+  });
   const orchestrator = createOrchestrator(inv, {
     lifecycle,
     join,

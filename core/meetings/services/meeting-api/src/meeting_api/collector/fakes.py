@@ -121,7 +121,7 @@ class InMemoryTranscriptStore:
         by-id read returns exactly that row's segments/notes. Mirrors the real store's viewer-aware
         response projection, ``viewer_is_owner`` included — the fake and the real store must agree on
         what a share recipient receives, since most of the suite drives the fake."""
-        from .projection import project_response_data
+        from .projection import project_response_data, project_transcript_recordings
 
         m = self._meetings[mid]
         by_id = dict(m["segments"])
@@ -146,7 +146,7 @@ class InMemoryTranscriptStore:
             "status": m["status"],
             "start_time": m["start_time"],
             "end_time": m["end_time"],
-            "recordings": m["data"].get("recordings", []),
+            "recordings": project_transcript_recordings(m["data"].get("recordings"), viewer_is_owner=viewer_is_owner),
             "notes": m["data"].get("notes"),
             "data": project_response_data(m["data"], viewer_is_owner=viewer_is_owner),
             "segments": [_segment_to_api(s) for s in segments],
@@ -717,22 +717,25 @@ class InMemoryTranscriptStore:
         data = dict(m.get("data") or {})
         prior = data.get("artifact_deletion") or {}
         already_deleted = bool(prior and prior.get("state", "completed") == "completed")
-        if not already_deleted:
-            data["artifact_deletion"] = {
-                "state": "pending",
-                "requested_at": prior.get("requested_at")
-                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "scope": "primary_transcript_and_recording_storage",
-                "backup_residuals": "expire_under_deployment_retention_policy",
-            }
-            m["data"] = data
+        cleanup_version = int(prior.get("cleanup_version") or 0) + 1
+        data["artifact_deletion"] = {
+            "state": "pending",
+            "requested_at": prior.get("requested_at")
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scope": "primary_transcript_and_recording_storage",
+            "backup_residuals": "expire_under_deployment_retention_policy",
+            "cleanup_version": cleanup_version,
+        }
+        m["data"] = data
         return {
             "meeting_id": meeting_id,
             "recordings": list(data.get("recordings") or []),
+            "attributed_audio_manifest": data.get("attributed_audio_manifest"),
+            "cleanup_version": cleanup_version,
             "already_deleted": already_deleted,
         }
 
-    async def finalize_completed_artifact_deletion(self, user_id, meeting_id):
+    async def finalize_completed_artifact_deletion(self, user_id, meeting_id, cleanup_plan=None):
         from datetime import datetime, timezone
 
         m = self._meetings.get(meeting_id)
@@ -740,15 +743,25 @@ class InMemoryTranscriptStore:
             return None
         if m["status"] not in ("completed", "failed"):
             return False
-        m["segments"] = {}
         data = dict(m.get("data") or {})
-        for key in ("recordings", "processed", "notes", "share_grants", "transcript_viewers"):
+        cleanup_plan = cleanup_plan or {}
+        deletion = data.get("artifact_deletion") or {}
+        if (deletion.get("state") != "pending"
+                or deletion.get("cleanup_version") != cleanup_plan.get("cleanup_version")):
+            return False
+        m["segments"] = {}
+        if data.get("recordings") == cleanup_plan.get("recordings"):
+            data.pop("recordings", None)
+        if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
+            data.pop("attributed_audio_manifest", None)
+        for key in ("processed", "notes", "share_grants", "transcript_viewers"):
             data.pop(key, None)
         data["artifact_deletion"] = {
             "state": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "scope": "primary_transcript_and_recording_storage",
             "backup_residuals": "expire_under_deployment_retention_policy",
+            "cleanup_version": cleanup_plan["cleanup_version"],
         }
         m["data"] = data
         if self._redis is not None:

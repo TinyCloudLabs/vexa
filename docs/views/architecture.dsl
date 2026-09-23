@@ -21,6 +21,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   module zoom-capture
   contract acts.v1
   contract captured-signal.v1
+  contract attributed-audio.v1
   contract flagged-issue.v1
   contract invocation.v1
   contract lifecycle.v1

@@ -5,6 +5,7 @@ S3/MinIO delete fails, the persisted paths remain addressable and the same reque
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from .ports import RecordingRepo, Storage
@@ -12,6 +13,22 @@ from .ports import RecordingRepo, Storage
 
 class MeetingNotTerminal(Exception):
     """The recording exists, but its meeting lifecycle may still produce more artifacts."""
+
+
+def _artifact_deletion(state: str, prior: Optional[dict] = None, *, cleanup_version: Optional[int] = None) -> dict:
+    """The shared tombstone/fence shape used by every completed-artifact delete path."""
+    value = {
+        "state": state,
+        "scope": "primary_transcript_and_recording_storage",
+        "backup_residuals": "expire_under_deployment_retention_policy",
+    }
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if state == "pending":
+        value["requested_at"] = (prior or {}).get("requested_at") or now
+    else:
+        value["completed_at"] = now
+    value["cleanup_version"] = cleanup_version if cleanup_version is not None else int((prior or {}).get("cleanup_version") or 0)
+    return value
 
 
 def _recording_prefix(recording: dict) -> Optional[str]:
@@ -57,6 +74,17 @@ async def delete_recording_objects(storage: Storage, recording: dict) -> list[st
     return keys
 
 
+async def delete_attributed_objects(storage: Storage, manifest: Optional[dict], *, user_id: int, meeting_id: int) -> list[str]:
+    """Delete only the attributed keys the owner-scoped durable ledger names."""
+    prefix = f"attributed-audio/{user_id}/{meeting_id}/"
+    keys = sorted({row.get("storage_path") for row in (manifest or {}).get("ranges", [])
+                   if isinstance(row, dict) and isinstance(row.get("storage_path"), str)
+                   and row["storage_path"].startswith(prefix)})
+    for key in keys:
+        await storage.delete(key)
+    return keys
+
+
 async def delete_owned_recording(
     repo: RecordingRepo, storage: Storage, *, user_id: int, recording_id: int
 ) -> Optional[dict]:
@@ -72,17 +100,61 @@ async def delete_owned_recording(
         raise MeetingNotTerminal
 
     meeting_id = int(recording["meeting_id"])
+    # This legacy endpoint deletes the same meeting artifacts as the newer completed-artifact
+    # path. Publish the durable write fence before touching storage so an old bot token cannot
+    # reserve, upload, or recreate attributed PCM while this delete is in flight.
+    def _prepare_artifact(data: dict):
+        next_data = dict(data)
+        prior = next_data.get("artifact_deletion")
+        version = int((prior or {}).get("cleanup_version") or 0) + 1
+        next_data["artifact_deletion"] = _artifact_deletion(
+            "pending", prior if isinstance(prior, dict) else None, cleanup_version=version,
+        )
+        # The legacy route is addressed by recording id.  Keep that retry handle inside the
+        # tombstone until its snapshot is known complete, so a late rejected PUT can restore the
+        # cleanup owner even after the first pass removed the public recording row.
+        next_data["artifact_deletion"]["legacy_recording"] = dict(recording)
+        return next_data, {
+            "manifest": next_data.get("attributed_audio_manifest"),
+            "cleanup_version": version,
+        }
+
+    cleanup_plan = await repo.mutate_meeting_data(meeting_id, _prepare_artifact)
+    manifest = cleanup_plan["manifest"]
     deleted_keys = await delete_recording_objects(storage, recording)
+    # Attributed PCM belongs to the same completed meeting artifact. Delete objects first so a
+    # storage fault leaves its manifest available for retry rather than lying about cleanup.
+    attributed_keys = await delete_attributed_objects(storage, manifest, user_id=user_id, meeting_id=meeting_id)
 
-    def _remove(current: list[dict]):
-        remaining = [r for r in current if r.get("id") != recording_id]
-        return remaining, len(remaining) != len(current)
+    # Complete only after every primary object was removed, and atomically remove the durable
+    # cleanup ledger with the recording metadata. A failed delete leaves pending + storage paths
+    # intact for the same endpoint to retry.
+    def _complete_artifact(data: dict):
+        next_data = dict(data)
+        deletion = next_data.get("artifact_deletion") or {}
+        # Storage was deleted from the plan above.  If a rejected late PUT restored a deterministic
+        # key after that snapshot, retain both its ledger and this pending tombstone for retry.
+        # Otherwise an object can outlive every durable cleanup owner.
+        if (deletion.get("state") != "pending"
+                or deletion.get("cleanup_version") != cleanup_plan["cleanup_version"]
+                or next_data.get("attributed_audio_manifest") != cleanup_plan["manifest"]):
+            return next_data, False
+        next_data["recordings"] = [r for r in next_data.get("recordings", []) if r.get("id") != recording_id]
+        next_data.pop("attributed_audio_manifest", None)
+        completed_deletion = _artifact_deletion(
+            "completed", deletion, cleanup_version=cleanup_plan["cleanup_version"],
+        )
+        completed_deletion["legacy_recording"] = dict(recording)
+        next_data["artifact_deletion"] = completed_deletion
+        return next_data, True
 
-    await repo.mutate_recordings(meeting_id, _remove)
+    completed = await repo.mutate_meeting_data(meeting_id, _complete_artifact)
+    if not completed:
+        raise RuntimeError("recording artifact cleanup changed after its storage snapshot; retry required")
     return {
         "status": "deleted",
         "recording_id": recording_id,
         "meeting_id": meeting_id,
-        "objects_deleted": len(deleted_keys),
+        "objects_deleted": len(deleted_keys) + len(attributed_keys),
         "scope": "primary_object_storage",
     }

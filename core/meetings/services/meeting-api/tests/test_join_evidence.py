@@ -479,21 +479,23 @@ def test_no_join_evidence_for_a_failure_after_admission():
 # ══ 5. surfacing — the evidence must survive the projections ═════════════════════════════════════
 
 
-def test_evidence_survives_the_list_view_projection():
-    """The list view drops the heavy forensics keys (``last_error`` among them — which is exactly
-    where the reason used to be buried). ``reason`` and ``join_evidence`` are small and must ride
-    along, or the failure stays unaggregatable from the list endpoint."""
+def test_evidence_is_owner_only_on_the_list_view_projection():
+    """A share recipient gets meeting content, not another user's terminal diagnostics."""
     assert "reason" not in LIST_OMIT_KEYS
     assert "join_evidence" not in LIST_OMIT_KEYS
-    projected = project_list_data({
+    source = {
         "reason": "host did not admit",
         "join_evidence": {"reason": "awaiting_admission_timeout", "attribution": "host_action"},
         "last_error": {"trace": "x" * 5000},
         "bot_logs": ["noise"] * 100,
-    })
-    assert projected["reason"] == "host did not admit"
-    assert projected["join_evidence"]["attribution"] == "host_action"
-    assert "last_error" not in projected and "bot_logs" not in projected
+    }
+    owner = project_list_data(source, viewer_is_owner=True)
+    assert owner["reason"] == "host did not admit"
+    assert owner["join_evidence"]["attribution"] == "host_action"
+    assert "last_error" not in owner and "bot_logs" not in owner
+    shared = project_list_data(source, viewer_is_owner=False)
+    assert "reason" not in shared and "join_evidence" not in shared
+    assert "last_error" not in shared and "bot_logs" not in shared
 
 
 @pytest.mark.parametrize("endpoint", ["/meetings", "/bots"])

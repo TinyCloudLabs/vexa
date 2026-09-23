@@ -427,8 +427,8 @@ async function runFixtures(): Promise<void> {
     check(`[${f.name}] stage = ${f.expectStage}`, ev?.stage === f.expectStage, `got ${ev?.stage}`);
     check(`[${f.name}] a human reason text is stamped (never null)`,
       typeof terminal.reason === 'string' && terminal.reason.length > 0);
-    check(`[${f.name}] the raw platform signal is preserved`,
-      typeof ev?.detail === 'string' && ev!.detail!.length > 0);
+    check(`[${f.name}] detail is the bounded terminal stage/code`,
+      ev?.detail === terminal.reason && !JSON.stringify(terminal).includes('https://'));
   }
 
   // The user-stop fixture takes the ABORT path: the join blocks in the lobby and a `leave` act
@@ -488,7 +488,8 @@ async function runFixtures(): Promise<void> {
       result.status === 'failed' && result.completionReason === 'join_failure');
     check('[fail-open] the exit code is unchanged', result.exitCode === 1);
     check('[fail-open] the terminal event still conforms', validateLifecycle(terminal) === true);
-    check('[fail-open] the human reason text still lands', terminal.reason?.includes('browser exploded') === true);
+    check('[fail-open] the bounded reason still lands',
+      terminal.reason === 'capture failed (stage=joining code=join_exception)');
     check('[fail-open] evidence degrades to a classification without signals, not to a throw',
       terminal.join_evidence === undefined || typeof terminal.join_evidence.reason === 'string');
   }

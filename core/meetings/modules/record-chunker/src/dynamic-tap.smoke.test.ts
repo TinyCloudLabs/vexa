@@ -54,16 +54,24 @@ class FakeSourceNode {
 }
 let sourcesCreated = 0;
 class FakeAudioContext {
+  static instances: FakeAudioContext[] = [];
+  static failDestination = false;
   state = 'running';
+  closeCalls = 0;
+  constructor() { FakeAudioContext.instances.push(this); }
   resume() { /* */ }
-  close() { (this as any).state = 'closed'; }
-  createMediaStreamDestination() { return { stream: new FakeMediaStream() }; }
+  close() { this.closeCalls++; (this as any).state = 'closed'; }
+  createMediaStreamDestination() {
+    if (FakeAudioContext.failDestination) throw new Error('private destination construction failure');
+    return { stream: new FakeMediaStream() };
+  }
   createMediaStreamSource(s: any) { sourcesCreated++; return new FakeSourceNode(s); }
 }
 (globalThis as any).AudioContext = FakeAudioContext;
 
 class FakeMediaRecorder {
   static instances: FakeMediaRecorder[] = [];
+  static failStart = false;
   static isTypeSupported(mime: string) { return mime === 'audio/webm;codecs=opus'; }
   onstart: (() => void) | null = null;
   ondataavailable: ((e: any) => void) | null = null;
@@ -74,7 +82,10 @@ class FakeMediaRecorder {
     this.mimeType = opts?.mimeType ?? '';
     FakeMediaRecorder.instances.push(this);
   }
-  start(_ts?: number) { this.state = 'recording'; this.onstart?.(); }
+  start(_ts?: number) {
+    if (FakeMediaRecorder.failStart) throw new Error('MediaRecorder start unavailable');
+    this.state = 'recording'; this.onstart?.();
+  }
   stop() { this.state = 'inactive'; this.onstop?.(); }
 }
 (globalThis as any).MediaRecorder = FakeMediaRecorder;
@@ -143,6 +154,62 @@ async function main() {
   const before = connected.length;
   await sleep(RESCAN * 3);
   check(connected.length === before, 'stop: rescan halted (no attach after stop)');
+
+  // A failed final delivery must still release every page-side recording owner.  This drives the
+  // real createRecordingTap composition rather than stopping a mixer in isolation.
+  pageElements.length = 0;
+  pageElements.push(new FakeMediaElement(new FakeMediaStream()));
+  const failedTap = createRecordingTap({
+    rescanMs: RESCAN, timesliceMs: 1000, onChunk: (chunk) => !chunk.isFinal,
+  });
+  await failedTap.start();
+  await sleep(RESCAN * 2);
+  let stopRejected = false;
+  try { await failedTap.stop(); } catch { stopRejected = true; }
+  const failedCounts = failedTap.releaseCounts?.();
+  await sleep(RESCAN * 2);
+  check(stopRejected && !!failedCounts
+    && failedCounts.mixers === 0 && failedCounts.contexts === 0 && failedCounts.sources === 0
+    && failedCounts.listeners === 0 && failedCounts.intervals === 0 && failedCounts.retainedReferences === 0
+    && connected.length === 0,
+  'failed stop: finally releases mixer/context/sources/listeners/intervals/references');
+
+  // Startup owns the mixer before MediaRecorder.start can reject. It must unwind the same graph
+  // immediately, and a later pipeline stop must be an idempotent no-op rather than closing twice.
+  pageElements.length = 0;
+  pageElements.push(new FakeMediaElement(new FakeMediaStream()));
+  const contextsBeforeStartFailure = FakeAudioContext.instances.length;
+  FakeMediaRecorder.failStart = true;
+  const rejectedStartTap = createRecordingTap({
+    rescanMs: RESCAN, timesliceMs: 1000, onChunk: () => true,
+  });
+  let startRejected = false;
+  try { await rejectedStartTap.start(); } catch { startRejected = true; }
+  FakeMediaRecorder.failStart = false;
+  const failedStartCounts = rejectedStartTap.releaseCounts?.();
+  const failedStartContext = FakeAudioContext.instances[contextsBeforeStartFailure];
+  await rejectedStartTap.stop();
+  check(startRejected && !!failedStartCounts
+    && failedStartCounts.mixers === 0 && failedStartCounts.contexts === 0 && failedStartCounts.sources === 0
+    && failedStartCounts.listeners === 0 && failedStartCounts.intervals === 0 && failedStartCounts.retainedReferences === 0
+    && connected.length === 0 && failedStartContext?.closeCalls === 1,
+  'failed start: releases mixer resources and closes its context exactly once before pipeline stop');
+
+  // The destination allocation is after AudioContext allocation. Its failure used to strand that
+  // context because the mixer was never returned to createRecordingTap's catch/finally owner.
+  const destinationContextsBefore = FakeAudioContext.instances.length;
+  FakeAudioContext.failDestination = true;
+  const destinationFailureTap = createRecordingTap({ rescanMs: RESCAN, onChunk: () => true });
+  let destinationRejected = false;
+  try { await destinationFailureTap.start(); } catch { destinationRejected = true; }
+  FakeAudioContext.failDestination = false;
+  const destinationContext = FakeAudioContext.instances[destinationContextsBefore];
+  const destinationCounts = destinationFailureTap.releaseCounts?.();
+  check(destinationRejected && FakeAudioContext.instances.length === destinationContextsBefore + 1
+    && destinationContext?.closeCalls === 1 && !!destinationCounts
+    && destinationCounts.contexts === 0 && destinationCounts.sources === 0
+    && destinationCounts.intervals === 0 && destinationCounts.retainedReferences === 0,
+  'destination failure: every allocated context is closed and release telemetry returns to zero');
 
   // Video-only Meet tiles must not create a new capture track on every rescan.
   pageElements.length = 0;

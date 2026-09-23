@@ -38,7 +38,7 @@ import {
   type TurnSourceObservation,
 } from '@vexa/mixed-pipeline';
 import { TranscriptionClient, type TranscriptionResult } from '@vexa/transcribe-whisper';
-import { isMixedLanePlatform, isPerTrackLanePlatform, type Invocation, type Platform } from './config.js';
+import { isMixedLanePlatform, isPerTrackLanePlatform, liveSttEnabled, type Invocation, type Platform } from './config.js';
 import type { TranscriptSegment } from './contracts.js';
 import type { Pipeline, TranscriptSink } from './ports.js';
 
@@ -85,7 +85,7 @@ export type TeamsTranscriber = Pick<
   | 'recordRosterName'
   | 'recordRosterCoverage'
   | 'dispose'
->;
+> & Partial<Pick<TeamsCsrcGmeetPipeline, 'resourceCounts'>>;
 export type TeamsTranscriberFactory = (options: TeamsCsrcGmeetPipelineOptions) => TeamsTranscriber;
 
 /** The Pipeline port extended with the capture entry the bridge pumps frames into. The
@@ -116,6 +116,22 @@ export interface BotPipeline extends Pipeline {
   recordRosterCoverage?(named: number, participants: number, tMs?: number): void;
   /** Mixed lane only: the cumulative hint-hop counters (undefined on the gmeet lane). */
   readonly hintCounters?: HintCounters;
+  /** Present only where the selected live-STT pipeline exposes an owned PCM measurement. */
+  resourceCounts?(): { retainedPcmBytes: number };
+}
+
+/** Recording-only meetings still capture page audio, but have no business creating turn timers,
+ * transcription queues, prompts, or PCM windows. Keep this at the composition boundary so the
+ * live-STT implementation never has to carry a disabled-mode branch. */
+function createRecordingOnlyPipeline(): BotPipeline {
+  return {
+    async start() { /* capture/recording own their own lifecycle */ },
+    async stop() { /* no STT state was allocated */ },
+    feedAudio() { /* intentionally discard PCM after the recording tap has consumed it */ },
+    feedMixedAudio() { /* intentionally discard PCM */ },
+    recordHint() { /* no transcript attribution without live STT */ },
+    hintCounters: { received: 0, matched: 0, missed: 0 },
+  };
 }
 
 /** The lane segments are the SEALED transcript.v1 view — structurally identical to the bot's
@@ -295,6 +311,7 @@ function createGmeetBotPipeline(
     feedAudio: (channel, glowName, pcm, tsMs) => lane.feedAudio(channel, glowName, pcm, tsMs),
     feedMixedAudio() { /* not the gmeet lane */ },
     recordHint() { /* not the gmeet lane */ },
+    resourceCounts: () => lane.resourceCounts(),
   };
 }
 
@@ -343,6 +360,7 @@ function createTeamsBotPipeline(
     recordRosterName: (name, tMs) => transcriber.recordRosterName(name, tMs),
     recordRosterCoverage: (named, participants, tMs) => transcriber.recordRosterCoverage(named, participants, tMs),
     hintCounters,
+    ...(transcriber.resourceCounts ? { resourceCounts: () => transcriber.resourceCounts!() } : {}),
   };
 }
 
@@ -452,7 +470,7 @@ function createMixedBotPipeline(
  *  the lane never knows about config. transcribeEnabled=false ⇒ a no-op transcribe (the engine
  *  still runs turn gating but emits empty text; recording-only meetings need no STT). */
 export function createTranscribe(inv: Invocation): Transcribe {
-  if (inv.transcribeEnabled === false || !inv.transcriptionServiceUrl) {
+  if (!liveSttEnabled(inv) || !inv.transcriptionServiceUrl) {
     return async () => ({ text: '', language: inv.language ?? 'en', duration: 0, segments: [] });
   }
   const client = new TranscriptionClient({
@@ -497,6 +515,7 @@ export function createBotPipeline(
     onObservation?: (source: string, obs: Record<string, unknown>, tMs?: number) => void;
   } = {},
 ): BotPipeline {
+  if (!liveSttEnabled(inv)) return createRecordingOnlyPipeline();
   const transcribe = opts.transcribe ?? createTranscribe(inv);
   if (inv.platform === 'teams') {
     return createTeamsBotPipeline(
@@ -516,25 +535,18 @@ export function createBotPipeline(
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */
-export type LiveStage = 'capture-start' | 'recording-start' | 'engine-start';
+export type LiveStage = 'capture-start' | 'capture-stop' | 'recording-start' | 'engine-start';
 
-/**
- * Serialize a thrown value for a LOG LINE (#593 A1). Prefer the stack (names the throwing frame),
- * else `name: message`, else a safe JSON — NEVER `String(e)` (a DOM Event → "[object Event]", the
- * exact fidelity loss that hid the real #593 throw) and never bare `JSON.stringify` (throws on cycles).
- */
-export function serr(e: unknown): string {
-  const x = e as { message?: string; stack?: string; name?: string } | null | undefined;
-  if (x?.stack) return x.stack;
-  if (x?.message) return `${x.name ?? 'Error'}: ${x.message}`;
-  try { return `non-error throw: ${JSON.stringify(e)}`; }
-  catch { return `non-error throw: ${String(e)}`; }
+/** Error values can contain page URLs, transcript text, PCM metadata, credential-bearing bodies,
+ * or stack paths. Keep terminal-adjacent logs to the stable fault vocabulary. */
+export function serr(_e: unknown): string {
+  return 'code=operation_failed';
 }
 
 export interface LivePipelineDeps {
   /** Attach the page-side capture; returns its teardown. Best-effort — a throw DEGRADES, never evicts. */
   startCapture: () => Promise<() => Promise<void>>;
-  /** Attach the page-side recording (optional); returns its teardown. Best-effort. */
+  /** Attach the requested page-side recording; returns its teardown. */
   startRecording?: () => Promise<() => Promise<void>>;
   /** The transcription engine (the BotPipeline). Its start() failure is non-fatal + retried. */
   engine: Pipeline;
@@ -542,6 +554,9 @@ export interface LivePipelineDeps {
   onFault: (stage: LiveStage, e: unknown) => void;
   /** Bounded retry for engine start (the pyannote model load). Default 3 attempts, 2s apart. */
   retry?: { attempts: number; delayMs: number };
+  /** An enabled attributed producer makes capture initialization/close part of the artifact
+   * contract. Its fault is recoverable while active, but terminal success is forbidden. */
+  captureFaultTerminal?: boolean;
 }
 
 /**
@@ -569,6 +584,14 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   let stopRecording: (() => Promise<void>) | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  // Active-phase capture faults are recoverable while the bot is seated, but they are not a
+  // successful artifact outcome.  Keep the first cause through every cleanup step and make the
+  // orchestrator's terminal lifecycle/exit truthful after teardown completes.
+  let terminalFault: unknown = null;
+  const captureFault = (stage: LiveStage, error: unknown): void => {
+    if (deps.captureFaultTerminal && terminalFault === null) terminalFault = error;
+    onFault(stage, error);
+  };
 
   // Engine start with bounded background retry: the FIRST attempt is awaited by start() (so start()
   // resolves promptly — the bot is already seated); later attempts fire on a timer without ever
@@ -597,16 +620,22 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
         if (stopped) await stop().catch(() => { /* stop won while capture was attaching */ });
         else stopCapture = stop;
       }
-      catch (e) { if (!stopped) onFault('capture-start', e); }
+      catch (e) { if (!stopped) captureFault('capture-start', e); }
       if (stopped) return;
-      // recording-start — best-effort.
+      // A requested recording that never starts is not a successful recording meeting. Keep the
+      // bot seated for orderly cleanup, but retain this fault for its terminal lifecycle outcome.
       if (startRecording) {
         try {
           const stop = await startRecording();
           if (stopped) await stop().catch(() => { /* stop won while recording was attaching */ });
           else stopRecording = stop;
         }
-        catch (e) { if (!stopped) onFault('recording-start', e); }
+        catch (e) {
+          if (!stopped) {
+            if (terminalFault === null) terminalFault = e;
+            onFault('recording-start', e);
+          }
+        }
       }
       if (stopped) return;
       // engine-start — non-fatal degrade + bounded retry (the pyannote model load; #593 root cause).
@@ -617,10 +646,21 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       const sc = stopCapture; stopCapture = null;
-      if (sc) await sc().catch(() => { /* best-effort — page may be closing */ });
+      if (sc) await sc().catch((e) => { captureFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;
-      if (sr) await sr().catch(() => { /* best-effort — flush the final chunk → master assembly */ });
+      let recordingFailure: unknown;
+      if (sr) {
+        try { await sr(); }
+        catch (error) {
+          recordingFailure = error;
+          captureFault('recording-start', error);
+        }
+      }
       await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
+      // An incomplete MediaRecorder delivery is not a degraded successful meeting. The
+      // orchestrator converts this to a failed terminal lifecycle event after all cleanup.
+      if (terminalFault !== null) throw terminalFault;
+      if (recordingFailure) throw recordingFailure;
     },
   };
 }

@@ -38,6 +38,7 @@ delivery after a read has been served.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,11 +47,13 @@ from meeting_api.collector import create_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.projection import (
     OWNER_ONLY_KEYS,
+    RESPONSE_MAX_SERIALIZED_BYTES,
     RESPONSE_OMIT_KEYS,
     SENSITIVE_OMIT_KEYS,
     is_sensitive_key,
     project_list_data,
     project_response_data,
+    project_transcript_recordings,
 )
 
 OWNER, VIEWER, STRANGER, WS_MEMBER = 41, 42, 43, 44
@@ -72,6 +75,9 @@ ROW_DATA = {
     # tier 1 — credential material, nobody's to read
     "webhook_secret": SECRET,
     "auth_userdata_path": USERDATA,
+    "attributed_audio_manifest": {"ranges": [{"storage_path": "attributed-audio/41/1/private.pcm"}]},
+    "artifact_deletion": {"state": "pending", "cleanup_version": 7},
+    "recordings": [{"media_files": [{"storage_path": "recordings/41/1/private.wav"}]}],
 }
 
 # Keys a reader may legitimately see — asserted present so the projection is proven to be a strip of
@@ -151,6 +157,66 @@ def test_owner_keeps_their_webhook_config_on_the_meeting_detail():
     data = client.get(f"/meetings/{_mid(store)}", headers={"x-user-id": str(OWNER)}).json()["data"]
     _assert_owner_private_present(data, where="GET /meetings/{id} (owner)")
     _assert_no_credentials(data, where="GET /meetings/{id} (owner)")
+
+
+def test_generic_meeting_projections_never_ship_attributed_cleanup_or_nonowner_storage_paths():
+    store, client = _client()
+    meeting_id = _mid(store)
+    owner_detail = client.get(f"/meetings/{meeting_id}", headers={"x-user-id": str(OWNER)}).json()["data"]
+    owner_list = client.get("/meetings", headers={"x-user-id": str(OWNER)}).json()["meetings"][0]["data"]
+    assert "attributed_audio_manifest" not in owner_detail
+    assert "artifact_deletion" not in owner_detail
+    assert "attributed_audio_manifest" not in owner_list
+    assert "artifact_deletion" not in owner_list
+
+    _share_with(client, VIEWER)
+    shared_detail = client.get(f"/meetings/{meeting_id}", headers={"x-user-id": str(VIEWER)}).json()["data"]
+    shared_list = client.get("/meetings", headers={"x-user-id": str(VIEWER)}).json()["meetings"][0]["data"]
+    for data in (shared_detail, shared_list):
+        assert "attributed_audio_manifest" not in data
+        assert "artifact_deletion" not in data
+        assert "recordings" not in data
+        assert "storage_path" not in repr(data)
+
+
+def test_share_projection_recursively_removes_and_bounds_diagnostic_siblings():
+    """A future producer cannot hide terminal blobs under a harmless-looking custom key."""
+    marker = "Bearer private-token s3://bucket/private.pcm transcript words"
+    data = {
+        **ROW_DATA,
+        "custom": {
+            "bot_logs": [marker] * 10_000,
+            "nested": {"join_evidence": {"detail": marker, "reason": marker}},
+            "ordinary": list(range(20)),
+        },
+        "last_error": {"error_details": marker},
+        "status_transition": [{"reason": marker}] * 10_000,
+    }
+    projected = project_response_data(data, viewer_is_owner=False)
+    assert marker not in repr(projected)
+    assert "last_error" not in projected and "status_transition" not in projected
+    assert "bot_logs" not in projected["custom"]
+    assert "join_evidence" not in projected["custom"]["nested"]
+    assert projected["custom"]["ordinary"] == list(range(12, 20))
+    assert len(repr(projected)) < 10_000
+
+
+def test_owner_projection_sanitizes_persisted_diagnostics_and_capability():
+    marker = "PRIVATE_TRANSCRIPT https://private.example Authorization: Bearer secret provider body"
+    data = {
+        "bot_logs": [marker] * 10_000,
+        "last_error": {"error_details": marker, "nested": {"detail": marker}},
+        "attributed_audio_capability": {"requested_version": 1, "supported_version": 1,
+                                        "status": "supported", "provider_body": marker},
+    }
+    projected = project_response_data(data, viewer_is_owner=True)
+    assert marker not in repr(projected)
+    assert len(projected["bot_logs"]) == 32
+    assert projected["attributed_audio_capability"] == {
+        "requested_version": 1, "supported_version": 1, "status": "supported",
+    }
+    shared = project_response_data(data, viewer_is_owner=False)
+    assert shared["attributed_audio_capability"] == projected["attributed_audio_capability"]
 
 
 @pytest.mark.parametrize("path_for", [
@@ -233,6 +299,26 @@ def test_share_recipient_gets_no_owner_private_keys_from_the_transcript_detail()
     _assert_no_credentials(r.json()["data"], where="GET /transcripts/by-id (share recipient)")
 
 
+def test_share_recipient_gets_only_bounded_recording_summaries_from_transcript():
+    """The legacy top-level field is a response edge too, not an escape hatch around ``data``."""
+    rows = [
+        {"id": f"r-{n}", "status": "completed", "storage_path": f"s3://private/{n}",
+         "manifest": {"object_key": f"recordings/private/{n}"},
+         "media_files": [{"storage_path": f"recordings/private/{n}.webm"}]}
+        for n in range(60)
+    ]
+    store, client = _client({**ROW_DATA, "recordings": rows})
+    _share_with(client, VIEWER)
+    shared = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(VIEWER)})
+    owner = client.get(f"/transcripts/by-id/{_mid(store)}", headers={"x-user-id": str(OWNER)})
+    assert shared.status_code == owner.status_code == 200
+    assert owner.json()["recordings"] == rows[:50], "owner recordings are explicitly bounded"
+    summaries = shared.json()["recordings"]
+    assert len(summaries) == 50
+    assert summaries[0] == {"id": "r-0", "status": "completed"}
+    assert "private" not in repr(summaries) and "manifest" not in repr(summaries)
+
+
 def test_bound_workspace_member_is_not_the_owner_either():
     """The third branch of the access union. Membership authorizes the meeting, not the owner's
     configuration — ``shared`` is true for them too."""
@@ -310,6 +396,52 @@ def test_credential_shaped_keys_are_dropped_by_default_for_the_owner_too():
     keep = {"token_count": 12, "secret_santa_notes": "x", "tokens_used": 3}
     assert project_response_data(keep, viewer_is_owner=True) == keep
     assert project_response_data(keep) == keep
+
+
+def test_nested_credentials_and_internal_artifacts_are_omitted_for_every_projection():
+    """Key-shaped secrets are omitted recursively even when their values look harmless."""
+    data = {
+        "title": "useful title",
+        "diagnostic": {
+            "api_key": "alpha", "access_token": "bravo", "token": "charlie",
+            "authorization": "delta", "secret_hash": "echo", "db_password": "foxtrot",
+            "nested": {
+                "auth_userdata_path": "session-ref",
+                "attributed_audio_manifest": {"ranges": [{"storage_path": "object-ref"}]},
+                "phase": "capture", "attempt": 2,
+            },
+        },
+    }
+    for project in (project_response_data, project_list_data):
+        for owner in (True, False):
+            projected = project(data, viewer_is_owner=owner)
+            rendered = repr(projected)
+            for forbidden in ("api_key", "access_token", "token", "authorization", "secret_hash",
+                              "db_password", "auth_userdata_path", "attributed_audio_manifest",
+                              "storage_path", "alpha", "bravo", "charlie", "delta", "echo",
+                              "foxtrot", "session-ref", "object-ref"):
+                assert forbidden not in rendered, (project.__name__, owner, forbidden, projected)
+            assert projected["diagnostic"]["nested"] == {"phase": "capture", "attempt": 2}
+
+
+def test_projection_limits_are_small_and_deterministic_for_untrusted_shapes():
+    huge = {f"diagnostic_{i:05d}": "x" * 1024 for i in range(10_000)}
+    huge["k" * 10_000] = "oversized key"
+    data = {"title": "still useful", "custom": huge}
+    first = project_response_data(data, viewer_is_owner=True)
+    second = project_response_data(data, viewer_is_owner=True)
+    assert first == second
+    assert len(json.dumps(first, separators=(",", ":")).encode()) <= RESPONSE_MAX_SERIALIZED_BYTES
+    assert "k" * 10_000 not in repr(first)
+    assert first["title"] == "still useful"
+
+
+def test_recording_summary_strings_share_the_projection_ceiling():
+    recordings = [{"id": "rec-1", "status": "s" * 1_000_000, "media_type": "audio"}]
+    for owner in (True, False):
+        projected = project_transcript_recordings(recordings, viewer_is_owner=owner)
+        assert len(json.dumps(projected, separators=(",", ":")).encode()) <= RESPONSE_MAX_SERIALIZED_BYTES
+        assert projected[0]["status"] == "s" * 1024
 
 
 def test_response_omissions_cover_the_delivery_paths_internal_keys():

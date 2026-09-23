@@ -69,11 +69,18 @@ async function main(): Promise<void> {
     const sink = captureSink();
     const pipe = createBotPipeline(baseInv(), sink, { transcribe, config: FAST });
     await pipe.start();
+    check('enabled live STT begins with no retained PCM', pipe.resourceCounts?.().retainedPcmBytes === 0,
+      JSON.stringify(pipe.resourceCounts?.()));
 
     let ts = 1000;
-    for (let i = 0; i < 12; i++) { pipe.feedAudio(0, 'Alice', FRAME, ts); ts += FRAME_MS; await sleep(110); }
+    pipe.feedAudio(0, 'Alice', FRAME, ts); ts += FRAME_MS;
+    check('enabled live STT retained-byte telemetry rises from its actual PCM owner',
+      (pipe.resourceCounts?.().retainedPcmBytes ?? 0) >= FRAME.byteLength, JSON.stringify(pipe.resourceCounts?.()));
+    for (let i = 0; i < 11; i++) { pipe.feedAudio(0, 'Alice', FRAME, ts); ts += FRAME_MS; await sleep(110); }
     await sleep(300);
     await pipe.stop();   // dispose → flush every turn → finalize
+    check('enabled live STT retained-byte telemetry returns to zero on stop', pipe.resourceCounts?.().retainedPcmBytes === 0,
+      JSON.stringify(pipe.resourceCounts?.()));
 
     const seg = sink.published.find((s) => s.speaker === 'Alice' && s.completed);
     check('stt port was driven (lane→transcribe wired)', calls >= 2, `calls=${calls}`);
@@ -186,6 +193,24 @@ async function main(): Promise<void> {
     for (let i = 0; i < 6; i++) { pipe.feedAudio(0, 'Alice', FRAME, ts); ts += FRAME_MS; await sleep(60); }
     await pipe.stop();
     check('transcribe disabled: pipeline runs without throwing, emits no text', sink.published.every((s) => s.text === ''), JSON.stringify(sink.published));
+    check('transcribe disabled: no live-STT resource owner is allocated', pipe.resourceCounts === undefined);
+  }
+
+  // Canonical attributed Meet PCM is deferred evidence. It must not also allocate a live STT
+  // lane when a caller omitted transcription settings or explicitly requested them.
+  for (const transcribeEnabled of [undefined, true] as const) {
+    let calls = 0;
+    const sink = captureSink();
+    const pipe = createBotPipeline(baseInv({ transcribeEnabled, attributedAudioEnabled: true }), sink, {
+      config: FAST,
+      transcribe: async () => { calls++; return { text: 'must not publish', language: 'en', duration: 0, segments: [] }; },
+    });
+    await pipe.start();
+    pipe.feedAudio(0, 'Alice', FRAME, 1_000);
+    await pipe.stop();
+    check(`attributed Meet (${String(transcribeEnabled)}): synthetic PCM makes no STT calls or publications`,
+      calls === 0 && sink.published.length === 0 && pipe.resourceCounts === undefined,
+      JSON.stringify({ calls, published: sink.published.length, resources: pipe.resourceCounts?.() }));
   }
 
   // ── 4) createTranscribe threads invocation.transcriptionModel → the STT wire (#522) ──

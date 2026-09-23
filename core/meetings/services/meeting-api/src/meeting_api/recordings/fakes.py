@@ -103,6 +103,31 @@ class InMemoryRecordingRepo:
         self._meetings[meeting_id]["recordings"] = list(new_recordings)
         return result
 
+    async def mutate_meeting_data(self, meeting_id: int, mutator):
+        self._meetings.setdefault(meeting_id, {"user_id": None, "recordings": []})
+        meeting = self._meetings[meeting_id]
+        data = dict(meeting.get("data") or {})
+        next_data, result = mutator(data)
+        meeting["data"] = dict(next_data)
+        # Production stores recordings in this same JSONB document. Older focused fixtures keep a
+        # convenient top-level mirror, so retain that mirror when a complete-data mutation changes
+        # the durable recordings list.
+        if "recordings" in next_data:
+            meeting["recordings"] = list(next_data["recordings"])
+        return result
+
+    async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
+        meeting = self._meetings.get(meeting_id)
+        if not meeting or meeting.get("user_id") != user_id:
+            return None
+        data = meeting.get("data") or {}
+        value = data.get("attributed_audio_manifest")
+        return {
+            "manifest": dict(value) if isinstance(value, dict) else None,
+            "artifact_deletion": dict(data["artifact_deletion"])
+            if isinstance(data.get("artifact_deletion"), dict) else None,
+        }
+
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")
 

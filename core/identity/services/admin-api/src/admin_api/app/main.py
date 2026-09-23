@@ -266,7 +266,7 @@ _SETUP_FIELDS = ("models", "transcription", "completed")
 # "diagnostics" carries the operator kill switches for capture-side telemetry. Today one field:
 # capture_signal — whether a spawned bot tees its raw captured-signal.v1 stream to durable storage
 # (the offline-replay fixture tape). It is the ONLY control-plane knob on fixture collection, and it
-# is a KILL switch, not an enable switch: absence means ON everywhere (see _resolve_capture_signal).
+# is an explicit diagnostic opt-in: absence and malformed values remain OFF (see _resolve_capture_signal).
 # Written as a STRING like every other settings field ("false" to disable, "" to clear back to the
 # default) because _validate_config_fields' one rulebook is string-only.
 _DIAGNOSTICS_FIELDS = ("capture_signal",)
@@ -400,18 +400,17 @@ def _as_flag(value) -> Optional[bool]:
 
 
 def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool:
-    """Whether this user's bots tee the captured-signal tape: user > platform_settings > DEFAULT ON.
+    """Whether this user's bots explicitly opt into captured-signal diagnostics.
 
-    DEFAULT ON is the product decision, not an accident of config: prod meetings are the fixture
-    source, so absence of any flag means capture. The flag exists to STOP collection fleet-wide with
-    no redeploy (``PUT /internal/settings/diagnostics {"capture_signal": "false"}``), and per-user
-    (``users.data["diagnostics"]["capture_signal"]``) for an account that must not be taped.
+    User settings may disable or enable the diagnostic; otherwise a typed platform ``true`` enables
+    it. Empty, absent, and malformed settings are disabled: diagnostics must never become a
+    production allocation merely because an older or partial settings service omitted a field.
     """
     for source in (user_data.get("diagnostics") or {}, platform_diagnostics or {}):
         flag = _as_flag(source.get("capture_signal") if isinstance(source, dict) else None)
         if flag is not None:
             return flag
-    return True
+    return False
 
 
 def create_app() -> FastAPI:

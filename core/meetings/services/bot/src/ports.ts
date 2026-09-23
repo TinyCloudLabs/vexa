@@ -152,6 +152,12 @@ export interface AlonenessSource {
  * a serialized retry backlog cannot prevent the platform leave or terminal lifecycle event. */
 export interface RecordingSink {
   close(key: string): void | Promise<void>;
+  /**
+   * Invalidate a partially-produced recording before teardown.  A sink that implements this
+   * must refuse to synthesize its successful final marker after capture/engine shutdown failed.
+   * Optional keeps the core compatible with recording adapters that cannot own finalization.
+   */
+  abort?(reason: unknown): void;
 }
 
 /** One captured-signal.v1 frame as it crosses the capture-bridge tap — the VERBATIM raw

@@ -15,12 +15,72 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any, Dict, List, Optional
 
 
 # Cap forensics so a runaway ring-buffer can't bloat meeting.data (parent callbacks.py caps
 # bot_logs at 50 KiB, trimming the OLDEST lines first). 50 * 1024 bytes.
 _BOT_LOGS_BYTE_BUDGET = 50 * 1024
+_DIAGNOSTIC_TEXT_LIMIT = 512
+_DIAGNOSTIC_DEPTH_LIMIT = 4
+_DIAGNOSTIC_ITEMS_LIMIT = 32
+_UNSAFE_DIAGNOSTIC = re.compile(
+    r"private[_ -]?transcript|authorization|provider[-_ ]?body|bearer\s+|https?://|\b(?:s3|gs)://",
+    re.IGNORECASE,
+)
+_DURABLE_OMIT_KEYS = frozenset({
+    "webhook_secret", "webhook_secrets", "share_grants", "auth_userdata_path",
+    "attributed_audio_manifest", "artifact_deletion",
+})
+_CREDENTIAL_KEY_SUFFIXES = (
+    "secret", "secrets", "token", "tokens", "password", "credential", "credentials",
+    "api_key", "apikey", "private_key", "signing_key", "access_key", "authorization",
+)
+
+
+def _is_credential_key(key: str) -> bool:
+    """Omit credential-shaped producer keys before diagnostics reach durable JSONB."""
+    lowered = key.lower()
+    return (lowered in _DURABLE_OMIT_KEYS
+            or any(lowered == suffix or lowered.endswith("_" + suffix)
+                   for suffix in _CREDENTIAL_KEY_SUFFIXES)
+            or lowered.startswith(("secret_hash", "secret_value", "password_", "credential_", "authorization_")))
+
+
+def _safe_diagnostic_text(value: Any, *, limit: int = _DIAGNOSTIC_TEXT_LIMIT) -> str:
+    """Keep diagnostics useful without retaining content/transport secrets."""
+    text = value if isinstance(value, str) else str(value)
+    if _UNSAFE_DIAGNOSTIC.search(text):
+        return "[redacted diagnostic]"
+    if len(text) > limit:
+        return text[:limit] + " [truncated]"
+    return text
+
+
+def _sanitize_diagnostic(value: Any, *, depth: int = 0) -> Any:
+    """Bound and redact a producer-controlled diagnostic before it reaches durable data."""
+    if depth >= _DIAGNOSTIC_DEPTH_LIMIT:
+        return "[truncated diagnostic]"
+    if isinstance(value, str):
+        return _safe_diagnostic_text(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) < 10**15 else None
+    if isinstance(value, dict):
+        clean: Dict[str, Any] = {}
+        for key, item in list(value.items())[:_DIAGNOSTIC_ITEMS_LIMIT]:
+            if (not isinstance(key, str) or _UNSAFE_DIAGNOSTIC.search(key)
+                    or _is_credential_key(key)):
+                continue
+            clean[_safe_diagnostic_text(key, limit=96)] = _sanitize_diagnostic(item, depth=depth + 1)
+        return clean
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_diagnostic(item, depth=depth + 1) for item in list(value)[-_DIAGNOSTIC_ITEMS_LIMIT:]]
+    return "[redacted diagnostic]"
 
 
 class BotStatus(str, Enum):
@@ -185,13 +245,14 @@ def _trim_bot_logs(lines: List[str]) -> tuple[List[str], bool]:
     """
     kept: List[str] = []
     used = 0
-    for line in reversed(lines):
+    for raw_line in reversed(lines[-_DIAGNOSTIC_ITEMS_LIMIT:]):
+        line = _safe_diagnostic_text(raw_line)
         size = len(line.encode("utf-8")) + 1  # +1 for the implicit newline
         if used + size > _BOT_LOGS_BYTE_BUDGET and kept:
             return list(reversed(kept)), True
         kept.append(line)
         used += size
-    return list(reversed(kept)), False
+    return list(reversed(kept)), len(lines) > _DIAGNOSTIC_ITEMS_LIMIT
 
 
 #: Stages at which the bot had NOT yet reported reaching the waiting room. Used to answer
@@ -235,7 +296,7 @@ def _capture_join_evidence(
             return None
         stage = rec.failure_stage.value if rec.failure_stage is not None else None
         return evidence_from_event(
-            event, stage=stage, reached_lobby=reached_lobby, reason_text=rec.reason
+            event, stage=stage, reached_lobby=reached_lobby, reason_text=event.get("reason")
         )
     except Exception:  # noqa: BLE001 — evidence is a report about a finished run; never fail on it
         return None
@@ -294,6 +355,8 @@ class MeetingRecord:
     #: `join_evidence.JoinFailureReason` plus the stage, the stage timings, and the platform's own
     #: signal. Set on a `failed` terminal only; see `data` below for how it lands in the JSONB.
     join_evidence: Optional[Dict[str, Any]] = None
+    #: Bot-emitted acknowledgement of the requested attributed-audio producer contract.
+    attributed_audio_capability: Optional[Dict[str, Any]] = None
     # User intent (parent's `meeting.data.stop_requested`) — set by the DELETE/stop path, read
     # first by the exit classifier so a user stop is never mis-attributed as a failure.
     stop_requested: bool = False
@@ -334,22 +397,24 @@ class MeetingRecord:
         if self.reason is not None:
             d["reason"] = self.reason
         if self.join_evidence is not None:
-            d["join_evidence"] = dict(self.join_evidence)
+            d["join_evidence"] = _sanitize_diagnostic(self.join_evidence)
         if self.error_details is not None:
             d["last_error"] = {
                 "exit_code": self.exit_code,
-                "reason": self.reason,
-                "error_details": self.error_details,
+                "reason": _safe_diagnostic_text(self.reason),
+                "error_details": _safe_diagnostic_text(self.error_details),
             }
         if self.bot_logs is not None:
             d["bot_logs"] = list(self.bot_logs)
             d["bot_logs_truncated"] = self.bot_logs_truncated
         if self.bot_resources is not None:
-            d["bot_resources"] = dict(self.bot_resources)
+            d["bot_resources"] = _sanitize_diagnostic(self.bot_resources)
         if self.stop_requested:
             d["stop_requested"] = True
         if self.stt_fault is not None:
-            d["stt_fault"] = dict(self.stt_fault)
+            d["stt_fault"] = _sanitize_diagnostic(self.stt_fault)
+        if self.attributed_audio_capability is not None:
+            d["attributed_audio_capability"] = dict(self.attributed_audio_capability)
         return d
 
 
@@ -550,11 +615,25 @@ class LifecycleSink:
         if event.get("container_id"):
             rec.container_id = event["container_id"]
         if event.get("reason") is not None:
-            rec.reason = event["reason"]
+            rec.reason = _safe_diagnostic_text(event["reason"])
         if event.get("exit_code") is not None:
             rec.exit_code = event["exit_code"]
         if event.get("error_details") is not None:
-            rec.error_details = str(event["error_details"])
+            rec.error_details = _safe_diagnostic_text(event["error_details"])
+        capability = event.get("attributed_audio_capability")
+        if isinstance(capability, dict):
+            requested = capability.get("requested_version")
+            supported = capability.get("supported_version")
+            status = capability.get("status")
+            if (isinstance(requested, int) and 1 <= requested <= 100 and isinstance(supported, int)
+                    and 1 <= supported <= 100 and status in ("supported", "unsupported")):
+                # This is an acknowledgement emitted by the bot binary, not a reflection of the
+                # spawn request.  Missing/old images leave the requested state pending.
+                rec.attributed_audio_capability = {
+                    "requested_version": requested,
+                    "supported_version": supported,
+                    "status": status,
+                }
 
         if to is BotStatus.COMPLETED:
             rec.completion_reason = self._terminal_reason(rec, event)
@@ -574,20 +653,21 @@ class LifecycleSink:
             # record when it sent none, so a reconcile-driven or runtime-destroy terminal is
             # evidenced too. FAIL-OPEN by contract: this is a REPORT about a run that has already
             # ended, and no fault in it may alter the terminal the FSM is recording.
-            rec.join_evidence = _capture_join_evidence(rec, event, frm)
+            evidence = _capture_join_evidence(rec, event, frm)
+            rec.join_evidence = _sanitize_diagnostic(evidence) if evidence is not None else None
 
         # Terminal forensics → record.data (parent caps bot_logs, trims oldest-first).
         if to in _TERMINAL:
             if event.get("bot_logs"):
                 rec.bot_logs, rec.bot_logs_truncated = _trim_bot_logs(list(event["bot_logs"]))
             if event.get("bot_resources"):
-                rec.bot_resources = dict(event["bot_resources"])
+                rec.bot_resources = _sanitize_diagnostic(event["bot_resources"])
             # WHY a transcript is short or empty. The bot counts STT failures across the meeting
             # and reports them once, here — without it a meeting whose backend refused every chunk
             # completes indistinguishable from a silent room (the zero-segment shape). Additive on
             # lifecycle.v1 (additionalProperties: true), same as infra_fault.
             if event.get("stt_fault"):
-                rec.stt_fault = dict(event["stt_fault"])
+                rec.stt_fault = _sanitize_diagnostic(event["stt_fault"])
 
         rec.status = to
         rec.history.append(to)
@@ -607,13 +687,13 @@ class LifecycleSink:
             "source": transition_source.value,
         }
         if rec.reason is not None and to in _TERMINAL:
-            entry["reason"] = rec.reason
+            entry["reason"] = _safe_diagnostic_text(rec.reason)
         if rec.completion_reason is not None:
             entry["completion_reason"] = rec.completion_reason.value
         if rec.failure_stage is not None:
             entry["failure_stage"] = rec.failure_stage.value
         if rec.error_details is not None:
-            entry["error_details"] = rec.error_details
+            entry["error_details"] = _safe_diagnostic_text(rec.error_details)
         rec.status_transition.append(entry)
 
         return StatusChange(

@@ -43,6 +43,44 @@ import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
 import type { RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
+import { createHttpAttributedAudioRecorder } from './attributed-audio.js';
+
+// The Playwright binding is asynchronous but the AudioWorklet callback is not.  Bound the page
+// queue BEFORE Array.from()/protocol serialization can retain unbounded PCM in Chromium.
+export const PAGE_ATTRIBUTED_AUDIO_MAX_BYTES = 8 * 1024 * 1024;
+export const PAGE_ATTRIBUTED_AUDIO_MAX_CALLS = 512;
+
+/** Installed inside Chromium, before its exposed Playwright bindings are called.  Kept exported so
+ * the exact synchronous-callback admission logic is exercised without a browser fixture. */
+export function installPageAttributedAudioAdmission({ maxBytes, maxCalls }: { maxBytes: number; maxCalls: number }): void {
+  const w = globalThis as any;
+  if (w.__vexaAttributedAdmissionInstalled) return;
+  w.__vexaAttributedAdmissionInstalled = true;
+  let bytes = 0, calls = 0, stopped = false;
+  const stop = (channel: number, name: string | undefined, ts: number) => {
+    if (stopped) return;
+    stopped = true;
+    Promise.resolve(w.__vexaAttributedBoundaryOverflow?.(channel, name, ts)).catch(() => undefined)
+      .finally(() => { try { w.__vexaGmeetCapture?.stop?.(); } catch { /* page teardown is best effort */ } });
+  };
+  const wrap = (bound: any, named: boolean) => (channel: number, nameOrSamples: string | number[], samplesOrTs?: number[] | number, maybeTs?: number) => {
+    const samples = (named ? samplesOrTs : nameOrSamples) as number[];
+    const name = named ? nameOrSamples as string : undefined;
+    const candidateTs = named ? maybeTs : samplesOrTs;
+    const ts = (typeof candidateTs === 'number' ? candidateTs : undefined) ?? Date.now();
+    const size = Array.isArray(samples) ? samples.length * 4 : 0;
+    if (stopped || !Array.isArray(samples) || size > maxBytes || calls >= maxCalls || bytes + size > maxBytes) {
+      stop(channel, name, ts);
+      return Promise.resolve();
+    }
+    calls++; bytes += size;
+    const args = named ? [channel, name, samples, ts] : [channel, samples, ts];
+    return Promise.resolve(bound(...args)).finally(() => { calls--; bytes -= size; });
+  };
+  w.__vexaPerSpeakerAudioData = wrap(w.__vexaPerSpeakerAudioData, false);
+  w.__vexaNamedAudioData = wrap(w.__vexaNamedAudioData, true);
+  w.__vexaAttributedAdmissionStats = () => ({ bytes, calls, stopped });
+}
 
 /** Float32 PCM → base64 of its little-endian bytes — the EXACT codec wire payload, so a stored
  *  captured-signal.v1 frame round-trips through @vexa/capture-codec (encode→decode→same PCM). */
@@ -707,13 +745,17 @@ export async function startCaptureBridge(
   // is OPTIONAL + zero-overhead when unset (makeTelemetryTap short-circuits to a single truthiness
   // check), so the proven O6 capture path is byte-for-byte unchanged. captureFrame is fire-and-forget.
   const tee = makeTelemetryTap(lane, telemetry);
+  const attributed = inv.platform === 'google_meet' && inv.attributedAudioEnabled
+    ? createHttpAttributedAudioRecorder(inv) : undefined;
+  // Reconcile the durable ledger before the page is allowed to offer a new PCM frame.
+  await attributed?.ready;
   const observeRemoteAudio = makeRemoteAudioEnergyTap(activity);
 
   // ── Node-side frame sink: one capture.v1 frame crossing the Playwright boundary. ──
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
   // Float32Array and stamp the capture time if the page didn't supply one (production stamps
   // Date.now() on the Node side — index.ts:1598–1605).
-  const onPerSpeakerAudio = (speakerIndex: number, samples: number[], tsMs?: number): void => {
+  const onPerSpeakerAudio = async (speakerIndex: number, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
@@ -722,16 +764,38 @@ export async function startCaptureBridge(
     // an unbound track (name not yet resolved) arrives with no name → the per-channel lane opens the
     // turn UNKNOWN and upgrades it the moment the resolver binds (gmeet-pipeline onset-adopt); the
     // named path is __vexaNamedAudioData.
+    if (attributed && !useMix) {
+      // An unbound voiced channel is evidence, not an "Unknown" transcript or a dropped frame.
+      await attributed.feed({ channel: speakerIndex, speaker_name: '', speaker_key: `gmeet:channel:${speakerIndex}`,
+        attribution: { source: 'unresolved', confidence: 0 }, pcm, capture_ms: ts, sample_rate: 16000 });
+    }
     if (useMix) pipeline.feedMixedAudio(pcm, ts);
     else pipeline.feedAudio(speakerIndex, undefined, pcm, ts);
   };
   // gmeet: the v1 producer stamps the glow name page-side; this named variant carries it through.
-  const onNamedAudio = (channel: number, glowName: string | undefined, samples: number[], tsMs?: number): void => {
+  const onNamedAudio = async (channel: number, glowName: string | undefined, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(channel, pcm, ts, glowName);                            // O-TEL-1: tap BEFORE the pipeline
+    if (attributed) {
+      await attributed.feed({
+        channel, speaker_name: glowName ?? '', speaker_key: glowName ? `gmeet:${channel}:${glowName}` : `gmeet:channel:${channel}`,
+        attribution: glowName ? { source: 'glow-bound', confidence: 1 } : { source: 'unresolved', confidence: 0 }, pcm, capture_ms: ts, sample_rate: 16000,
+      });
+    }
     pipeline.feedAudio(channel, glowName, pcm, ts);
+  };
+  const onAttributedBoundaryOverflow = async (channel: number, glowName: string | undefined, tsMs?: number): Promise<void> => {
+    if (!attributed) return;
+    const ts = tsMs ?? Date.now();
+    // The page stopped before this callback's PCM crossed the bridge.  This is not a successful
+    // partial capture: persist a terminal missing outcome and let stop() drain it observably.
+    await attributed.incomplete({
+      channel, speaker_name: glowName ?? '', speaker_key: glowName ? `gmeet:${channel}:${glowName}` : `gmeet:channel:${channel}`,
+      attribution: glowName ? { source: 'glow-bound', confidence: 1 } : { source: 'unresolved', confidence: 0 },
+      capture_ms: ts, sample_rate: 16000,
+    });
   };
   // mixed lane "who is lit" hint (Zoom/Teams active-speaker → the namer's time window).
   // Epoch-clock-guarded + counted; see makeSpeakerHintSink for the clock contract.
@@ -774,6 +838,9 @@ export async function startCaptureBridge(
     if (!String(e.message).includes('already registered')) throw e;
   });
   await page.exposeFunction('__vexaNamedAudioData', onNamedAudio).catch(() => { /* optional */ });
+  await page.exposeFunction('__vexaAttributedBoundaryOverflow', onAttributedBoundaryOverflow).catch((e: Error) => {
+    if (!String(e.message).includes('already registered')) throw e;
+  });
   await page.exposeFunction('__vexaSpeakerHint', onSpeakerHint).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaTeamsCaption', onTeamsCaption).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaCsrc', onCsrc).catch(() => { /* optional */ });
@@ -792,6 +859,15 @@ export async function startCaptureBridge(
   await page.exposeFunction('__vexaChatMessage', (sender: string, text: string): void => {
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
   }).catch(() => { /* optional */ });
+
+  if (attributed) {
+    // This wrapper lives at the producer boundary.  It admits both call count and PCM bytes before
+    // Node/Playwright receives an array, releases each reservation when the binding settles, and
+    // turns the first refusal into one durable incomplete range before stopping capture.
+    await page.evaluate(installPageAttributedAudioAdmission, {
+      maxBytes: PAGE_ATTRIBUTED_AUDIO_MAX_BYTES, maxCalls: PAGE_ATTRIBUTED_AUDIO_MAX_CALLS,
+    });
+  }
 
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
@@ -936,8 +1012,11 @@ export async function startCaptureBridge(
               // that never earns a name; carrying it to the transcript needs the retroactive repaint
               // the transport spine has (stable speaker_key) and the per-channel lane does not — the
               // Commit-B follow-up. Until then it is reported as data on the bind observations.
-              if (name) w.__vexaNamedAudioData(ch, name, arr, ts);
-              else w.__vexaPerSpeakerAudioData(ch, arr, ts);
+              // Playwright returns the exposed callback promise. Keep its rejection observed: the
+              // Node recorder is the bounded admission point and records a durable failed row on
+              // budget refusal instead of allowing an unhandled promise to retain this PCM.
+              if (name) Promise.resolve(w.__vexaNamedAudioData(ch, name, arr, ts)).catch(() => w.logBot?.('[pertrack] attributed admission failed: upload_request_failed'));
+              else Promise.resolve(w.__vexaPerSpeakerAudioData(ch, arr, ts)).catch(() => w.logBot?.('[pertrack] attributed admission failed: upload_request_failed'));
             };
             src.connect(proc);
             proc.connect(ctx.destination);                     // pull the processor (it outputs silence)
@@ -1270,13 +1349,15 @@ export async function startCaptureBridge(
         ?? w.VexaBrowserUtils.createGmeetSpeakers?.({ log: (m: string) => w.logBot?.('[PerSpeaker] ' + m) });
       w.__vexaGmeetCapture = w.VexaBrowserUtils.createGmeetCapture({
         log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
+        // Probe-only override: production leaves this unset and retains the conservative scan.
+        rescanMs: Number.isFinite(w.__vexaCaptureRescanMs) ? w.__vexaCaptureRescanMs : undefined,
         onAudio: (index: number, pcm: Float32Array) => {
           w.__vexaGmeetSpeakers?.reportTrackAudio?.(index);
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
           const glow = lit.length === 1 ? lit[0] : undefined;
-          if (glow) w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now());
-          else w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now());
+          if (glow) Promise.resolve(w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now())).catch(() => w.logBot?.('[gmeet] attributed admission failed: upload_request_failed'));
+          else Promise.resolve(w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now())).catch(() => w.logBot?.('[gmeet] attributed admission failed: upload_request_failed'));
         },
       });
       await w.__vexaGmeetCapture.start();
@@ -1288,7 +1369,12 @@ export async function startCaptureBridge(
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
       mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006) }).catch((e) => {
-    console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
+    console.error(attributed
+      ? '[bot] capture bridge: attributed page-side start failed'
+      : `[bot] capture bridge: page-side start failed: ${String(e)}`);
+    // The regular capture lane may degrade in place, but an enabled durable attributed producer
+    // cannot later close an empty-success manifest after its page initialization failed.
+    if (attributed) throw new Error('attributed-audio capture start failed');
   });
 
   // Captions are OFF by default now: the bot does not touch the meeting's UI to get a name source
@@ -1303,9 +1389,12 @@ export async function startCaptureBridge(
   return async () => {
     if (countersTimer) clearInterval(countersTimer);
     activity?.unavailable();
-    await page.evaluate(() => {
+    let pageFailure: unknown;
+    try {
+      await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
-      try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
+      let captureFailure: unknown;
+      try { await w.__vexaGmeetCapture?.stop?.(); } catch (error) { captureFailure = error; }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       // destroy() flushes a caption still mid-refinement as stable:false — the meeting's last
@@ -1331,7 +1420,18 @@ export async function startCaptureBridge(
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
-    }).catch(() => { /* page already gone */ });
+      if (captureFailure) throw captureFailure;
+      });
+    } catch (error) {
+      pageFailure = error;
+    }
+    // A page that did not tear down has an unknown final capture boundary.  Do not manufacture a
+    // closed empty manifest; the retained active-phase fault makes the terminal lifecycle fail.
+    if (pageFailure && attributed) throw pageFailure;
+    // Seal the last voiced turn, drain all admitted requests, then close the durable manifest.
+    // A rejected close is intentionally surfaced to the pipeline teardown instead of fabricating
+    // a closed manifest that omits an admitted range.
+    await attributed?.stop();
   };
 }
 
@@ -1383,10 +1483,13 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     return Number.isFinite(n) && n > 0 ? n : 15000;
   })();
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
-  await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
+  await page.exposeFunction('__vexaRecordingChunk', async (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): Promise<void> => {
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
     const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
-    recording.chunk(key, chunkSeq, isFinal, format, bytes);
+    // Await admission and durable upload. The page's chunker awaits this exposed function, so a
+    // slow remote uploader pauses production at the capture boundary instead of accumulating
+    // base64 strings, promises, or PCM in Node.
+    await recording.chunk(key, chunkSeq, isFinal, format, bytes);
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
   // Page-side: start the generic recording tap (finds + combines the page audio elements).
@@ -1402,14 +1505,25 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       });
       await w.__vexaRecordingTap.start();
     }
-  }, timesliceMs).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
+  }, timesliceMs).catch(() => {
+    console.error('[bot] recording bridge: page-side start failed (stage=recording-start code=operation_failed)');
+    throw new Error('recording bridge start failed');
+  });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
-    await page.evaluate(async () => {
+    try {
+      await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
-      try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
-    }).catch(() => { /* page already gone */ });
+        await w.__vexaRecordingTap?.stop?.();
+      });
+    } catch {
+      // The page producer, not the recording sink, knows that capture was incomplete. Carry that
+      // fact across the bridge before teardown so close() cannot add an is_final success marker.
+      const fault = new Error('recording capture stop failed (code operation_failed)');
+      recording.abort(fault);
+      throw fault;
+    }
   };
 }
 

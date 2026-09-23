@@ -2,14 +2,15 @@
  * L2 — createLivePipeline guard (#593 A4). The admitted→capture-start handoff had NO unit before
  * this: the composed pipeline was inline in index.ts (three bare awaits). This proves the
  * load-bearing invariant — a post-admission subsystem failure (page-side capture throw, recording
- * throw, or the engine/pyannote-model load rejecting) DEGRADES LOUDLY and NEVER rejects start(), so
+ * throw or engine/pyannote-model load rejecting) DEGRADES LOUDLY and NEVER rejects start(), so
  * the orchestrator's leave-on-pipeline-fail backstop never fires and the bot stays seated.
  *
  * RED on the pre-#593 inline pipeline (the first thrown await rejects start()); GREEN after.
  * Run: npx tsx src/live-pipeline.test.ts
  */
-import { createLivePipeline, serr, type LiveStage } from './pipeline.js';
-import type { Pipeline } from './ports.js';
+import { createBotPipeline, createLivePipeline, serr, type LiveStage } from './pipeline.js';
+import type { Invocation } from './config.js';
+import type { Pipeline, TranscriptSink } from './ports.js';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = ''): void => {
@@ -69,7 +70,8 @@ async function main(): Promise<void> {
     check('engine throw: capture attached first', capSpy.started === 1);
   }
 
-  // 3) recording-start throws → start() RESOLVES; fault reported; engine still starts.
+  // 3) A requested recording-start throws → start() resolves for orderly cleanup, but stop()
+  // reports the terminal artifact failure after releasing capture and the engine.
   {
     const faults: LiveStage[] = [];
     const capSpy: Spy = { started: 0, stopped: 0 };
@@ -86,6 +88,11 @@ async function main(): Promise<void> {
     check('recording throw: start() RESOLVED', resolved);
     check('recording throw: onFault(recording-start) fired', faults.includes('recording-start'));
     check('recording throw: engine STILL started', engine.starts === 1);
+    let rejected = false;
+    try { await live.stop(); } catch { rejected = true; }
+    check('recording throw: terminal outcome rejects after cleanup',
+      rejected && capSpy.stopped === 1 && engine.stops === 1,
+      JSON.stringify({ rejected, capSpy, engineStops: engine.stops }));
   }
 
   // 4) happy path → no faults; stop() tears down capture + recording + engine.
@@ -186,12 +193,88 @@ async function main(): Promise<void> {
       `starts=${engine.starts} stops=${engine.stops}`);
   }
 
-  // 9) serr: full-fidelity serialization — the A1 fix for the {isTrusted:true} fidelity loss.
+  // 9) terminal-adjacent logging must never serialize thrown values (they may contain meeting data).
   {
     const e = new Error('config.json not found');
-    check('serr: Error → includes message', serr(e).includes('config.json not found'));
-    check('serr: Error → includes a stack frame', /\bat\b/.test(serr(e)));
-    check('serr: bare object → NOT flattened to [object …]', !serr({ isTrusted: true }).includes('[object'));
+    check('serr: Error → stable code only', serr(e) === 'code=operation_failed');
+    check('serr: Error → omits stack and message', !serr(e).includes('config.json') && !/\bat\b/.test(serr(e)));
+    check('serr: bare object → stable code only', serr({ isTrusted: true }) === 'code=operation_failed');
+  }
+
+  // 10) A bounded attributed-audio stop failure is visible as an incomplete capture outcome but
+  // does not prevent the engine from being torn down in the controlled bot exit path.
+  {
+    const faults: LiveStage[] = [];
+    const engine = fakeEngine();
+    const live = createLivePipeline({
+      startCapture: async () => async () => { throw new Error('attributed close timed out'); },
+      engine, captureFaultTerminal: true, onFault: (stage) => faults.push(stage),
+    });
+    await live.start();
+    let rejected = false;
+    try { await live.stop(); } catch { rejected = true; }
+    check('capture-stop failure: observable incomplete capture fault', faults.includes('capture-stop'));
+    check('capture-stop failure: engine still tears down', engine.stops === 1);
+    check('capture-stop failure: terminal outcome remains failed after cleanup', rejected);
+  }
+
+  // 11) Disabling live STT owns only the transcription engine. Capture and the durable recording
+  // tap still run, while the recording-only pipeline accepts PCM without allocating turn state or
+  // emitting a false transcript final. This is the integration seam between the memory and
+  // attributed-audio lanes: recording may be the sole requested artifact for a live meeting.
+  {
+    const invocation: Invocation = {
+      platform: 'google_meet', meetingUrl: 'https://meet.google.com/abc-defg-hij', botName: 'Vexa',
+      redisUrl: 'redis://localhost:6379', transcribeEnabled: false, recordingEnabled: true,
+    };
+    const published: unknown[] = [];
+    const transcript: TranscriptSink = {
+      async publish(segment) { published.push(segment); },
+      async retract() { /* recording-only mode has no pending transcript tail */ },
+    };
+    const engine = createBotPipeline(invocation, transcript);
+    const capture: Spy = { started: 0, stopped: 0 };
+    const recording: Spy = { started: 0, stopped: 0 };
+    const live = createLivePipeline({
+      startCapture: okThunk(capture), startRecording: okThunk(recording), engine, onFault: () => {},
+    });
+    await live.start();
+    engine.feedAudio(0, 'Alice', new Float32Array(320).fill(0.1), Date.now());
+    await live.stop();
+    check('recording-only: capture and durable recording start even when live STT is disabled',
+      capture.started === 1 && recording.started === 1, JSON.stringify({ capture, recording }));
+    check('recording-only: capture and recording both release on stop',
+      capture.stopped === 1 && recording.stopped === 1, JSON.stringify({ capture, recording }));
+    check('recording-only: PCM does not allocate STT state or publish a false transcript final',
+      engine.resourceCounts === undefined && published.length === 0, JSON.stringify({ resources: engine.resourceCounts, published }));
+  }
+
+  // The attributed/recording-only composition is deliberately real at the failure boundary: the
+  // actual disabled-STT engine stays seated while capture start, recording start, and manifest-close
+  // faults are retained and turn the eventual lifecycle result into a failure.
+  for (const [name, captureFailure, captureStopFailure] of [
+    ['attributed capture start', true, false],
+    ['attributed capture stop', false, true],
+  ] as const) {
+    const invocation: Invocation = {
+      platform: 'google_meet', meetingUrl: 'https://meet.google.com/abc-defg-hij', botName: 'Vexa',
+      redisUrl: 'redis://localhost:6379', transcribeEnabled: false, recordingEnabled: true,
+      attributedAudioEnabled: true,
+    };
+    const engine = createBotPipeline(invocation, { async publish() {}, async retract() {} });
+    const faults: LiveStage[] = [];
+    const live = createLivePipeline({
+      startCapture: captureFailure ? throwThunk(new Error(`${name} failed`))
+        : captureStopFailure ? async () => async () => { throw new Error(`${name} failed`); }
+          : okThunk({ started: 0, stopped: 0 }),
+      startRecording: okThunk({ started: 0, stopped: 0 }),
+      engine, captureFaultTerminal: true, onFault: (stage) => faults.push(stage), retry: { attempts: 1, delayMs: 0 },
+    });
+    await live.start();
+    let rejected = false;
+    try { await live.stop(); } catch { rejected = true; }
+    check(`${name}: active composition stays seated then rejects terminal success`,
+      rejected && faults.length === 1 && engine.resourceCounts === undefined, JSON.stringify(faults));
   }
 
   console.log(failed === 0 ? '\n✅ live-pipeline: all passed' : `\n❌ live-pipeline: ${failed} failed`);

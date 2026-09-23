@@ -149,18 +149,36 @@ export function startBotLogSidecar(
 export function wrapTranscriptWithSnapshot<
   S extends { segment_id: string; start?: number },
   T extends { publish(segment: S): Promise<void>; retract?(ids: string[]): Promise<void> },
->(sink: T, path: string, log: (m: string) => void = (m) => console.log(`[bot] transcript-snapshot: ${m}`)): T & { writeSnapshot: () => Promise<number> } {
+>(sink: T, path: string, log: (m: string) => void = (m) => console.log(`[bot] transcript-snapshot: ${m}`), maxRetainedBytes = 16 * 1024 * 1024): T & { writeSnapshot: () => Promise<number> } {
   const durable = new Map<string, S>();
+  let retainedBytes = 0;
+  let capped = false;
   const wrapped = {
     ...sink,
     async publish(segment: S): Promise<void> {
-      if (segment?.segment_id) durable.set(segment.segment_id, { ...segment });
+      if (segment?.segment_id) {
+        const previous = durable.get(segment.segment_id);
+        const next = { ...segment };
+        const previousBytes = previous ? Buffer.byteLength(JSON.stringify(previous)) : 0;
+        const nextBytes = Buffer.byteLength(JSON.stringify(next));
+        if (retainedBytes - previousBytes + nextBytes <= maxRetainedBytes) {
+          durable.set(segment.segment_id, next);
+          retainedBytes += nextBytes - previousBytes;
+        } else if (!capped) {
+          capped = true;
+          log(`retention cap ${maxRetainedBytes}B reached; later transcript rows are not snapshotted`);
+        }
+      }
       return sink.publish(segment);
     },
     ...(sink.retract
       ? {
         async retract(ids: string[]): Promise<void> {
-          for (const id of ids) durable.delete(id);
+          for (const id of ids) {
+            const previous = durable.get(id);
+            if (previous) retainedBytes -= Buffer.byteLength(JSON.stringify(previous));
+            durable.delete(id);
+          }
           return sink.retract!(ids);
         },
       }
@@ -298,23 +316,31 @@ export interface RecorderOptions {
 const DEFAULT_DIR = process.env.VEXA_CAPTURE_SIGNAL_DIR ?? '/tmp/captured-signal';
 const DEFAULT_FLUSH_MS = 2000;
 const DEFAULT_MAX_BUFFER = 1 << 20; // 1 MiB of pending JSONL
-/** 250 MB ≈ an hour of tape at the observed ~4 MB/min. The pod's ephemeral-storage request is the
- *  real bound; this keeps one pathological meeting from ever reaching it. */
-export const DEFAULT_MAX_TAPE_BYTES = 250 * 1024 * 1024;
+/** Capture-signal diagnostics are opt-in. Zero means no diagnostic tape is retained by default. */
+export const DEFAULT_MAX_TAPE_BYTES = 0;
+/** Bound applied once the explicit diagnostic switch enables a tape. */
+export const DEFAULT_ENABLED_MAX_TAPE_BYTES = 250 * 1024 * 1024;
 
 export function resolveMaxTapeBytes(
   raw: string | undefined = process.env.VEXA_CAPTURE_SIGNAL_MAX_BYTES,
 ): number {
   if (raw === undefined || raw.trim() === '') return DEFAULT_MAX_TAPE_BYTES;
   const n = Number(raw);
-  // A garbled cap is NOT an instruction to record without bound — fall back loudly to the default.
-  // (Same rule as meeting-api's env_flag: an unrecognized value is not an explicit opt-out, and a
-  // set-but-empty env line — which .env files produce constantly — must read as unset.)
+  // A malformed or non-positive cap never enables a tape. The enable flag and this positive bound
+  // are both required at the composition root.
   if (!Number.isFinite(n) || n <= 0) {
     signalEvent('cap-invalid', { raw, using: DEFAULT_MAX_TAPE_BYTES });
     return DEFAULT_MAX_TAPE_BYTES;
   }
   return n;
+}
+
+/** Production diagnostic gate: identity's typed opt-in AND a positive operator cap are required. */
+export function captureSignalEnabled(inv: Pick<Invocation, 'captureSignalEnabled'>, rawCap?: string): boolean {
+  // Invocation is authoritative when present.  When a legacy/local invocation has no typed
+  // context, keep the established VEXA_CAPTURE_SIGNAL=1 escape hatch.
+  const enabled = inv.captureSignalEnabled ?? process.env.VEXA_CAPTURE_SIGNAL === '1';
+  return enabled && (rawCap === undefined || resolveMaxTapeBytes(rawCap) > 0);
 }
 
 /** Build the captured-signal.v1 SessionHeader for this invocation. */
@@ -406,6 +432,24 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
   const botlogPath = path.replace(/\.captured-signal\.jsonl$/, '.botlog.txt');
   const transcriptPath = path.replace(/\.captured-signal\.jsonl$/, '.transcript.jsonl');
 
+  // This function is also a public seam used by tests and embeddings. Make an off/zero cap a true
+  // no-op here as well as at the composition root: no directory, header, timer, writer, or flush
+  // promise is allocated merely because a caller constructed the diagnostic adapter.
+  // Direct construction is an explicit diagnostic API use and retains its bounded test/embedding
+  // default. Production never reaches this branch unless invocation.v1 said true *and* supplied a
+  // positive configured cap (index.ts); an explicit false/zero is always a no-op.
+  const requestedMaxBytes = opts.maxBytes ?? (inv.captureSignalEnabled === false
+    ? DEFAULT_MAX_TAPE_BYTES
+    : (resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES));
+  if (!Number.isFinite(requestedMaxBytes) || requestedMaxBytes <= 0) {
+    const noop = (): void => { /* capture diagnostics intentionally disabled */ };
+    return {
+      sink: { captureFrame: noop, captureHint: noop, captureCaption: noop, captureCsrc: noop, captureObservation: noop },
+      path, captionsPath, csrcPath, observationsPath, botlogPath, transcriptPath,
+      bytesWritten: () => 0, isCapped: () => false, close: async () => {},
+    };
+  }
+
   const headerLine = JSON.stringify(sessionHeader(inv, startedAt)) + '\n';
   let writer: SignalWriter | null = null;
   let flushing: Promise<void> = Promise.resolve();
@@ -433,13 +477,15 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
   const maxBuffer = opts.maxBufferBytes ?? DEFAULT_MAX_BUFFER;
 
   // ── the size cap ──────────────────────────────────────────────────────────────────────────────
-  // Fixture collection is default ON, so EVERY prod meeting writes into the pod's ephemeral
+  // Fixture collection is explicitly enabled, so a diagnostic meeting writes into the pod's ephemeral
   // storage. Unbounded, one pathological meeting (a 6-hour room, a wedged leave) fills the disk —
   // and a bot that dies of a full disk is a lost MEETING, not just a lost fixture. So the tape has
   // a ceiling, and reaching it stops the TAPE and nothing else: no throw into capture, no leave, no
   // change to transcription or recording. A capped tape is a shorter fixture; a dead bot is an
   // incident.
-  const maxBytes = opts.maxBytes ?? resolveMaxTapeBytes();
+  // The composition root calls this only after VEXA_CAPTURE_SIGNAL/captureSignalEnabled opted in.
+  // Direct callers retain the bounded diagnostic default; an unset process never creates it.
+  const maxBytes = requestedMaxBytes;
   let written = writer ? headerLine.length : 0;
   let capped = false;
 

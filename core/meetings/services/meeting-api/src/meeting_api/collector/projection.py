@@ -42,6 +42,7 @@ two tiers of response omissions, and the default page size that bounds an otherw
 from __future__ import annotations
 
 import json
+import re
 
 from typing import Any, Dict, Optional
 
@@ -59,6 +60,10 @@ LIST_OMIT_KEYS = frozenset({
     "chat_messages",
     "error_details",
     "last_error",
+    # The attributed ledger is a potentially large forensic artifact; its only read surface is the
+    # authenticated owner endpoint, never a generic list row.
+    "attributed_audio_manifest",
+    "artifact_deletion",
 })
 
 CALENDAR_SOURCE_LIST_KEYS = frozenset({
@@ -87,6 +92,11 @@ SENSITIVE_OMIT_KEYS = frozenset({
     # S3 path of the authenticated browser-session userdata used for authenticated spawns — a
     # pointer to a live browser session's cookies.
     "auth_userdata_path",
+    # The manifest names durable object keys and the deletion ledger names their cleanup state.
+    # Neither belongs on an ordinary meeting response, including the owner's; the dedicated
+    # attributed-audio endpoint is the owner-authenticated read surface.
+    "attributed_audio_manifest",
+    "artifact_deletion",
 })
 
 # ── Response-edge omissions · TIER 2: the OWNER's, and only the owner's ──────────────────────────
@@ -109,12 +119,34 @@ OWNER_ONLY_KEYS = frozenset({
     # The reader roster — every user id that can read this meeting. A share recipient enumerating it
     # learns who ELSE the owner shared with, which is other people's material, not theirs.
     "transcript_viewers",
+    # Recording rows contain storage paths. A transcript share grants transcript access, not object
+    # namespace visibility; the owner has the dedicated recordings surface.
+    "recordings",
 })
 
 # What a NON-OWNER's response drops explicitly: both tiers. Kept as one name because that is the
 # question most readers of this module are asking ("what does a stranger not get?"), and because the
 # delivery path's internal-key set is pinned against it.
 RESPONSE_OMIT_KEYS = SENSITIVE_OMIT_KEYS | OWNER_ONLY_KEYS
+
+# Durable lifecycle forensics are an operator/owner diagnostic carrier, never a transcript-share
+# carrier.  Keep this one recursive policy at the response edge so new nested history blobs cannot
+# bypass an endpoint-specific omission list.
+NON_OWNER_DIAGNOSTIC_KEYS = frozenset({
+    "bot_logs", "bot_logs_truncated", "last_error", "error_details", "join_evidence",
+    "status_transition", "history", "failure_history", "error_history", "diagnostics",
+    "bot_resources", "stt_fault", "infra_fault", "outbound_events",
+})
+NON_OWNER_DIAGNOSTIC_SUFFIXES = ("_logs", "_history", "_evidence", "_details", "_trace", "_stack")
+NON_OWNER_VALUE_LIST_LIMIT = 8
+NON_OWNER_VALUE_DEPTH_LIMIT = 8
+NON_OWNER_TEXT_LIMIT = 512
+DIAGNOSTIC_VALUE_LIST_LIMIT = 32
+DIAGNOSTIC_VALUE_DEPTH_LIMIT = 4
+_UNSAFE_RESPONSE_TEXT = re.compile(
+    r"private[_ -]?transcript|authorization|provider[-_ ]?body|bearer\s+|https?://|\b(?:s3|gs)://",
+    re.IGNORECASE,
+)
 
 # DENY-set, not allow-list, deliberately (unchanged from #1243). ``data`` is an open multi-producer
 # blob whose LIGHT keys the detail view genuinely renders (title, docs, notes, scheduled_at, flags,
@@ -130,8 +162,19 @@ RESPONSE_OMIT_KEYS = SENSITIVE_OMIT_KEYS | OWNER_ONLY_KEYS
 # word are unaffected.
 SENSITIVE_KEY_SUFFIXES = (
     "secret", "secrets", "token", "tokens", "password", "credential", "credentials",
-    "api_key", "apikey", "private_key", "signing_key", "access_key",
+    "api_key", "apikey", "private_key", "signing_key", "access_key", "authorization",
 )
+
+# Response data is producer-controlled JSON.  These limits are deliberately independent from the
+# metadata-write limits below: old rows and lifecycle diagnostics can reach a response without
+# having passed metadata validation.  Bound every dimension before serializing, then enforce the
+# aggregate ceiling as the last line of defence against combinatorial nesting.
+RESPONSE_MAX_DICT_ITEMS = 64
+RESPONSE_MAX_KEY_CHARS = 128
+RESPONSE_MAX_STRING_CHARS = 1024
+RESPONSE_MAX_DEPTH = 8
+RESPONSE_MAX_LIST_ITEMS = 32
+RESPONSE_MAX_SERIALIZED_BYTES = 16 * 1024
 
 # Default page size applied on the list-view path when a caller passes no ``limit`` — turns an
 # unbounded full-table response (the outage's proximate trigger) into a bounded page. An explicit
@@ -139,6 +182,40 @@ SENSITIVE_KEY_SUFFIXES = (
 # meetings (get-by-id filter, /bots/status, calendar sync) do NOT take the list-view path and are
 # never capped.
 DEFAULT_LIST_LIMIT = 50
+
+# Transcript reads carry recordings at the top level for legacy clients.  Unlike ``data``, that
+# field bypassed the response projection entirely.  A transcript grant is not a recording grant:
+# recipients may learn that a recording exists, but not its storage topology, playback manifest,
+# or an unbounded history of operational rows.
+TRANSCRIPT_RECORDING_LIMIT = 50
+TRANSCRIPT_RECORDING_PUBLIC_KEYS = frozenset({
+    "id", "recording_id", "status", "created_at", "updated_at", "is_final", "media_type",
+})
+
+
+def project_transcript_recordings(recordings: Any, *, viewer_is_owner: bool) -> list[dict]:
+    """Shape the legacy top-level transcript ``recordings`` field for its reader.
+
+    Owners retain the established recording response unchanged.  A non-owner gets a small,
+    primitive-only existence summary; nested media files, manifests, object keys, URLs, and raw
+    history never cross a transcript-share or workspace-read boundary.
+    """
+    if not isinstance(recordings, list):
+        return []
+    projected: list[dict] = []
+    for recording in recordings[:TRANSCRIPT_RECORDING_LIMIT]:
+        if not isinstance(recording, dict):
+            continue
+        source = recording if viewer_is_owner else {
+            key: value for key, value in recording.items()
+            if key in TRANSCRIPT_RECORDING_PUBLIC_KEYS and isinstance(value, (str, int, float, bool, type(None)))
+        }
+        summary = _project_response_value(source, viewer_is_owner=viewer_is_owner)
+        if summary:
+            projected.append(summary)
+    # Recording summaries ride a legacy top-level response field, outside ``data``.  Give that
+    # second carrier the same deterministic aggregate ceiling as every projected data blob.
+    return _fit_serialized_response(projected, list_only=True)
 
 
 # #1222: the list orders by the MEETING EVENT time, not row-creation time. A calendar-managed row
@@ -221,7 +298,159 @@ def project_calendar_sources(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def is_sensitive_key(key: str) -> bool:
     """True when ``key`` is named like credential material (see :data:`SENSITIVE_KEY_SUFFIXES`)."""
     k = key.lower()
-    return any(k == s or k.endswith("_" + s) for s in SENSITIVE_KEY_SUFFIXES)
+    return (any(k == s or k.endswith("_" + s) for s in SENSITIVE_KEY_SUFFIXES)
+            # Hashes and metadata beside a secret are still credential material; preserve the
+            # useful ``token_count``/``tokens_used`` diagnostics by matching only secret-like
+            # prefixes rather than every occurrence of a word.
+            or k.startswith(("secret_hash", "secret_value", "password_", "credential_", "authorization_")))
+
+
+def _is_omitted_key(key: str, *, viewer_is_owner: bool) -> bool:
+    """Whether a key is forbidden at this response depth for this viewer."""
+    lowered = key.lower()
+    if lowered in SENSITIVE_OMIT_KEYS or is_sensitive_key(lowered):
+        return True
+    return not viewer_is_owner and lowered in OWNER_ONLY_KEYS
+
+
+def is_non_owner_diagnostic_key(key: str) -> bool:
+    """Whether a persisted key is lifecycle/operational diagnostics, at any nesting level."""
+    lowered = key.lower()
+    return (lowered in NON_OWNER_DIAGNOSTIC_KEYS
+            or lowered.endswith(NON_OWNER_DIAGNOSTIC_SUFFIXES)
+            or lowered in {"error", "errors", "detail", "reason"})
+
+
+def _project_response_value(value: Any, *, viewer_is_owner: bool, depth: int = 0) -> Any:
+    """Recursively omit private keys and bound an arbitrary response value."""
+    if depth >= RESPONSE_MAX_DEPTH:
+        return None
+    if isinstance(value, str):
+        if not viewer_is_owner and _UNSAFE_RESPONSE_TEXT.search(value):
+            return "[redacted]"
+        return value[:RESPONSE_MAX_STRING_CHARS]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        projected: Dict[str, Any] = {}
+        for key, item in value.items():
+            if len(projected) >= RESPONSE_MAX_DICT_ITEMS:
+                break
+            if not isinstance(key, str) or len(key) > RESPONSE_MAX_KEY_CHARS:
+                continue
+            if _is_omitted_key(key, viewer_is_owner=viewer_is_owner):
+                continue
+            if is_non_owner_diagnostic_key(key):
+                if not viewer_is_owner:
+                    continue
+                projected[key] = project_diagnostic_value(item)
+            else:
+                projected[key] = _project_response_value(item, viewer_is_owner=viewer_is_owner, depth=depth + 1)
+        return projected
+    if isinstance(value, (list, tuple)):
+        limit = RESPONSE_MAX_LIST_ITEMS if viewer_is_owner else min(RESPONSE_MAX_LIST_ITEMS, NON_OWNER_VALUE_LIST_LIMIT)
+        return [_project_response_value(item, viewer_is_owner=viewer_is_owner, depth=depth + 1)
+                for item in list(value)[-limit:]]
+    return None
+
+
+def project_non_owner_value(value: Any, *, depth: int = 0) -> Any:
+    """Recursively bound a non-owner response without letting diagnostic siblings leak.
+
+    Meeting ``data`` is intentionally open-ended, so a top-level deny-list alone cannot protect a
+    future producer that nests a diagnostic event below an otherwise harmless key.  Lists retain a
+    fixed tail for ordinary product data; diagnostics and credential-shaped keys are removed before
+    their values are traversed.
+    """
+    return _project_response_value(value, viewer_is_owner=False, depth=depth)
+
+
+def project_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound and redact a persisted diagnostic on every response edge, including its owner."""
+    if depth >= min(DIAGNOSTIC_VALUE_DEPTH_LIMIT, RESPONSE_MAX_DEPTH):
+        return "[truncated diagnostic]"
+    if isinstance(value, str):
+        if _UNSAFE_RESPONSE_TEXT.search(value):
+            return "[redacted diagnostic]"
+        return value[:min(NON_OWNER_TEXT_LIMIT, RESPONSE_MAX_STRING_CHARS)]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        return {
+            key: project_diagnostic_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:min(DIAGNOSTIC_VALUE_LIST_LIMIT, RESPONSE_MAX_DICT_ITEMS)]
+            if (isinstance(key, str) and len(key) <= RESPONSE_MAX_KEY_CHARS
+                and not _UNSAFE_RESPONSE_TEXT.search(key) and not _is_omitted_key(key, viewer_is_owner=True))
+        }
+    if isinstance(value, (list, tuple)):
+        return [project_diagnostic_value(item, depth=depth + 1)
+                for item in list(value)[-min(DIAGNOSTIC_VALUE_LIST_LIMIT, RESPONSE_MAX_LIST_ITEMS):]]
+    return "[redacted diagnostic]"
+
+
+def _project_attributed_audio_capability(value: Any) -> Optional[dict]:
+    """Expose only the small version acknowledgement contract, never producer diagnostics."""
+    if not isinstance(value, dict):
+        return None
+    requested = value.get("requested_version")
+    status = value.get("status")
+    if not isinstance(requested, int) or isinstance(requested, bool) or not 1 <= requested <= 100:
+        return None
+    if status == "pending":
+        return {"requested_version": requested, "status": status}
+    supported = value.get("supported_version")
+    if (status not in ("supported", "unsupported") or not isinstance(supported, int)
+            or isinstance(supported, bool) or not 1 <= supported <= 100):
+        return None
+    return {"requested_version": requested, "supported_version": supported, "status": status}
+
+
+def sanitize_response_diagnostics(value: Any) -> Any:
+    """Sanitize known diagnostic subtrees without changing ordinary owner-visible content."""
+    if not isinstance(value, dict):
+        return _project_response_value(value, viewer_is_owner=True)
+    result = _project_response_value(value, viewer_is_owner=True)
+    if "attributed_audio_capability" in value:
+        capability = _project_attributed_audio_capability(value["attributed_audio_capability"])
+        if capability is not None:
+            result["attributed_audio_capability"] = capability
+    return result
+
+
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def _fit_serialized_response(value: Any, *, list_only: bool = False) -> Any:
+    """Keep a deterministic prefix within the aggregate wire ceiling."""
+    try:
+        if _serialized_size(value) <= RESPONSE_MAX_SERIALIZED_BYTES:
+            return value
+    except (TypeError, ValueError):
+        return [] if list_only else {}
+    if isinstance(value, list):
+        kept: list[Any] = []
+        for item in value:
+            candidate = [*kept, item]
+            if _serialized_size(candidate) > RESPONSE_MAX_SERIALIZED_BYTES:
+                break
+            kept.append(item)
+        return kept
+    if isinstance(value, dict) and not list_only:
+        kept: Dict[str, Any] = {"response_truncated": True}
+        for key, item in value.items():
+            if key == "response_truncated":
+                continue
+            candidate = {**kept, key: item}
+            if _serialized_size(candidate) > RESPONSE_MAX_SERIALIZED_BYTES:
+                break
+            kept[key] = item
+        return kept
+    return [] if list_only else {}
 
 
 def omitted_keys(*, viewer_is_owner: bool) -> frozenset:
@@ -259,10 +488,10 @@ def project_response_data(
     """
     omit = omitted_keys(viewer_is_owner=viewer_is_owner)
     projected = project_calendar_sources(data)
-    return {
-        k: v for k, v in projected.items()
-        if k not in omit and not is_sensitive_key(k)
-    }
+    result = {k: v for k, v in projected.items() if k not in omit and not is_sensitive_key(k)}
+    result = sanitize_response_diagnostics(result)
+    result = _project_response_value(result, viewer_is_owner=viewer_is_owner)
+    return _fit_serialized_response(result)
 
 
 def project_list_data(
@@ -291,7 +520,9 @@ def project_list_data(
                  and k not in omit and not is_sensitive_key(k)}
     if isinstance(sources, list):
         projected["calendar_sources"] = sources
-    return projected
+    projected = sanitize_response_diagnostics(projected)
+    projected = _project_response_value(projected, viewer_is_owner=viewer_is_owner)
+    return _fit_serialized_response(projected)
 
 
 # --- caller-supplied metadata: bounds -------------------------------------------------------

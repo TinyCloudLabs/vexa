@@ -31,10 +31,12 @@ class FakeMediaRecorder {
   onstart: (() => void) | null = null;
   ondataavailable: ((e: any) => void) | null = null;
   onstop: (() => void) | null = null;
-  state: 'inactive' | 'recording' = 'inactive';
+  state: 'inactive' | 'recording' | 'paused' = 'inactive';
   mimeType: string;
   constructor(_stream: any, opts?: { mimeType?: string }) { this.mimeType = opts?.mimeType ?? ''; }
   start(_timeslice?: number) { this.state = 'recording'; this.onstart?.(); }
+  pause() { if (this.state === 'recording') this.state = 'paused'; }
+  resume() { if (this.state === 'paused') this.state = 'recording'; }
   stop() { this.state = 'inactive'; this.onstop?.(); }
   emit(bytes: Uint8Array) { this.ondataavailable?.({ data: new FakeBlob(bytes) }); }
 }
@@ -76,8 +78,8 @@ async function main() {
       got[1] ? Buffer.from(decode(got[1].base64)).toString('hex') : 'no chunk1');
   }
 
-  // ── 2) THE FIELD BUG: chunk 0's onChunk FAILS (bridge dropped the big blob). The retained init
-  //        segment must be re-attached to the next surviving cluster chunk so a header survives. ──
+  // ── 2) A bridge rejection is terminal. A later final marker would claim a complete recording
+  //        after an admitted chunk was lost, so it must never be repaired by silently splicing it. ──
   {
     const got: RecordingChunk[] = [];
     let firstSeen = false;
@@ -92,17 +94,10 @@ async function main() {
     });
     await chunker.start();
     const mr = chunker.getMediaRecorder() as unknown as FakeMediaRecorder;
-    mr.emit(headerBlob);          // chunk 0 — its onChunk throws (lost)
+    mr.emit(headerBlob);
     await new Promise((r) => setTimeout(r, 10));
-    mr.emit(clusterBlob(0x20));   // chunk 1 — survives, MUST now carry the re-attached header
-    await new Promise((r) => setTimeout(r, 10));
-    check('field: a surviving chunk carries the EBML header after chunk 0 was lost',
-      got.some((c) => startsWith(decode(c.base64), EBML)),
-      got.map((c) => Buffer.from(decode(c.base64)).toString('hex').slice(0, 8)).join(','));
-    const survivor = got.find((c) => startsWith(decode(c.base64), EBML));
-    check('field: the re-attached survivor is [EBML init][cluster] (self-describing again)',
-      !!survivor && startsWith(decode(survivor.base64), EBML),
-      survivor ? Buffer.from(decode(survivor.base64)).toString('hex') : 'no survivor');
+    check('field: rejected admitted header is a terminal recording failure', chunker.resourceCounts().failed);
+    check('field: no later chunk is silently sent after bridge rejection', got.length === 0, JSON.stringify(got));
   }
 
   // ── 3) ONCE DELIVERED, never re-attach: after a header-bearing chunk is ACK'd, later clusters
@@ -126,7 +121,7 @@ async function main() {
   }
 
   if (failed) { console.error(`\n❌ init-segment.smoke: ${failed} check(s) FAILED.`); process.exit(1); }
-  console.log('\n✅ init-segment.smoke: the chunker retains + re-attaches the EBML init segment when chunk 0 is lost, and never duplicates it once delivered.');
+  console.log('\n✅ init-segment.smoke: successful chunks preserve the EBML init segment once, while a rejected admitted chunk fails terminally rather than claiming completion.');
   process.exit(0);
 }
 

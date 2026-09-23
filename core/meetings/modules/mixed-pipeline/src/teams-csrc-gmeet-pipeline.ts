@@ -362,6 +362,11 @@ export class TeamsCsrcGmeetPipeline {
     };
   }
 
+  /** PCM retained by the shared window that owns Teams' live-STT audio. */
+  resourceCounts(): { retainedPcmBytes: number } {
+    return { retainedPcmBytes: this.manager.resourceCounts().retainedPcmBytes };
+  }
+
   async flush(): Promise<void> {
     this.promoteTimedOutDrafts(Number.POSITIVE_INFINITY, true);
     for (const state of this.tracks.values()) await this.flushSource(state.key);

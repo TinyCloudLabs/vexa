@@ -279,8 +279,13 @@ def create_app(
         storage = _recordings_fakes().InMemoryStorage()
 
     async def _delete_recording_objects(recording: dict) -> list[str]:
-        from .recordings.deletion import delete_recording_objects
+        from .recordings.deletion import delete_attributed_objects, delete_recording_objects
 
+        if "attributed_audio_manifest" in recording:
+            return await delete_attributed_objects(
+                storage, recording["attributed_audio_manifest"],
+                user_id=int(recording["user_id"]), meeting_id=int(recording["meeting_id"]),
+            )
         return await delete_recording_objects(storage, recording)
 
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---

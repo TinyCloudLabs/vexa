@@ -81,6 +81,9 @@ export interface Invocation {
   // ── recording ──
   recordingEnabled?: boolean;
   captureSignalEnabled?: boolean;
+  attributedAudioEnabled?: boolean;
+  attributedAudioUploadUrl?: string;
+  attributedAudioRequiredVersion?: number;
   captureModes?: string[];
   recordingUploadUrl?: string;
   // ── lifecycle timeouts ──
@@ -98,6 +101,11 @@ export interface Invocation {
   s3Bucket?: string;
   s3AccessKey?: string;
   s3SecretKey?: string;
+}
+
+/** Attributed Google Meet capture is deferred evidence, never a simultaneous live-STT lane. */
+export function liveSttEnabled(inv: Pick<Invocation, 'platform' | 'attributedAudioEnabled' | 'transcribeEnabled'>): boolean {
+  return inv.transcribeEnabled !== false && !(inv.platform === 'google_meet' && inv.attributedAudioEnabled === true);
 }
 
 /** Thrown when VEXA_BOT_CONFIG is missing / not JSON / off-contract. The composition root

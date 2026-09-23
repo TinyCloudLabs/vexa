@@ -8,7 +8,7 @@
  *
  * Google Meet renders each participant's audio as a separate <audio>/<video>
  * element whose srcObject is a live MediaStream. This wires each into a
- * dedicated AudioContext → AudioWorklet, resampled to 16 kHz, and delivers
+ * shared AudioContext → AudioWorklet, resampled to 16 kHz, and delivers
  * per-element PCM chunks via onAudio(index, pcm). It rescans for late joiners /
  * recycled elements and silence-gates each chunk. The track index is stable per
  * stream id (the basis for per-track speaker attribution in gmeet-speakers.ts).
@@ -17,7 +17,7 @@
 import { createPcmCaptureNode } from './pcm-capture.js';
 
 export interface GmeetCaptureOptions {
-  /** One per-element PCM chunk (already 16 kHz). index is the stable track index. */
+  /** One per-track PCM chunk (already 16 kHz). index is the stable track index. */
   onAudio: (index: number, pcm: Float32Array) => void;
   log?: (msg: string) => void;
   targetSampleRate?: number;   // default 16000
@@ -33,6 +33,8 @@ export interface GmeetCapture {
   stop(): void;
   /** Number of currently-connected participant streams. */
   streamCount(): number;
+  /** Bounded resource accounting used by the long-meeting probe. */
+  resourceCounts(): { contexts: number; sources: number; worklets: number; tracks: number; references: number };
 }
 
 export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
@@ -45,54 +47,154 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
 
   let running = false;
   let rescanTimer: ReturnType<typeof setInterval> | null = null;
-  const connectedStreamIds = new Set<string>();
-  const contexts: AudioContext[] = [];
+  interface Connection {
+    stream: MediaStream;
+    track: MediaStreamTrack;
+    elements: Map<HTMLMediaElement, MediaStream>;
+    source: MediaStreamAudioSourceNode;
+    node: AudioWorkletNode | null;
+    onEnded: () => void;
+  }
+  interface ElementBinding {
+    stream: MediaStream;
+    connection: Connection;
+  }
+  // Capture resources belong to the audio track, not to a DOM element. Meet can
+  // temporarily mirror one MediaStream through several elements while recycling
+  // tiles; element-keyed ownership would capture identical PCM more than once.
+  // Chromium may return a new JS MediaStreamTrack wrapper on a later scan, so use
+  // its stable browser id rather than wrapper identity for this owner registry.
+  const connections = new Map<string, Connection>();
+  const bindings = new Map<HTMLMediaElement, ElementBinding>();
+  let context: AudioContext | null = null;
   let nextIndex = 0;
+  // Initial worklet failures reject start(). A worklet can also fail much later, after a rescan
+  // discovers a new participant; retain that fault until the bridge tears capture down so an
+  // attributed session cannot be closed as a successful empty artifact.
+  let initializationFailure: Error | null = null;
 
   function findMediaElements(): HTMLMediaElement[] {
     return Array.from(document.querySelectorAll('audio, video')).filter((el: any) =>
+      (typeof document.contains !== 'function' || document.contains(el)) &&
       !el.paused &&
       el.srcObject instanceof MediaStream &&
-      el.srcObject.getAudioTracks().length > 0
+      el.srcObject.getAudioTracks().some((track: MediaStreamTrack) => track.readyState !== 'ended')
     ) as HTMLMediaElement[];
   }
 
-  function connectElement(el: HTMLMediaElement, index: number): boolean {
+  function release(connection: Connection, reason: string): void {
+    // Remove the listener before disconnecting so a stop/close cascade cannot retain this
+    // connection through the track. Every path (end, detach, replacement, failed init, stop)
+    // comes through here; it is deliberately idempotent.
+    if (connections.get(connection.track.id) !== connection) return;
+    connections.delete(connection.track.id);
+    for (const el of connection.elements.keys()) {
+      if (bindings.get(el)?.connection === connection) bindings.delete(el);
+    }
+    connection.elements.clear();
+    try { connection.track.removeEventListener('ended', connection.onEnded); } catch { /* */ }
+    try { connection.node?.port.close(); } catch { /* */ }
+    try { connection.node?.disconnect(); } catch { /* */ }
+    try { connection.source.disconnect(); } catch { /* */ }
+    log(`stream released (${reason})`);
+  }
+
+  function detachElement(el: HTMLMediaElement, binding: ElementBinding, reason: string): void {
+    if (bindings.get(el) !== binding) return;
+    bindings.delete(el);
+    binding.connection.elements.delete(el);
+    if (binding.connection.elements.size === 0) release(binding.connection, reason);
+    else log(`stream mirror detached (${reason}; ${binding.connection.elements.size} reference(s) remain)`);
+  }
+
+  function releaseAll(reason: string): void {
+    for (const connection of Array.from(connections.values())) release(connection, reason);
+  }
+
+  function ensureContext(): AudioContext {
+    if (!context || context.state === 'closed') {
+      context = new AudioContext({ sampleRate: SR });
+      void context.resume().then(() => log(`capture ctx.state=${context?.state}`)).catch(() => { /* */ });
+    }
+    return context;
+  }
+
+  async function connectElement(el: HTMLMediaElement, index: number): Promise<boolean> {
     try {
       const stream: MediaStream = (el as any).srcObject;
       if (!stream || stream.getAudioTracks().length === 0) return false;
-      const streamId = stream.id;
-      if (connectedStreamIds.has(streamId)) return false;
+      const track = stream.getAudioTracks()[0];
+      const existing = bindings.get(el);
+      if (existing?.stream === stream && existing.connection.track.id === track.id) return false;
+      if (existing) detachElement(el, existing, 'replacement');
 
-      const ctx = new AudioContext({ sampleRate: SR });
-      // Chrome's autoplay policy can create the context SUSPENDED (no user gesture) → the worklet
-      // never runs → zero PCM even while people talk. Resume it explicitly. (L4 capture fix.)
-      void ctx.resume().then(() => log(`stream ${index} ctx.state=${ctx.state}`)).catch(() => { /* */ });
+      const shared = connections.get(track.id);
+      if (shared) {
+        shared.elements.set(el, stream);
+        bindings.set(el, { stream, connection: shared });
+        log(`stream mirror attached (track ${track.id.substring(0, 8)}; ${shared.elements.size} reference(s))`);
+        return false;
+      }
+
+      const ctx = ensureContext();
       const source = ctx.createMediaStreamSource(stream);
       // AudioWorklet (audio-thread) instead of the deprecated ScriptProcessor,
       // which duplicates/drops buffers under main-thread load — the captured-audio
-      // stutter. connectElement is sync, so wire the node when addModule resolves.
+      // stutter.  Crucially, initial capture does not report ready until this resolves:
+      // an enabled attributed recorder must not later close an empty-success manifest
+      // when Chromium rejected the worklet module.
       let seen = 0, emitted = 0; // L4 frame-flow diagnostic
-      createPcmCaptureNode(ctx, (data) => {
-        if (!running) return;
+      const connection: Connection = {
+        stream, track, elements: new Map([[el, stream]]), source, node: null,
+        onEnded: () => release(connection, 'track ended'),
+      };
+      connections.set(track.id, connection);
+      bindings.set(el, { stream, connection });
+      track.addEventListener('ended', connection.onEnded);
+      let node: AudioWorkletNode;
+      try {
+        node = await createPcmCaptureNode(ctx, (data) => {
+        if (!running || connections.get(track.id) !== connection) return;
         seen++;
         let maxVal = 0;
         for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxVal) maxVal = a; }
         if (maxVal > SILENCE) { emitted++; if (emitted === 1 || emitted % 100 === 0) log(`stream ${index} AUDIO seen=${seen} emitted=${emitted} max=${maxVal.toFixed(3)}`); opts.onAudio(index, data); } // worklet already yields a fresh copy
         else if (seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${maxVal.toFixed(4)} ctx=${ctx.state}`);
-      }).then((node) => { source.connect(node); node.connect(ctx.destination); })
-        .catch((err: any) => console.log(`[gmeet-capture] worklet init failed: ${err?.message}`));
-      connectedStreamIds.add(streamId);
-      contexts.push(ctx);
-
-      const track = stream.getAudioTracks()[0];
-      track.addEventListener('ended', () => { connectedStreamIds.delete(streamId); });
+        });
+      } catch {
+        release(connection, 'worklet init failed');
+        log('worklet init failed code=worklet_init_failed');
+        initializationFailure ??= new Error('gmeet capture worklet initialization failed');
+        throw initializationFailure;
+      }
+      // stop/replacement can happen while addModule() is pending. Never attach a late node.
+      if (!running || connections.get(track.id) !== connection) {
+        try { node.port.close(); node.disconnect(); } catch { /* */ }
+        return false;
+      }
+      connection.node = node;
+      source.connect(node);
+      node.connect(ctx.destination);
 
       log(`stream ${index} connected (track ${track.id.substring(0, 8)})`);
       return true;
-    } catch (err: any) {
-      log(`stream ${index} error: ${err.message}`);
-      return false;
+    } catch (error) {
+      log(`stream ${index} error code=capture_connect_failed`);
+      throw error;
+    }
+  }
+
+  function retainLiveOwners(elements: HTMLMediaElement[]): void {
+    // An element may change to B before a later DOM sibling that still references A is
+    // visited. Retain every already-owned target first, so replacing that first element
+    // cannot release A between the two discoveries.
+    for (const el of elements) {
+      const stream: MediaStream = (el as any).srcObject;
+      const track = stream?.getAudioTracks()[0];
+      const existing = bindings.get(el);
+      const shared = track && connections.get(track.id);
+      if (shared && (!existing || existing.stream !== stream || existing.connection.track.id !== track.id))
+        shared.elements.set(el, stream);
     }
   }
 
@@ -110,33 +212,65 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       if (!running) return;
 
       for (let i = 0; i < mediaElements.length; i++) {
-        if (connectElement(mediaElements[i], i)) nextIndex = i + 1;
+        if (await connectElement(mediaElements[i], i)) nextIndex = i + 1;
       }
       nextIndex = Math.max(nextIndex, mediaElements.length);
 
       rescanTimer = setInterval(() => {
         if (!running) return;
-        for (const el of findMediaElements()) {
-          const stream: MediaStream = (el as any).srcObject;
-          if (stream && !connectedStreamIds.has(stream.id)) {
-            if (connectElement(el, nextIndex)) nextIndex++;
-          }
+        const mediaElements = findMediaElements();
+        // First retain all desired references that already have an owner. A DOM-ordered scan can
+        // otherwise release A while the earlier element changes to B, before its later A mirror
+        // is visited and attached. Only after that pre-registration may replacements release.
+        retainLiveOwners(mediaElements);
+        for (const el of mediaElements) {
+          // Later joiners initialize asynchronously.  The initial scan is awaited above so the
+          // bridge can fail terminally before it reports readiness. Reserve the channel before
+          // that await: two distinct tracks discovered by this one scan otherwise both capture
+          // the same mutable nextIndex and merge PCM/speaker identity when they resolve.
+          const stream: MediaStream | undefined = (el as any).srcObject;
+          const track = stream?.getAudioTracks()[0];
+          const index = track && !connections.has(track.id) ? nextIndex++ : nextIndex;
+          void connectElement(el, index).catch(() => {
+            initializationFailure ??= new Error('gmeet capture worklet initialization failed');
+            log('worklet init failed code=worklet_init_failed');
+          });
+        }
+        // A removed element or swapped srcObject must not pin its old source once all surviving
+        // references have been reconciled.
+        for (const [el, binding] of Array.from(bindings.entries())) {
+          const connection = binding.connection;
+          const inDom = typeof document.contains !== 'function' || document.contains(el);
+          const live = connection.track.readyState !== 'ended';
+          if (!inDom || !live || (el as any).srcObject !== binding.stream)
+            detachElement(el, binding, !inDom ? 'element removed' : !live ? 'track ended' : 'replacement');
         }
       }, RESCAN);
 
-      log(`capture started with ${connectedStreamIds.size} stream(s)`);
+      log(`capture started with ${connections.size} stream(s)`);
     },
 
     stop(): void {
       running = false;
       if (rescanTimer !== null) { clearInterval(rescanTimer); rescanTimer = null; }
-      for (const ctx of contexts) { try { ctx.close(); } catch { /* ignore */ } }
-      contexts.length = 0;
-      connectedStreamIds.clear();
+      releaseAll('stop');
+      const ctx = context;
+      context = null;
+      try { void ctx?.close(); } catch { /* ignore */ }
       nextIndex = 0;
       log('capture stopped');
+      if (initializationFailure) throw initializationFailure;
     },
 
-    streamCount(): number { return connectedStreamIds.size; },
+    streamCount(): number { return connections.size; },
+    resourceCounts() {
+      let worklets = 0;
+      let references = 0;
+      for (const connection of connections.values()) {
+        if (connection.node) worklets++;
+        references += connection.elements.size;
+      }
+      return { contexts: context ? 1 : 0, sources: connections.size, worklets, tracks: connections.size, references };
+    },
   };
 }
