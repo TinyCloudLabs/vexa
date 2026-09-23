@@ -79,7 +79,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
   async function emit(event: LifecycleEvent): Promise<void> {
     const body = JSON.stringify(event);
     const deadline = Date.now() + Math.max(1, emitTimeoutMs);
-    let lastErr: string | undefined;
+    let lastCode: 'http_error' | 'network_error' | 'timeout' = 'timeout';
     let attempted = 0;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const remainingMs = deadline - Date.now();
@@ -90,9 +90,9 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
       try {
         const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
         if (res.ok) return; // 2xx — delivered
-        lastErr = `HTTP ${res.status}`;
-      } catch (e) {
-        lastErr = (e as Error)?.message ?? String(e);
+        lastCode = 'http_error';
+      } catch {
+        lastCode = 'network_error';
       } finally {
         clearTimeout(timeout);
       }
@@ -104,7 +104,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     }
     // Give up — log, never throw (a lifecycle POST failure must not crash the bot, P14).
     console.error(
-      `[bot] lifecycle.v1 ${event.status} POST failed after ${attempted} attempt(s) within ${emitTimeoutMs}ms: ${lastErr ?? 'timeout'} (giving up)`,
+      `[bot] lifecycle.v1 ${event.status} POST failed code=${lastCode} attempts=${attempted} timeout_ms=${emitTimeoutMs}`,
     );
   }
 
@@ -115,19 +115,19 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
   // `unreachable`. Never throws (P14).
   async function emitReachable(event: LifecycleEvent): Promise<PrimaryReachability> {
     const body = JSON.stringify(event);
-    let lastErr: string | undefined;
+    let lastCode: 'network_error' | 'timeout' = 'timeout';
     for (let attempt = 1; attempt <= reachAttempts; attempt++) {
       try {
         // A response of ANY status means the callback host answered → the channel is up.
         await fetchImpl(callbackUrl, { method: 'POST', headers, body });
         return 'reachable';
-      } catch (e) {
-        lastErr = (e as Error)?.message ?? String(e);
+      } catch {
+        lastCode = 'network_error';
       }
       if (attempt < reachAttempts) await sleep(reachBackoffMs * 2 ** (attempt - 1));
     }
     console.error(
-      `[bot] lifecycle.v1 ${event.status} reachability probe: primary channel UNREACHABLE after ${reachAttempts} attempt(s): ${lastErr ?? 'unknown'}`,
+      `[bot] lifecycle.v1 ${event.status} reachability probe code=${lastCode} attempts=${reachAttempts}`,
     );
     return 'unreachable';
   }

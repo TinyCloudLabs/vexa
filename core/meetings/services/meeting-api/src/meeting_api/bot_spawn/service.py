@@ -223,14 +223,10 @@ def _transcription_from_context(ctx: dict) -> dict:
     return transcription if isinstance(transcription, dict) else {}
 
 
-def _capture_signal_from_context(ctx: dict) -> bool:
-    """Whether this spawn explicitly opted into raw captured-signal diagnostics.
-
-    Identity is best-effort. Missing, stale, or unreachable context must therefore remain off:
-    a diagnostic tape is never an implicit production workload. Only the typed ``true`` contract
-    value opens this path; malformed values are treated as disabled rather than guessed.
-    """
-    return ctx.get("capture_signal") is True
+def _capture_signal_from_context(ctx: dict) -> Optional[bool]:
+    """Return an explicit identity choice, or preserve the legacy bot-side fallback when absent."""
+    value = ctx.get("capture_signal")
+    return value if isinstance(value, bool) else None
 
 
 def _bot_name_from_context(ctx: dict) -> Optional[str]:
@@ -443,6 +439,10 @@ async def request_bot(
     means no cap was provided, so no pre-check.
     """
     authority = authority or AllowAllServiceAuthority()
+    # Canonical attributed Google Meet PCM is deferred evidence. It cannot also start local
+    # Whisper/live publication, even if transcription was omitted or requested by the caller.
+    if platform == "google_meet" and attributed_audio_enabled:
+        transcribe_enabled = False
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(
         platform, native_meeting_id, teams_base_host=teams_base_host

@@ -161,15 +161,15 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
         connection.node = node;
         source.connect(node);
         node.connect(ctx.destination);
-      }).catch((err: any) => {
+      }).catch(() => {
         release(connection, 'worklet init failed');
-        log(`worklet init failed: ${err?.message ?? err}`);
+        log('worklet init failed code=worklet_init_failed');
       });
 
       log(`stream ${index} connected (track ${track.id.substring(0, 8)})`);
       return true;
-    } catch (err: any) {
-      log(`stream ${index} error: ${err.message}`);
+    } catch {
+      log(`stream ${index} error code=capture_connect_failed`);
       return false;
     }
   }

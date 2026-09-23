@@ -324,6 +324,18 @@ async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], se
     # and therefore seals itself; legacy clients may still send a small subset for compatibility.
     expected = set(expected_sequences or [])
     if any(not isinstance(value, int) or value < 0 for value in expected): raise AttributedConflict("invalid admitted sequence ledger")
+    def receipt(manifest: dict) -> dict:
+        """Small bot-facing close acknowledgement; the owner endpoint owns the full ledger."""
+        ranges = manifest.get("ranges", [])
+        return {
+            "version": manifest.get("version"),
+            "meeting_id": manifest.get("meeting_id"),
+            "state": manifest.get("state"),
+            "range_count": len(ranges),
+            "uploaded_count": sum(1 for row in ranges if row.get("state") == "uploaded"),
+            "failed_count": sum(1 for row in ranges if row.get("state") == "failed"),
+        }
+
     def close(data_json):
         deletion = data_json.get("artifact_deletion") or {}
         if deletion.get("state") in ("pending", "completed"):
@@ -331,11 +343,11 @@ async def close_attributed_manifest(repo, *, token_meeting_id: Optional[int], se
         manifest = _manifest(meeting_id, data_json.get("attributed_audio_manifest"))
         present = {r.get("sequence") for r in manifest["ranges"]}
         if not expected.issubset(present): raise AttributedConflict("server ledger omits client-admitted ranges")
-        if manifest["state"] == "closed": return data_json, manifest
+        if manifest["state"] == "closed": return data_json, receipt(manifest)
         if any(r.get("state") not in ("uploaded", "failed") for r in manifest["ranges"]):
             raise AttributedConflict("attributed audio uploads have not reached a durable outcome")
         manifest["state"] = "closed"; next_data = dict(data_json); next_data["attributed_audio_manifest"] = manifest
-        return next_data, manifest
+        return next_data, receipt(manifest)
     return await repo.mutate_meeting_data(meeting_id, close)
 
 

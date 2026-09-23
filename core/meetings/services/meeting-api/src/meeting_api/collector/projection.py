@@ -42,6 +42,7 @@ two tiers of response omissions, and the default page size that bounds an otherw
 from __future__ import annotations
 
 import json
+import re
 
 from typing import Any, Dict, Optional
 
@@ -139,6 +140,11 @@ NON_OWNER_DIAGNOSTIC_KEYS = frozenset({
 NON_OWNER_DIAGNOSTIC_SUFFIXES = ("_logs", "_history", "_evidence", "_details", "_trace", "_stack")
 NON_OWNER_VALUE_LIST_LIMIT = 8
 NON_OWNER_VALUE_DEPTH_LIMIT = 8
+NON_OWNER_TEXT_LIMIT = 512
+_UNSAFE_RESPONSE_TEXT = re.compile(
+    r"private[_ -]?transcript|authorization|provider[-_ ]?body|bearer\s+|https?://|\b(?:s3|gs)://",
+    re.IGNORECASE,
+)
 
 # DENY-set, not allow-list, deliberately (unchanged from #1243). ``data`` is an open multi-producer
 # blob whose LIGHT keys the detail view genuinely renders (title, docs, notes, scheduled_at, flags,
@@ -299,6 +305,10 @@ def project_non_owner_value(value: Any, *, depth: int = 0) -> Any:
     """
     if depth >= NON_OWNER_VALUE_DEPTH_LIMIT:
         return None
+    if isinstance(value, str):
+        if _UNSAFE_RESPONSE_TEXT.search(value):
+            return "[redacted]"
+        return value[:NON_OWNER_TEXT_LIMIT]
     if isinstance(value, dict):
         return {
             key: project_non_owner_value(item, depth=depth + 1)
@@ -308,7 +318,7 @@ def project_non_owner_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, list):
         return [project_non_owner_value(item, depth=depth + 1)
                 for item in value[-NON_OWNER_VALUE_LIST_LIMIT:]]
-    return value
+    return value if isinstance(value, (int, float, bool, type(None))) else None
 
 
 def omitted_keys(*, viewer_is_owner: bool) -> frozenset:

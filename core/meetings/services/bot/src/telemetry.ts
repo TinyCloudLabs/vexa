@@ -337,7 +337,10 @@ export function resolveMaxTapeBytes(
 
 /** Production diagnostic gate: identity's typed opt-in AND a positive operator cap are required. */
 export function captureSignalEnabled(inv: Pick<Invocation, 'captureSignalEnabled'>, rawCap?: string): boolean {
-  return inv.captureSignalEnabled === true && resolveMaxTapeBytes(rawCap) > 0;
+  // Invocation is authoritative when present.  When a legacy/local invocation has no typed
+  // context, keep the established VEXA_CAPTURE_SIGNAL=1 escape hatch.
+  const enabled = inv.captureSignalEnabled ?? process.env.VEXA_CAPTURE_SIGNAL === '1';
+  return enabled && (rawCap === undefined || resolveMaxTapeBytes(rawCap) > 0);
 }
 
 /** Build the captured-signal.v1 SessionHeader for this invocation. */

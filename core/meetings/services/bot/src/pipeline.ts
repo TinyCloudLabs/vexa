@@ -38,7 +38,7 @@ import {
   type TurnSourceObservation,
 } from '@vexa/mixed-pipeline';
 import { TranscriptionClient, type TranscriptionResult } from '@vexa/transcribe-whisper';
-import { isMixedLanePlatform, isPerTrackLanePlatform, type Invocation, type Platform } from './config.js';
+import { isMixedLanePlatform, isPerTrackLanePlatform, liveSttEnabled, type Invocation, type Platform } from './config.js';
 import type { TranscriptSegment } from './contracts.js';
 import type { Pipeline, TranscriptSink } from './ports.js';
 
@@ -470,7 +470,7 @@ function createMixedBotPipeline(
  *  the lane never knows about config. transcribeEnabled=false ⇒ a no-op transcribe (the engine
  *  still runs turn gating but emits empty text; recording-only meetings need no STT). */
 export function createTranscribe(inv: Invocation): Transcribe {
-  if (inv.transcribeEnabled === false || !inv.transcriptionServiceUrl) {
+  if (!liveSttEnabled(inv) || !inv.transcriptionServiceUrl) {
     return async () => ({ text: '', language: inv.language ?? 'en', duration: 0, segments: [] });
   }
   const client = new TranscriptionClient({
@@ -515,7 +515,7 @@ export function createBotPipeline(
     onObservation?: (source: string, obs: Record<string, unknown>, tMs?: number) => void;
   } = {},
 ): BotPipeline {
-  if (inv.transcribeEnabled === false) return createRecordingOnlyPipeline();
+  if (!liveSttEnabled(inv)) return createRecordingOnlyPipeline();
   const transcribe = opts.transcribe ?? createTranscribe(inv);
   if (inv.platform === 'teams') {
     return createTeamsBotPipeline(

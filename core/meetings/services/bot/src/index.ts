@@ -23,7 +23,7 @@
  * lazy redis connect.
  */
 import { createClient } from 'redis';
-import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
+import { liveSttEnabled, loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
 import { createOrchestrator, DEFAULT_PIPELINE_STOP_MS } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
@@ -32,7 +32,7 @@ import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redi
 import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
-import { captureSignalEnabled, createCaptureSignalRecorder, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
+import { captureSignalEnabled, createCaptureSignalRecorder, DEFAULT_ENABLED_MAX_TAPE_BYTES, resolveMaxTapeBytes, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { createResourceMonitor } from './resources.js';
@@ -200,7 +200,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
-  const captureSignalMaxBytes = resolveMaxTapeBytes();
+  const captureSignalMaxBytes = resolveMaxTapeBytes() || DEFAULT_ENABLED_MAX_TAPE_BYTES;
   const signalRecorder: CaptureSignalRecorder | null =
     captureSignalEnabled(inv)
       ? createCaptureSignalRecorder(inv, { maxBytes: captureSignalMaxBytes })
@@ -322,7 +322,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       return {
         recording_retained_bytes: counts?.retainedBytes ?? 0,
         recording_queued_chunks: counts?.queuedChunks ?? 0,
-        ...(inv.transcribeEnabled === false
+        ...(!liveSttEnabled(inv)
           ? { live_stt_retained_state: 'disabled' }
           : liveStt
             ? { live_stt_retained_state: 'measured', live_stt_retained_bytes: liveStt.retainedPcmBytes }

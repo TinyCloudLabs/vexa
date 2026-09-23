@@ -103,6 +103,11 @@ export interface Invocation {
   s3SecretKey?: string;
 }
 
+/** Attributed Google Meet capture is deferred evidence, never a simultaneous live-STT lane. */
+export function liveSttEnabled(inv: Pick<Invocation, 'platform' | 'attributedAudioEnabled' | 'transcribeEnabled'>): boolean {
+  return inv.transcribeEnabled !== false && !(inv.platform === 'google_meet' && inv.attributedAudioEnabled === true);
+}
+
 /** Thrown when VEXA_BOT_CONFIG is missing / not JSON / off-contract. The composition root
  *  maps this to lifecycle.v1 failed(validation_error, failure_stage=requested). */
 export class InvocationError extends Error {
