@@ -200,6 +200,55 @@ async function main(): Promise<void> {
     check('producer overflow: upload/capture exception is redacted before terminal state',
       fault === 'Error: recording delivery failed (code operation_failed)' && !fault.includes('credential-marker'), fault);
   }
+  // ── 6c) an exhausted chunk leaves a gap without stopping later recording data ─────────────────
+  {
+    const delivered: Array<{ seq: number; final: boolean; bytes: number }> = [];
+    const attempts = new Map<number, number>();
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      retryDelayMs: () => 0,
+      uploadChunk: async (seq, final, _format, bytes) => {
+        const count = (attempts.get(seq) ?? 0) + 1;
+        attempts.set(seq, count);
+        if (seq === 1) throw new Error('temporary private upload detail');
+        delivered.push({ seq, final, bytes: bytes.byteLength });
+      },
+    });
+    const first = sink.chunk('google_meet/gap', 0, false, 'webm', new Uint8Array([0]));
+    const lost = sink.chunk('google_meet/gap', 1, false, 'webm', new Uint8Array([1]));
+    const later = sink.chunk('google_meet/gap', 2, false, 'webm', new Uint8Array([2]));
+    const realFinal = sink.chunk('google_meet/gap', 3, true, 'webm', new Uint8Array([3, 4]));
+    await Promise.all([first, lost, later, realFinal]);
+    let closeRejected = false;
+    try { await sink.close('google_meet/gap'); } catch { closeRejected = true; }
+    check('gap: failed seq1 is attempted three times with bounded retries', attempts.get(1) === 3, String(attempts.get(1)));
+    check('gap: later seq2 is still delivered after the missing seq1', delivered.map((x) => x.seq).join(',') === '0,2,3',
+      JSON.stringify(delivered));
+    check('gap: real final audio uploads as non-final data',
+      delivered[2]?.seq === 3 && !delivered[2].final && delivered[2].bytes === 2, JSON.stringify(delivered));
+    check('gap: no final marker claims a complete recording', delivered.every((x) => !x.final) && closeRejected,
+      JSON.stringify({ delivered, closeRejected }));
+    check('gap: delivery failure is surfaced and resources are released',
+      sink.resourceCounts().failed && sink.resourceCounts().retainedBytes === 0, JSON.stringify(sink.resourceCounts()));
+  }
+
+  // ── 6d) transient chunk errors retry and resume normal complete delivery ──────────────────────
+  {
+    const delivered: Array<{ seq: number; final: boolean }> = [];
+    let attempts = 0;
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      retryDelayMs: () => 0,
+      uploadChunk: async (seq, final) => {
+        if (seq === 0 && ++attempts < 3) throw new Error('transient upload error');
+        delivered.push({ seq, final });
+      },
+    });
+    await sink.chunk('google_meet/retry', 0, false, 'webm', new Uint8Array([7]));
+    await sink.close('google_meet/retry');
+    check('retry: chunk succeeds on third attempt and close completes', attempts === 3 &&
+      delivered.map((x) => `${x.seq}:${x.final}`).join(',') === '0:false,1:true', JSON.stringify({ attempts, delivered }));
+  }
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
