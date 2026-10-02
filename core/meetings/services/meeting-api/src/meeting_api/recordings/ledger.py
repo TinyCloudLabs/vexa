@@ -374,12 +374,12 @@ async def assemble_attributed_manifest(db, meeting_id: int, data: Optional[dict]
     return manifest
 
 
-async def run_meeting_data_mutator(data: dict, mutator, tx_guard=None):
+async def run_meeting_data_mutator(data: dict, mutator):
     """Fake-side ``mutate_meeting_data`` core: ledger-view in, materialized manifest out.
 
-    ``tx_guard`` carries the production session so the caller can prove to the tx-scope gate
-    that the mutator's work runs inside its row-locked transaction. The fake has no transaction,
-    so the value is intentionally unused here.
+    The production adapter binds ``ranges`` to a ``SqlRangeLedger`` before calling the mutator
+    and writes the table back itself; this runner does the same in-memory so the fakes and the
+    tests share the exact ledger contract.
     """
     data = dict(data)
     stored = data.get("attributed_audio_manifest")

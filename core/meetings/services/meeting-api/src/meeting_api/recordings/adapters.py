@@ -33,6 +33,66 @@ async def _flush_range_ledger(tx_guard, ledger):
     session; the ledger binds it at construction and needs no second handle)."""
     await ledger.flush()
 
+async def ensure_attributed_audio_schema(engine) -> None:
+    """Guarantee ``attributed_audio_ranges`` exists before meeting-api serves attributed traffic.
+
+    The table's SSOT is admin-api's ``ensure_schema`` (MIGRATION-0008), but meeting-api is
+    deployed independently (a fork's meeting-api image can ship against an upstream admin-api
+    whose ensure_schema never learned this table) — and the attributed write path fails hard on
+    a missing table. So meeting-api converges its own mirror: the same DDL semantics as
+    ensure_schema — additive only, missing-table → create, missing index → add, existing
+    everything → no-op — scoped to ONE table's metadata so it can never touch the rest of the
+    schema.
+
+    A failed DDL raises: startup must not bind a port and serve attributed-audio requests whose
+    every write faults on a missing table.
+    """
+    from ..sessions.models import AttributedAudioRange
+
+    async with engine.begin() as conn:
+        await conn.run_sync(_sync_attributed_table, AttributedAudioRange.__table__)
+
+
+def _sync_attributed_table(conn, table) -> None:
+    """``ensure_schema`` semantics for one table: create if absent, then converge its indexes.
+
+    Unique indexes are invariants the writer relies on (uq_attributed_range_key is the
+    idempotent-reserve backstop): a failed unique CREATE raises, matching the admin-api
+    fail-closed rule (#1186), rather than logging and starting against a table that cannot keep
+    the contract. Non-unique index failures stay tolerated — a missing probe index degrades
+    latency, never correctness.
+
+    ``UniqueConstraint``s are converged as ``CREATE UNIQUE INDEX IF NOT EXISTS`` — equivalent on
+    Postgres and the only idempotent spelling it offers for a pre-existing partial table.
+    """
+    from sqlalchemy import UniqueConstraint, inspect, text
+
+    inspector = inspect(conn)
+    if table.name not in set(inspector.get_table_names()):
+        table.create(conn)
+        return
+    existing = {idx["name"] for idx in inspector.get_indexes(table.name) if idx["name"]}
+    for index in table.indexes:
+        if index.name and index.name in existing:
+            continue
+        try:
+            with conn.begin_nested():
+                index.create(conn)
+        except Exception:
+            if getattr(index, "unique", False):
+                raise
+    for constraint in table.constraints:
+        if not isinstance(constraint, UniqueConstraint) or not constraint.name:
+            continue
+        if constraint.name in existing:
+            continue
+        cols = ", ".join(f'"{c.name}"' for c in constraint.columns)
+        with conn.begin_nested():
+            conn.execute(text(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS "{constraint.name}" '
+                f'ON "{table.name}" ({cols})'
+            ))
+
 
 class S3Storage:
     """``Storage`` over an S3/MinIO bucket (boto3). Lazy client so the package imports without boto3."""

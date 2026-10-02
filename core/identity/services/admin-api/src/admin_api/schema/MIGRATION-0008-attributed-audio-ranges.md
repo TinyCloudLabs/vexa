@@ -1,9 +1,16 @@
 # MIGRATION-0008 — `attributed_audio_ranges` table (TC-583)
 
-**Status:** applied automatically by `ensure_schema` (`create_all` + additive `_sync_indexes`).
-No out-of-band step and no rewrite of existing rows is required — `meetings.data` payloads are
-migrated lazily by the writer (see "Legacy rows" below). The table is new, so its two unique
-indexes are built against an empty table: no dedup risk, no `CONCURRENTLY` runbook.
+**Status:** applied by EITHER of two convergers, whichever reaches the database first.
+admin-api's `ensure_schema` (`create_all` + additive `_sync_indexes`) converges the whole SSOT on
+its startup; meeting-api's own startup additionally converges just this one table from its mirror
+model (`recordings/adapters.ensure_attributed_audio_schema`, run inside the app lifespan before
+traffic, additive `checkfirst` semantics only). The meeting-api path exists because the services
+deploy independently — a deployment can ship a meeting-api image that contains this table against
+an upstream admin-api image that predates it (ptx-dev's compose runs exactly that pair), and the
+attributed write path fails on a missing table, so meeting-api fails its own startup loudly
+instead. No out-of-band step and no rewrite of existing rows is required — `meetings.data`
+payloads are migrated lazily by the writer (see "Legacy rows" below). The table is new, so its
+two unique indexes are built against an empty table: no dedup risk, no `CONCURRENTLY` runbook.
 
 ## What changes
 
