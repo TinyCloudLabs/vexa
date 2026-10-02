@@ -106,14 +106,14 @@ class RecordingRepo(Protocol):
         self, user_id: int, meeting_id: int, sequence: int
     ) -> Optional[dict]:
         """One owner-scoped read returning ``{"data": meetings.data, "range": payload|None,
-        "key_range": payload|None}`` — the keyed path for
-        ``GET /meetings/{id}/attributed-audio/ranges/{seq}``: index lookups on
-        ``(meeting_id, sequence)`` and ``(meeting_id, idempotency_key)`` instead of assembling
-        the whole manifest, with the header and both payloads in the same snapshot. ``range``
-        holds the table row at the requested sequence; ``key_range`` holds the table row at
-        the FIRST inline row's key at that sequence (the union contract drops a crossed inline
-        row — both axes must be probed to answer what the manifest answers). Probes are
-        ``None`` for a pre-table meeting — inline ``ranges`` still live in ``data``.
+        "table_ranges": list|None}`` — the keyed path for
+        ``GET /meetings/{id}/attributed-audio/ranges/{seq}``. While the header still carries
+        inline ``ranges`` (unmigrated legacy meeting), ``table_ranges`` holds the meeting's
+        whole ordered table row list — the caller recomputes the FULL union, the exact inputs
+        the manifest uses, at the O(ranges) cost the pre-table path paid per download. Once the
+        header is ranges-free (migrated or new meetings), ``table_ranges`` is ``None`` and
+        ``range`` — the ``(meeting_id, sequence)`` unique-index probe — IS the union's row at
+        that sequence. Header and payloads resolve in the same snapshot.
         """
         ...
 

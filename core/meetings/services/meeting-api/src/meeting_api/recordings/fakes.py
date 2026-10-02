@@ -132,13 +132,16 @@ class InMemoryRecordingRepo:
         }
 
     async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
-        """The pre-table shape: no range table exists, so both probes are empty and ``data``
-        still carries the inline ``ranges`` the caller scans."""
+        """The pre-table shape: no range table exists — ``table_ranges`` mirrors ``[]`` when
+        the header still carries inline ``ranges`` and ``None`` once it does not."""
         meeting = self._meetings.get(meeting_id)
         if not meeting or meeting.get("user_id") != user_id:
             return None
         data = meeting.get("data") or {}
-        return {"data": dict(data), "range": None, "key_range": None}
+        manifest = data.get("attributed_audio_manifest")
+        has_inline = isinstance(manifest, dict) and isinstance(manifest.get("ranges"), list)
+        return {"data": dict(data), "range": None,
+                "table_ranges": [] if has_inline else None}
 
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")

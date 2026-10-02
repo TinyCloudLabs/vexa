@@ -387,52 +387,24 @@ async def attributed_range_for_owner(repo, storage, *, user_id: int, meeting_id:
     manifest = (data or {}).get("attributed_audio_manifest")
     if not isinstance(manifest, dict) or manifest.get("state") != "closed":
         raise SessionNotFound("attributed audio range not found")
-    # Union semantics over the bounded probe set: a same-identity pair merges to the
-    # more-advanced payload; a crossed inline twin drops because its key OR sequence is owned
-    # by a different table row — the sequence probe alone cannot see that, so the keyed read
-    # also probed the table for the inline twin's key (``key_range``). Serving the union's
-    # answer keeps the keyed path identical to the manifest before AND after migration.
-    inline_rows = [r for r in manifest.get("ranges") or [] if isinstance(r, dict)]
-    inline_idx = next(
-        (i for i, r in enumerate(inline_rows) if r.get("sequence") == sequence),
-        None,
-    )
-    inline = inline_rows[inline_idx] if inline_idx is not None else None
-    probes: list = []
-    seen_ids: set = set()
-    for probe in (snapshot.get("range"), snapshot.get("key_range")):
-        if not isinstance(probe, dict):
-            continue
-        # Both probes can return the same table row — the union requires axis-unique input,
-        # so one identity enters once.
-        ident = (probe.get("idempotency_key"), probe.get("sequence"))
-        if ident not in seen_ids:
-            seen_ids.add(ident)
-            probes.append(probe)
-    merged = union_ranges(
-        [inline] if isinstance(inline, dict) else [],
-        probes,
-        meeting_id=meeting_id,
-    )
-    if isinstance(inline, dict):
-        key = inline.get("idempotency_key")
-        if (key is not None
-                and any(r.get("idempotency_key") == key
-                        for r in inline_rows[:inline_idx])
-                and not isinstance(snapshot.get("key_range"), dict)):
-            # An earlier inline row shares the key: if it survives, the full union's dedup
-            # drops this candidate (first-wins). Its fate hinges on a table probe the keyed
-            # read does not hold — fail closed rather than serve a row the manifest may not
-            # list. Requires hand-edited duplicate keys; no writer produces them.
-            merged = []
-    # The served row is whatever the union holds at the requested sequence — the surviving
-    # inline twin, the merge winner, or the table row that displaced a crossed twin (the
-    # manifest lists that table row at this sequence, so it is what a download serves). If the
-    # union holds nothing at this sequence — inline twin crossed/dropped and no table row
-    # there — there is nothing to serve: 404, exactly like the manifest.
-    value = next((r for r in merged if r.get("sequence") == sequence), None)
+    # The download serves whatever the union manifest holds at the requested sequence, computed
+    # with the SAME function and inputs the manifest itself uses (TC-583 round-8):
+    # - Unmigrated meeting (header still carries inline ``ranges``): the keyed read aggregated
+    #   the meeting's table rows in the same snapshot — ``union_ranges`` over the FULL inline
+    #   list + table rows resolves every malformed/duplicate/crossed inline row exactly as the
+    #   manifest does.
+    # - Header-only manifest (migrated or new meetings): the unique-index sequence probe IS the
+    #   union's row at that sequence — no inline list, nothing to union.
+    inline = manifest.get("ranges")
+    table_ranges = snapshot.get("table_ranges")
+    if isinstance(inline, list) and table_ranges is not None:
+        unioned = union_ranges(inline, table_ranges, meeting_id=meeting_id)
+        value = next((r for r in unioned if r.get("sequence") == sequence), None)
+    else:
+        value = snapshot.get("range")
     if not isinstance(value, dict) or value.get("state") != "uploaded":
         raise SessionNotFound("attributed audio range not found")
     path = value.get("storage_path")
-    if not isinstance(path, str) or not path.startswith("attributed-audio/"): raise SessionNotFound("attributed audio range not found")
+    if not isinstance(path, str) or not path.startswith("attributed-audio/"):
+        raise SessionNotFound("attributed audio range not found")
     return await storage.get(path)

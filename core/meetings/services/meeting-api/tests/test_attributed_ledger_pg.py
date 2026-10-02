@@ -1158,3 +1158,119 @@ async def test_r7_keyed_download_honors_crossed_identity(pg):
                     repo, storage, user_id=USER, meeting_id=mid, sequence=dropped_seq)
             assert await attributed_range_for_owner(
                 repo, storage, user_id=USER, meeting_id=mid, sequence=kept_seq) == pcm, label
+
+
+async def test_r8_keyed_download_matches_full_union(pg):
+    """Round-8 review: the keyed download must equal the manifest row at each sequence —
+    computed by union_ranges over the SAME inputs (full inline list + whole table), never by
+    special-casing. Seeded parity over malformed duplicate inline rows, crossed identities,
+    and merge losers, before AND after migration.
+
+    Reviewer repros embedded: Opus 11/1009 seq 5 (dup key + crossed); Astra inline
+    (a,1),(a,2) + table (b,2) → seq 2 serves the table row; Astra inline (a,1),(a,2) +
+    table (b,1) → seq 2 serves surviving inline (a,2); Opus 1016 seq 3 (dup sequence:
+    (d,3) dropped, (c,3,uploaded) serves).
+    """
+    pcm = b"\x00\x00\x80?" * 4
+    pcm2 = b"\x00\x00\x80?" * 8
+    from sqlalchemy import insert
+    from meeting_api.sessions.models import AttributedAudioRange
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import (
+        attributed_range_for_owner, attributed_manifest_for_owner)
+    from meeting_api.recordings.fakes import InMemoryStorage
+    from meeting_api.recordings.service import SessionNotFound
+
+    def row(seq, key, path, state="uploaded"):
+        return dict(_meta(seq, key, pcm), state=state, storage_path=path)
+
+    cases = [
+        # Astra: dup inline keys, key collides with table on neither/both axes — seq 2 has a
+        # table row in the first case, only the surviving inline row in the second.
+        ("dups-b2", [row(1, "a", "attributed-audio/1/m/in1.pcm"),
+                     row(2, "a", "attributed-audio/1/m/in2.pcm")],
+                    [row(2, "b", "attributed-audio/1/m/tb2.pcm")]),
+        ("dups-b1", [row(1, "a", "attributed-audio/1/m/in1.pcm"),
+                     row(2, "a", "attributed-audio/1/m/in2.pcm")],
+                    [row(1, "b", "attributed-audio/1/m/tb1.pcm")]),
+        # Opus 1016: duplicate inline sequence — first inline at seq 3 drops on the table's
+        # (d,9); the second inline at seq 3 still serves.
+        ("dup-seq", [row(3, "d", "attributed-audio/1/m/d3.pcm"),
+                     row(3, "c", "attributed-audio/1/m/c3.pcm")],
+                    [row(9, "d", "attributed-audio/1/m/t9.pcm")]),
+        # Opus 11/1009: crossed dup — (a,5) and (a,7) inline with table (a,9),(d,5): seq 5's
+        # candidate drops (crossed), the table row (d,5) serves.
+        ("opus-1009", [row(5, "a", "attributed-audio/1/m/a5.pcm"),
+                       row(7, "a", "attributed-audio/1/m/a7.pcm")],
+                      [row(9, "a", "attributed-audio/1/m/t9.pcm"),
+                       row(5, "d", "attributed-audio/1/m/d5.pcm")]),
+        # Same-identity merge at seq 1 (failed inline vs uploaded table) + a non-uploaded
+        # survivor (failed → 404) + a clean table row.
+        ("mixed", [row(1, "m", "attributed-audio/1/m/m1.pcm", state="failed"),
+                   row(2, "m2", "attributed-audio/1/m/m2.pcm"),
+                   row(4, "f", "attributed-audio/1/m/f4.pcm", state="failed")],
+                  [row(1, "m", "attributed-audio/1/m/m1t.pcm"),
+                   row(3, "n", "attributed-audio/1/m/n3.pcm")]),
+        # A malformed non-dict inline row rides along; union drops it, reads unaffected.
+        ("malformed", [row(1, "a", "attributed-audio/1/m/in1.pcm"), "not-a-dict"],
+                      [row(2, "b", "attributed-audio/1/m/tb2.pcm")]),
+    ]
+
+    for label, inline, table in cases:
+        async with _scratch_database() as (e2, sf2):
+            repo = SqlAlchemyRecordingRepo(sf2)
+            storage = InMemoryStorage()
+            mid = MEETING_ID
+            for r in inline + table:
+                if isinstance(r, dict):
+                    storage.blobs[r["storage_path"]] = pcm2
+            await _seed_meeting(sf2, data={"attributed_audio_manifest": {
+                "version": 1, "meeting_id": str(mid),
+                "clock_origin": "first_admitted_capture_epoch_ms",
+                "clock_origin_ms": 500, "state": "closed",
+                "ranges": [dict(r) if isinstance(r, dict) else r for r in inline]}},
+                meeting_id=mid)
+            async with sf2() as db:
+                for r in table:
+                    await db.execute(insert(AttributedAudioRange).values(
+                        meeting_id=mid, sequence=r["sequence"],
+                        idempotency_key=r["idempotency_key"], payload=dict(r)))
+                await db.commit()
+
+            manifest = await attributed_manifest_for_owner(repo, user_id=USER, meeting_id=mid)
+            listed = {r["sequence"]: r for r in manifest["ranges"]}
+
+            async def check_parity():
+                for seq in range(12):
+                    try:
+                        blob = await attributed_range_for_owner(
+                            repo, storage, user_id=USER, meeting_id=mid, sequence=seq)
+                    except SessionNotFound:
+                        blob = None
+                    if seq not in listed:
+                        assert blob is None, f"{label}: seq {seq} served but not listed"
+                        continue
+                    expected = listed[seq]
+                    if expected["state"] == "uploaded":
+                        # storage_path is stripped from the public manifest — look the row up
+                        # in the repo's union (unstripped) instead.
+                        artifact = await repo.attributed_artifacts_for_owner(USER, mid)
+                        raw = next(r for r in artifact["manifest"]["ranges"]
+                                   if r["sequence"] == seq)
+                        want = storage.blobs[raw["storage_path"]]
+                        assert blob == want, f"{label}: seq {seq} wrong bytes"
+                    else:
+                        assert blob is None, (
+                            f"{label}: seq {seq} state={expected['state']} served")
+
+            # Pre-migration parity: the download answers the union even on corrupt inline
+            # input.
+            await check_parity()
+
+            # Post-migration parity: identical answers on the bounded keyed path.
+            async def _noop(data):
+                return dict(data), True
+            assert await repo.mutate_meeting_data(mid, _noop) is True
+            assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid))[
+                "attributed_audio_manifest"], label
+            await check_parity()

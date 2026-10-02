@@ -217,33 +217,25 @@ class _TableRangeRepo(InMemoryRecordingRepo):
         }
 
     async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
-        """Mirrors the SQL keyed read: ``range`` is the (meeting_id, sequence) table probe and
-        ``key_range`` the (meeting_id, idempotency_key) probe for the FIRST inline twin's key —
-        both over table rows, in one snapshot, exactly as the production SQL."""
+        """Mirrors the SQL keyed read: ``range`` is the (meeting_id, sequence) table probe;
+        ``table_ranges`` is the meeting's whole ordered row list — populated only while the
+        header still carries inline ``ranges`` (pre-migration), exactly as the CASE-guarded
+        aggregate does in production."""
         meeting = self._meetings.get(meeting_id)
         if not meeting or meeting.get("user_id") != user_id:
             return None
         data = meeting.get("data") or {}
         manifest = data.get("attributed_audio_manifest")
-        inline = next(
-            (r for r in (manifest.get("ranges") if isinstance(manifest, dict) else []) or []
-             if isinstance(r, dict) and r.get("sequence") == sequence),
-            None,
-        )
-        key = inline.get("idempotency_key") if isinstance(inline, dict) else None
+        has_inline = isinstance(manifest, dict) and isinstance(manifest.get("ranges"), list)
         found = next(
             (payload for _id, payload in self._table(meeting_id)
              if (payload or {}).get("sequence") == sequence),
             None,
         )
-        key_found = next(
-            (payload for _id, payload in self._table(meeting_id)
-             if key is not None and (payload or {}).get("idempotency_key") == key),
-            None,
-        )
         return {"data": dict(data),
                 "range": dict(found) if isinstance(found, dict) else None,
-                "key_range": dict(key_found) if isinstance(key_found, dict) else None}
+                "table_ranges": ([dict(p) for _id, p in self._table(meeting_id)]
+                                 if has_inline else None)}
 
 class InlineRangeRepo(InMemoryRecordingRepo):
     """Alias for readability: the inline-JSONB durable shape via the shared runner."""
