@@ -253,7 +253,7 @@ async function main(): Promise<void> {
     const final = sink.chunk('google_meet/abort', 2, true, 'webm', new Uint8Array(0)).catch(() => {});
     let closeRejected = false;
     const closing = sink.close('google_meet/abort').catch(() => { closeRejected = true; });
-    await retryStarted.promise;
+    await retryStarted;
     sink.abort(new Error('capture stopped'));
     await Promise.all([data, later, final, closing]);
     check('abort: no retry begins after abort', attempts === 1, String(attempts));
@@ -308,6 +308,33 @@ async function main(): Promise<void> {
       attempts === 1 && delivered.length === 0, JSON.stringify({ attempts, delivered }));
     check('non-retryable 400: sink close rejects without completion', closeRejected && sink.resourceCounts().failed,
       JSON.stringify({ closeRejected, resources: sink.resourceCounts() }));
+  }
+
+  // ── 6g) a full queue rejects the fallback but drains all already-admitted data ────────────────
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: Array<{ seq: number; final: boolean }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      maxRetainedBytes: 1024,
+      uploadChunk: async (seq, final) => {
+        if (seq === 0) await blocked;
+        delivered.push({ seq, final });
+      },
+    });
+    const chunks = Array.from({ length: 128 }, (_, seq) =>
+      sink.chunk('google_meet/saturated', seq, false, 'webm', new Uint8Array([seq & 0xff])));
+    let closeError = '';
+    const closing = sink.close('google_meet/saturated').catch((error) => { closeError = String(error); });
+    release();
+    await Promise.all([...chunks, closing]);
+    check('fallback saturation: all 128 admitted data chunks drain in order',
+      delivered.length === 128 && delivered.every((chunk, seq) => chunk.seq === seq),
+      JSON.stringify({ count: delivered.length, first: delivered[0]?.seq, last: delivered.at(-1)?.seq }));
+    check('fallback saturation: close rejects admission failure without a completion marker',
+      closeError.includes('delivery admission budget exhausted') && delivered.every((chunk) => !chunk.final),
+      JSON.stringify({ closeError, finalCount: delivered.filter((chunk) => chunk.final).length }));
   }
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──

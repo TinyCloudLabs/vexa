@@ -21,8 +21,9 @@
  *     is_final MediaRecorder chunk (the WS closes before it flushes), so on close we POST one empty
  *     is_final upload IF none was sent — the server then flips the recording to COMPLETED. Fires once.
  *   • uploads are serialized on an internal promise queue so parts land in seq order. Retryable
- *     upload errors keep the head chunk in place with capped exponential backoff until recovery
- *     or capture abort; a non-retryable error fails the sink closed without a final marker.
+ *     upload errors keep the head chunk in place with capped exponential backoff until recovery.
+ *     Abort wakes backoff and prevents a new sink attempt; an in-flight uploader may finish its
+ *     own internal retries. Non-retryable errors fail the sink closed without a final marker.
  *
  * L4-gated: the full page→Node→HTTP loss path is proven only by a live compose run. The SINK half
  * (per-chunk upload, correct seq/isFinal/session_uid, retry and loss behavior) is offline-provable
@@ -115,8 +116,10 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   const log = opts.log ?? (() => { /* silent by default */ });
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
   const maxRetainedBytes = opts.maxRetainedBytes ?? DEFAULT_MAX_RECORDING_RETAINED_BYTES;
-  const retryDelayMs = opts.retryDelayMs ?? ((retryIndex: number) =>
-    Math.min(CHUNK_RETRY_MAX_DELAY_MS, CHUNK_RETRY_BASE_DELAY_MS * (2 ** retryIndex)));
+  const retryDelayMs = opts.retryDelayMs ?? ((retryIndex: number) => {
+    const cap = Math.min(CHUNK_RETRY_MAX_DELAY_MS, CHUNK_RETRY_BASE_DELAY_MS * (2 ** retryIndex));
+    return cap * (0.5 + Math.random() * 0.5);
+  });
   if (!Number.isSafeInteger(maxRetainedBytes) || maxRetainedBytes <= 0) throw new Error('recording maxRetainedBytes must be a positive integer');
 
   interface Job {
@@ -215,8 +218,8 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
     abort(reason) {
       if (!failure) failure = fail(reason);
       for (const wake of [...retryWaiters]) wake();
-      // A browser-side producer failure means an admitted part may be missing. Reject queued work
-      // and deliberately leave the server-side recording incomplete; no close fallback is allowed.
+      // A running uploader call cannot be cancelled and may finish its own retries; abort only
+      // prevents this sink from starting another attempt and rejects chunks still queued.
       for (const pending of jobs.splice(0)) {
         retainedBytes -= pending.bytes.byteLength;
         pending.reject(failure);
@@ -231,12 +234,21 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       // Freeze ingress before selecting the fallback sequence. All pre-close calls reserve and
       // append synchronously, so the final marker follows them in the serialized queue.
       closing = true;
-      if (anyChunk && !finalRequested && !failure) void enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), true).catch(() => {});
-      closed = true;
-      // A failing upload rejects close truthfully. Polling is only lifecycle observation; no
-      // caller bytes are parked outside `retainedBytes` while this waits.
+      let fallbackFailure: Error | null = null;
+      if (anyChunk && !finalRequested && !failure) {
+        void enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), true).catch((error) => {
+          fallbackFailure = error instanceof Error ? error : fail(error);
+        });
+      }
+      // Abort exits promptly; a fallback-admission rejection does not fail admitted data, which
+      // continues draining before close reports that it could not enqueue completion.
       while ((uploading || jobs.length) && !failure) await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (failure) throw failure;
+      if (failure) {
+        closed = true;
+        throw failure;
+      }
+      if (fallbackFailure) throw fallbackFailure;
+      closed = true;
     },
     resourceCounts() {
       return { retainedBytes, queuedChunks: jobs.length + (uploading ? 1 : 0), failed: !!failure };
