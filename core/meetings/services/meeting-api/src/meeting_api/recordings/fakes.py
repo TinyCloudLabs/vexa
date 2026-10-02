@@ -131,6 +131,20 @@ class InMemoryRecordingRepo:
             if isinstance(data.get("artifact_deletion"), dict) else None,
         }
 
+    async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
+        meeting = self._meetings.get(meeting_id)
+        if not meeting or meeting.get("user_id") != user_id:
+            return None
+        data = meeting.get("data") or {}
+        manifest = data.get("attributed_audio_manifest")
+        ranges = manifest.get("ranges") if isinstance(manifest, dict) else []
+        found = next(
+            (r for r in ranges or []
+             if isinstance(r, dict) and r.get("sequence") == sequence),
+            None,
+        )
+        return {"data": dict(data), "range": dict(found) if found else None}
+
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")
 

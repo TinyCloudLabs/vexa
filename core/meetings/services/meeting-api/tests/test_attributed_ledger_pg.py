@@ -5,25 +5,32 @@ never prove the ``SqlRangeLedger`` write path. These tests run only when
 ``MEETING_API_TEST_DATABASE_URL`` is set and sqlalchemy+asyncpg are importable — same convention
 as ``test_single_flight.test_pg_advisory_lock_runs_on_real_postgres``.
 
-Proves, against real Postgres:
+Every test gets a DEDICATED SCRATCH DATABASE created/dropped inside the run
+(``tc583_scratch_<pid>_<n>``) — the fixture never drops tables on the configured DSN, which
+other suites also use. Proves, against real Postgres:
 
-  * ``ensure_attributed_audio_schema`` creates ``attributed_audio_ranges`` + indexes and is a
-    no-op second call (the startup DDL meeting-api now runs in its lifespan);
+  * ``ensure_attributed_audio_schema`` is safe under N concurrent boots (advisory-locked —
+    pg_type races produced DuplicateTableError/UniqueViolation crashes pre-fix) and is a no-op
+    second call;
   * reserve → upload → fail → close through ``SqlAlchemyRecordingRepo.mutate_meeting_data``:
-    ranges land as table rows, ``meetings.data`` keeps only the manifest header, and readers
-    assemble the same attributed-audio.v1 manifest;
-  * lazy migration: a meeting whose manifest still carries inline ``ranges`` migrates them into
-    the table on the first row-locked write — and a reserve retry for a key that exists only
-    inline is a REPLAY, not a duplicate;
-  * delete_on_removal: popping the manifest key deletes the meeting's table rows in the same tx;
-  * per-operation write volume stays FLAT as ranges grow: meetings-row byte size constant and
-    WAL bytes per reserve roughly equal at range ~10 and range ~5000 — the quadratic-rewrite
-    failure mode (meeting 85) is gone.
+    ranges land as table rows, ``meetings.data`` keeps only the manifest header;
+  * lazy migration preserves the externally visible union order (inline positions kept) and
+    never lets a stale inline row regress a table row that reached uploaded/failed;
+  * malformed duplicate inline rows are dropped (logged), never an IntegrityError-per-write;
+  * the owner manifest read is ONE statement (a mid-read committed delete cannot surface a
+    closed-empty manifest that never existed);
+  * keyed range downloads resolve by index, not whole-manifest assembly;
+  * MIGRATION-0008's rollback UPDATE folds table rows back inline verbatim;
+  * per-operation write volume stays FLAT as ranges grow — the meeting-85 quadratic rewrite
+    is gone.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
+from pathlib import Path
 
 import pytest
 
@@ -40,37 +47,61 @@ USER = 7
 SESSION_UID = "pg-conn-abc"
 SECRET = "pg-test-token"
 
+_scratch_counter = [0]
+
+
+def _scratch_url(base_url: str) -> tuple[str, str]:
+    """(admin DSN on the maintenance db, scratch DSN). The configured URL's database is never
+    touched — scratch lives in a fresh ``tc583_scratch_*`` database."""
+    _scratch_counter[0] += 1
+    name = f"tc583_scratch_{os.getpid()}_{_scratch_counter[0]}"
+    base = re.sub(r"/[^/]+$", "/postgres", base_url)
+    return base, f"{base.rsplit('/', 1)[0]}/{name}", name
+
 
 @pytest.fixture()
-async def pg(tmp_path):
-    """A real async engine + session factory against MEETING_API_TEST_DATABASE_URL, with the
-    meeting-api mirror schema created. Yields (engine, session_factory); disposes after."""
+async def pg():
+    """(engine, session_factory) bound to a freshly created scratch database with the meeting-api
+    mirror schema. The scratch DB is dropped on teardown."""
     sqlalchemy = pytest.importorskip("sqlalchemy")
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-    from meeting_api.sessions.models import Base
 
-    engine = create_async_engine(os.environ["MEETING_API_TEST_DATABASE_URL"])
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        # ``meetings`` carries expression indexes over the MIGRATION-0005 helper function,
-        # which create_all cannot create — install the function first, exactly as admin-api's
-        # ensure_schema does.
-        from sqlalchemy import text
-        await conn.execute(text(
-            "CREATE OR REPLACE FUNCTION meeting_event_time("
-            "data jsonb, start_time timestamp, created_at timestamp"
-            ") RETURNS timestamp LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $fn$ "
-            "BEGIN RETURN COALESCE("
-            "((data ->> 'scheduled_at')::timestamptz AT TIME ZONE 'UTC'),"
-            "start_time, created_at); "
-            "EXCEPTION WHEN OTHERS THEN RETURN COALESCE(start_time, created_at); "
-            "END $fn$;"))
-        await conn.run_sync(Base.metadata.create_all)
-    sf = async_sessionmaker(engine, expire_on_commit=False)
-    yield engine, sf
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
+    admin_url, scratch_url, scratch_name = _scratch_url(
+        os.environ["MEETING_API_TEST_DATABASE_URL"]
+    )
+    admin = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as c:
+        await c.execute(text(f'CREATE DATABASE "{scratch_name}"'))
+    try:
+        engine = create_async_engine(scratch_url)
+        from meeting_api.sessions.models import Base
+        async with engine.begin() as conn:
+            # ``meetings`` carries expression indexes over the MIGRATION-0005 helper function,
+            # which create_all cannot create — install it first, as admin-api's ensure_schema does.
+            await conn.execute(text(
+                "CREATE OR REPLACE FUNCTION meeting_event_time("
+                "data jsonb, start_time timestamp, created_at timestamp"
+                ") RETURNS timestamp LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $fn$ "
+                "BEGIN RETURN COALESCE("
+                "((data ->> 'scheduled_at')::timestamptz AT TIME ZONE 'UTC'),"
+                "start_time, created_at); "
+                "EXCEPTION WHEN OTHERS THEN RETURN COALESCE(start_time, created_at); "
+                "END $fn$;"))
+            await conn.run_sync(Base.metadata.create_all)
+        # Converge the range table through the production entry point — the same call the app
+        # lifespan runs — so every test exercises the real DDL path.
+        from meeting_api.recordings.adapters import ensure_attributed_audio_schema
+        await ensure_attributed_audio_schema(engine)
+        sf = async_sessionmaker(engine, expire_on_commit=False)
+        yield engine, sf
+        await engine.dispose()
+    finally:
+        # WITH (FORCE) — pg13+ terminates any pooled connection that outlived engine.dispose()
+        # (a failed test can strand one, and a blocked DROP DATABASE then fails teardown).
+        async with admin.connect() as c:
+            await c.execute(text(f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE)'))
+        await admin.dispose()
 
 
 def _meta(sequence: int, key: str, pcm: bytes, *, clock_origin_ms=1000, **overrides) -> dict:
@@ -91,34 +122,34 @@ def _meta(sequence: int, key: str, pcm: bytes, *, clock_origin_ms=1000, **overri
     return meta
 
 
-async def _seed_meeting(sf, *, status="active", data=None):
+async def _seed_meeting(sf, *, status="active", data=None, meeting_id=MEETING_ID):
     from meeting_api.sessions.models import Meeting, MeetingSession
 
     async with sf() as db:
-        db.add(Meeting(id=MEETING_ID, user_id=USER, platform="google_meet",
+        db.add(Meeting(id=meeting_id, user_id=USER, platform="google_meet",
                        platform_specific_id="pg-test", status=status, data=data or {}))
-        db.add(MeetingSession(meeting_id=MEETING_ID, session_uid=SESSION_UID))
+        db.add(MeetingSession(meeting_id=meeting_id, session_uid=SESSION_UID))
         await db.commit()
 
 
-async def _meeting_data(sf):
+async def _meeting_data(sf, meeting_id=MEETING_ID):
     from sqlalchemy import select
     from meeting_api.sessions.models import Meeting
 
     async with sf() as db:
         return (await db.execute(
-            select(Meeting.data).where(Meeting.id == MEETING_ID)
+            select(Meeting.data).where(Meeting.id == meeting_id)
         )).scalar_one()
 
 
-async def _range_rows(sf):
+async def _range_rows(sf, meeting_id=MEETING_ID):
     from sqlalchemy import select
     from meeting_api.sessions.models import AttributedAudioRange
 
     async with sf() as db:
         rows = (await db.execute(
             select(AttributedAudioRange)
-            .where(AttributedAudioRange.meeting_id == MEETING_ID)
+            .where(AttributedAudioRange.meeting_id == meeting_id)
             .order_by(AttributedAudioRange.id)
         )).scalars().all()
         return rows
@@ -126,19 +157,49 @@ async def _range_rows(sf):
 
 async def _table_names(engine):
     async with engine.connect() as conn:
-        return set(await conn.run_sync(lambda c: __import__("sqlalchemy").inspect(c).get_table_names()))
+        return set(await conn.run_sync(
+            lambda c: __import__("sqlalchemy").inspect(c).get_table_names()))
+
+
+async def test_concurrent_ensure_converges_once(pg):
+    """N replicas booting at once must not race pg_type — review saw DuplicateTableError /
+    UniqueViolation at 3–8 concurrent starts. The advisory xact lock serializes them."""
+    import asyncio
+
+    engine, sf = pg
+    await _seed_meeting(sf)  # populated meetings — the FK takes ShareRowExclusiveLock on it
+    from sqlalchemy import text
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP TABLE attributed_audio_ranges"))
+    assert "attributed_audio_ranges" not in await _table_names(engine)
+
+    from meeting_api.recordings.adapters import ensure_attributed_audio_schema
+
+    results = await asyncio.gather(
+        *[ensure_attributed_audio_schema(engine) for _ in range(8)],
+        return_exceptions=True,
+    )
+    assert results == [None] * 8, results
+    assert "attributed_audio_ranges" in await _table_names(engine)
+
+    async with engine.connect() as conn:
+        idx = {r[0] for r in (await conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE tablename='attributed_audio_ranges'"))).all()}
+        assert idx == {"attributed_audio_ranges_pkey",
+                       "uq_attributed_range_key", "uq_attributed_range_sequence"}, idx
+        count = (await conn.execute(text(
+            "SELECT count(*) FROM pg_class WHERE relname='attributed_audio_ranges'"))).scalar()
+        assert count == 1
 
 
 async def test_startup_ddl_creates_then_noops(pg):
     engine, sf = pg
+    await _seed_meeting(sf)
+    from meeting_api.recordings.adapters import ensure_attributed_audio_schema
     from sqlalchemy import text
 
     async with engine.begin() as conn:
-        # Drop just the range table so the startup converger has work to do.
-        await conn.execute(text("DROP TABLE IF EXISTS attributed_audio_ranges"))
-
-    from meeting_api.recordings.adapters import ensure_attributed_audio_schema
-
+        await conn.execute(text("DROP TABLE attributed_audio_ranges"))
     assert "attributed_audio_ranges" not in await _table_names(engine)
     await ensure_attributed_audio_schema(engine)
     assert "attributed_audio_ranges" in await _table_names(engine)
@@ -146,7 +207,6 @@ async def test_startup_ddl_creates_then_noops(pg):
     # Second call is a pure no-op (existing table + indexes → converge path).
     await ensure_attributed_audio_schema(engine)
 
-    # The unique invariants exist by name.
     async with engine.connect() as conn:
         idx = {r[0] for r in (await conn.execute(text(
             "SELECT indexname FROM pg_indexes WHERE tablename='attributed_audio_ranges'"))).all()}
@@ -158,7 +218,7 @@ async def test_reserve_upload_fail_close_through_sql_ledger(pg):
     await _seed_meeting(sf)
     from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
     from meeting_api.recordings.attributed import (
-        close_attributed_manifest, fail_reserved_attributed_range,
+        AttributedConflict, close_attributed_manifest, fail_reserved_attributed_range,
         reserve_attributed_range, upload_reserved_attributed_range,
     )
     from meeting_api.recordings.fakes import InMemoryStorage
@@ -180,7 +240,6 @@ async def test_reserve_upload_fail_close_through_sql_ledger(pg):
     assert len(await _range_rows(sf)) == 1
 
     # Duplicate sequence → conflict; conflicting metadata for the same key → conflict.
-    from meeting_api.recordings.attributed import AttributedConflict
     with pytest.raises(AttributedConflict):
         await reserve_attributed_range(
             repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
@@ -224,6 +283,322 @@ async def test_reserve_upload_fail_close_through_sql_ledger(pg):
         await reserve_attributed_range(
             repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
             range_data=_meta(2, "pg-turn-2", pcm))
+
+
+async def test_migration_preserves_union_order_and_never_regresses(pg):
+    """Reviewer repro: inline [2, 8] where seq-8 is already a table row — a union read shows
+    [2, 8] (inline first); migration must write exactly that order (not [8, 2]), and seq-8's
+    inline 'sealed' twin must NOT overwrite the table row's 'uploaded' payload."""
+    engine, sf = pg
+    pcm = b"\x00\x00\x80?" * 4
+    table_row_8 = dict(_meta(8, "tbl-8", pcm, clock_origin_ms=500), state="uploaded",
+                       storage_path="attributed-audio/7/1/s/8.pcm")
+    await _seed_meeting(sf, data={"attributed_audio_manifest": {
+        "version": 1, "meeting_id": str(MEETING_ID),
+        "clock_origin": "first_admitted_capture_epoch_ms",
+        "clock_origin_ms": 500, "state": "open",
+        "ranges": [
+            dict(_meta(2, "inline-2", pcm, clock_origin_ms=500), state="uploaded",
+                 storage_path="attributed-audio/7/1/s/2.pcm"),
+            dict(_meta(8, "tbl-8", pcm, clock_origin_ms=500), state="sealed",
+                 storage_path="attributed-audio/7/1/s/8.pcm"),
+        ],
+    }})
+    # Seed the table row directly (a range the new image wrote before this meeting's first write).
+    from meeting_api.sessions.models import AttributedAudioRange
+    async with sf() as db:
+        db.add(AttributedAudioRange(meeting_id=MEETING_ID, sequence=8,
+                                    idempotency_key="tbl-8", payload=table_row_8))
+        await db.commit()
+
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+
+    repo = SqlAlchemyRecordingRepo(sf)
+
+    # Pre-migration read shows the union order: inline first → [2, 8].
+    artifact = await repo.attributed_artifacts_for_owner(USER, MEETING_ID)
+    assert [r["sequence"] for r in artifact["manifest"]["ranges"]] == [2, 8]
+
+    # First row-locked write triggers migration; appending seq-9 must keep the union order.
+    await reserve_attributed_range(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        range_data=_meta(9, "new-9", pcm, clock_origin_ms=500))
+
+    rows = await _range_rows(sf)
+    assert [r.sequence for r in rows] == [2, 8, 9]
+    # No regression: the migrated seq-8 row kept the table's uploaded payload.
+    assert rows[1].payload["state"] == "uploaded"
+
+    # Post-migration read is IDENTICAL to the pre-migration union order.
+    artifact = await repo.attributed_artifacts_for_owner(USER, MEETING_ID)
+    assert [r["sequence"] for r in artifact["manifest"]["ranges"]] == [2, 8, 9]
+    assert artifact["manifest"]["ranges"][1]["state"] == "uploaded"
+    data = await _meeting_data(sf)
+    assert "ranges" not in data["attributed_audio_manifest"]
+
+
+async def test_malformed_inline_duplicates_migrate_instead_of_500(pg, caplog):
+    """Opus L3: a legacy inline list carrying duplicate sequences/keys must NOT raise
+    IntegrityError on every write (permanent 500 for that meeting). Migration dedups
+    first-occurrence-wins and logs."""
+    engine, sf = pg
+    pcm = b"\x00\x00\x80?" * 4
+    dup_seq = [
+        dict(_meta(3, "dup-a", pcm, clock_origin_ms=500), state="uploaded"),
+        dict(_meta(3, "dup-b", pcm, clock_origin_ms=500), state="sealed"),
+        dict(_meta(4, "dup-a", pcm, clock_origin_ms=500), state="sealed"),  # same KEY as row 0
+        dict(_meta(5, "ok-5", pcm, clock_origin_ms=500), state="uploaded"),
+        "not-a-dict",
+    ]
+    await _seed_meeting(sf, data={"attributed_audio_manifest": {
+        "version": 1, "meeting_id": str(MEETING_ID),
+        "clock_origin": "first_admitted_capture_epoch_ms",
+        "clock_origin_ms": 500, "state": "open", "ranges": dup_seq,
+    }})
+
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    import logging
+    with caplog.at_level(logging.WARNING, logger="meeting_api.recordings.ledger"):
+        await reserve_attributed_range(
+            repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            range_data=_meta(6, "new-6", pcm, clock_origin_ms=500))
+
+    rows = await _range_rows(sf)
+    assert [r.sequence for r in rows] == [3, 5, 6]
+    assert rows[0].idempotency_key == "dup-a"
+    assert any("dropped" in rec.message for rec in caplog.records)
+
+    # A second write hits no IntegrityError — the meeting's write path is healed.
+    await reserve_attributed_range(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        range_data=_meta(7, "new-7", pcm, clock_origin_ms=500))
+    assert [r.sequence for r in await _range_rows(sf)] == [3, 5, 6, 7]
+
+
+async def test_owner_manifest_read_is_one_statement(pg):
+    """Astra's read-shape finding: data + ranges in ONE snapshot — a deletion committing between
+    two statements must never yield a closed-empty manifest. Proven by statement count."""
+    engine, sf = pg
+    await _seed_meeting(sf)
+    from sqlalchemy import event, text
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    pcm = b"\x00\x00\x80?" * 4
+    for i in range(3):
+        await reserve_attributed_range(
+            repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            range_data=_meta(i, f"r-{i}", pcm))
+
+    statements = []
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(engine.sync_engine, "before_cursor_execute", _count)
+    try:
+        artifact = await repo.attributed_artifacts_for_owner(USER, MEETING_ID)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count)
+
+    assert artifact["manifest"] is not None
+    assert [r["sequence"] for r in artifact["manifest"]["ranges"]] == [0, 1, 2]
+    data_reads = [s for s in statements if "meetings" in s.lower() and "select" in s.lower()]
+    assert len(data_reads) == 1, f"owner read must be ONE snapshot, saw: {data_reads}"
+
+
+async def test_owner_read_never_surfaces_closed_empty_phantom(pg):
+    """The interleaving Astra flagged: a delete commits between the old reader's two statements →
+    closed manifest with zero ranges (never durably existed). The single-statement read makes the
+    interleaving impossible; assert it additionally under a real concurrent delete."""
+    engine, sf = pg
+    await _seed_meeting(sf)
+    import asyncio
+    from sqlalchemy import delete as sa_delete
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+    from meeting_api.sessions.models import AttributedAudioRange, Meeting
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    pcm = b"\x00\x00\x80?" * 4
+    for i in range(20):
+        await reserve_attributed_range(
+            repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            range_data=_meta(i, f"c-{i}", pcm))
+
+    async def _deleter():
+        async with sf() as db:
+            m = (await db.execute(
+                __import__("sqlalchemy").select(Meeting).where(Meeting.id == MEETING_ID)
+                .with_for_update()
+            )).scalars().first()
+            data = dict(m.data)
+            data.pop("attributed_audio_manifest", None)
+            from sqlalchemy.orm.attributes import flag_modified
+            m.data = data
+            flag_modified(m, "data")
+            await db.execute(sa_delete(AttributedAudioRange).where(
+                AttributedAudioRange.meeting_id == MEETING_ID))
+            await db.commit()
+
+    async def _reader():
+        seen = []
+        for _ in range(50):
+            artifact = await repo.attributed_artifacts_for_owner(USER, MEETING_ID)
+            seen.append(artifact["manifest"] if artifact else None)
+        return seen
+
+    reader = asyncio.create_task(_reader())
+    deleter = asyncio.create_task(_deleter())
+    manifests, _ = await asyncio.gather(reader, deleter)
+    for manifest in manifests:
+        if manifest is None:
+            continue  # read raced the delete and correctly saw it gone
+        assert manifest["ranges"], (
+            "phantom closed-empty manifest — header survived the read while the range rows "
+            "from a committed delete vanished")
+        assert len(manifest["ranges"]) == 20
+
+
+async def test_keyed_range_download_uses_index(pg):
+    """GET /meetings/{id}/attributed-audio/ranges/{seq} must resolve through the unique index —
+    not the O(ranges) manifest assembly that made staged downloads O(n²)."""
+    engine, sf = pg
+    await _seed_meeting(sf)
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import (
+        close_attributed_manifest, reserve_attributed_range,
+        upload_reserved_attributed_range,
+    )
+    from meeting_api.recordings.fakes import InMemoryStorage
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    storage = InMemoryStorage()
+    pcm = b"\x00\x00\x80?" * 4
+    meta0 = _meta(0, "dl-0", pcm)
+    meta1 = _meta(1, "dl-1", pcm)
+    await reserve_attributed_range(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta0)
+    await upload_reserved_attributed_range(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        range_data=meta0, data=pcm)
+    await reserve_attributed_range(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID, range_data=meta1)
+    await upload_reserved_attributed_range(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        range_data=meta1, data=pcm)
+    await close_attributed_manifest(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID)
+
+    from sqlalchemy import event
+    from meeting_api.recordings.attributed import attributed_range_for_owner
+
+    statements = []
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(engine.sync_engine, "before_cursor_execute", _count)
+    try:
+        blob = await attributed_range_for_owner(
+            repo, storage, user_id=USER, meeting_id=MEETING_ID, sequence=1)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count)
+    assert blob == pcm
+    # One statement — and it names the unique probe columns, not a manifest scan.
+    assert len(statements) == 1, statements
+    assert "sequence" in statements[0] and "meetings" in statements[0]
+
+    # Missing sequence → not found (fake storage still has both blobs).
+    from meeting_api.recordings.service import SessionNotFound
+    with pytest.raises(SessionNotFound):
+        await attributed_range_for_owner(
+            repo, storage, user_id=USER, meeting_id=MEETING_ID, sequence=99)
+    # Unowned meeting → not found.
+    with pytest.raises(SessionNotFound):
+        await attributed_range_for_owner(
+            repo, storage, user_id=999, meeting_id=MEETING_ID, sequence=0)
+    # A pending artifact_deletion fences the download in the same snapshot.
+    async def _settle(data):
+        d = dict(data)
+        d["artifact_deletion"] = {"state": "pending", "cleanup_version": 1,
+                                  "requested_at": "2026-10-02T00:00:00Z"}
+        return d, True
+    assert await repo.mutate_meeting_data(MEETING_ID, _settle) is True
+    with pytest.raises(SessionNotFound):
+        await attributed_range_for_owner(
+            repo, storage, user_id=USER, meeting_id=MEETING_ID, sequence=0)
+
+
+async def test_rollback_sql_restores_inline_manifest(pg):
+    """Opus M2: before a base image can run against a migrated database, table rows fold back
+    into meetings.data. Runs MIGRATION-0008-rollback.sql verbatim so the reviewed script and the
+    tested script can never drift."""
+    engine, sf = pg
+    await _seed_meeting(sf)
+    from sqlalchemy import text
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    pcm = b"\x00\x00\x80?" * 4
+    for i in range(3):
+        await reserve_attributed_range(
+            repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            range_data=_meta(i, f"rb-{i}", pcm))
+    assert "ranges" not in (await _meeting_data(sf))["attributed_audio_manifest"]
+
+    # The reviewed script, verbatim from the admin-api schema directory.
+    sql_file = next(
+        p for p in Path(__file__).resolve().parents
+        if (p / "core/identity/services/admin-api/src/admin_api/schema/"
+            "MIGRATION-0008-rollback.sql").exists()
+    )
+    sql = (sql_file / "core/identity/services/admin-api/src/admin_api/schema/"
+           "MIGRATION-0008-rollback.sql").read_text()
+    # Strip comment lines first — a ';' inside a -- comment must not split a statement.
+    code = "\n".join(l for l in sql.split("\n") if not l.strip().startswith("--"))
+    statements = [s.strip() for s in code.split(";") if s.strip()]
+    assert len(statements) == 1
+    async with sf() as db:
+        await db.execute(text(statements[0]))
+        await db.commit()
+
+    data = await _meeting_data(sf)
+    ranges = data["attributed_audio_manifest"]["ranges"]
+    assert [r["idempotency_key"] for r in ranges] == ["rb-0", "rb-1", "rb-2"]
+
+    # Idempotent: re-running rewrites the same union.
+    async with sf() as db:
+        await db.execute(text(statements[0]))
+        await db.commit()
+    ranges2 = (await _meeting_data(sf))["attributed_audio_manifest"]["ranges"]
+    assert [r["idempotency_key"] for r in ranges2] == ["rb-0", "rb-1", "rb-2"]
+
+
+async def test_manifest_removal_deletes_range_rows(pg):
+    engine, sf = pg
+    await _seed_meeting(sf, status="completed")
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+
+    repo = SqlAlchemyRecordingRepo(sf)
+    pcm = b"\x00\x00\x80?" * 4
+    await reserve_attributed_range(
+        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        range_data=_meta(0, "doomed", pcm))
+    assert len(await _range_rows(sf)) == 1
+
+    # A mutator that pops the manifest key must drop the table rows in the same transaction.
+    async def _drop(data):
+        next_data = dict(data)
+        next_data.pop("attributed_audio_manifest", None)
+        return next_data, True
+
+    assert await repo.mutate_meeting_data(MEETING_ID, _drop) is True
+    assert await _range_rows(sf) == []
+    assert "attributed_audio_manifest" not in await _meeting_data(sf)
 
 
 async def test_legacy_inline_ranges_migrate_on_first_write(pg):
@@ -273,30 +648,6 @@ async def test_legacy_inline_ranges_migrate_on_first_write(pg):
         "legacy-0", "legacy-1", "new-turn"]
 
 
-async def test_manifest_removal_deletes_range_rows(pg):
-    engine, sf = pg
-    await _seed_meeting(sf, status="completed")
-    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
-    from meeting_api.recordings.attributed import reserve_attributed_range
-
-    repo = SqlAlchemyRecordingRepo(sf)
-    pcm = b"\x00\x00\x80?" * 4
-    await reserve_attributed_range(
-        repo, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
-        range_data=_meta(0, "doomed", pcm))
-    assert len(await _range_rows(sf)) == 1
-
-    # A mutator that pops the manifest key must drop the table rows in the same transaction.
-    async def _drop(data):
-        next_data = dict(data)
-        next_data.pop("attributed_audio_manifest", None)
-        return next_data, True
-
-    assert await repo.mutate_meeting_data(MEETING_ID, _drop) is True
-    assert await _range_rows(sf) == []
-    assert "attributed_audio_manifest" not in await _meeting_data(sf)
-
-
 async def test_write_volume_stays_flat_as_ranges_grow(pg):
     """The TC-583 acceptance: per-reserve write volume is ~constant at ~10 ranges and ~5000
     ranges, and the meetings row stops growing with range count. The pre-TC-583 JSONB writer
@@ -320,7 +671,6 @@ async def test_write_volume_stays_flat_as_ranges_grow(pg):
     async def _wal_one(seq):
         """WAL bytes produced by ONE fresh reserve, on an otherwise idle database."""
         async with sf() as db:
-            await db.execute(text("SELECT pg_current_wal_lsn()"))
             before = (await db.execute(
                 text("SELECT pg_current_wal_lsn()"))).scalar()
         await _reserve(seq)

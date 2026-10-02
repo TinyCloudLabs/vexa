@@ -102,6 +102,17 @@ class RecordingRepo(Protocol):
         """
         ...
 
+    async def attributed_range_state_for_owner(
+        self, user_id: int, meeting_id: int, sequence: int
+    ) -> Optional[dict]:
+        """One owner-scoped read returning ``{"data": meetings.data, "range": payload|None}`` —
+        the keyed path for ``GET /meetings/{id}/attributed-audio/ranges/{seq}``: an index lookup
+        on ``(meeting_id, sequence)`` instead of assembling the whole manifest, with the header
+        and range payload in the same snapshot. ``range`` is ``None`` for a pre-table manifest
+        (inline ``ranges`` still live in ``data`` — the caller scans them).
+        """
+        ...
+
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         """The ``user_id`` that owns ``meeting_id`` — used to scope ``GET /recordings`` listing."""
         ...

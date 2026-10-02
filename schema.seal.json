@@ -11,9 +11,9 @@
       "user_id": "Column(Integer, ForeignKey('users.id'), nullable=False, index=True)"
     },
     "attributed_audio_ranges": {
-      "id": "Column(Integer, primary_key=True, index=True)",
+      "id": "Column(Integer, primary_key=True)",
       "idempotency_key": "Column(Text, nullable=True)",
-      "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False, index=True)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False)",
       "payload": "Column(JSONB, nullable=False, server_default=text(\"'{}'::jsonb\"), default=lambda: {})",
       "sequence": "Column(Integer, nullable=True)"
     },
@@ -65,9 +65,9 @@
   },
   "core/meetings/services/meeting-api/src/meeting_api/sessions/models.py": {
     "attributed_audio_ranges": {
-      "id": "Column(Integer, primary_key=True, index=True)",
+      "id": "Column(Integer, primary_key=True)",
       "idempotency_key": "Column(Text, nullable=True)",
-      "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False, index=True)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False)",
       "payload": "Column(JSONB, nullable=False, server_default=text(\"'{}'::jsonb\"), default=lambda: {})",
       "sequence": "Column(Integer, nullable=True)"
     },

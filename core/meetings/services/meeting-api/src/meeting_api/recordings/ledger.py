@@ -9,13 +9,22 @@ ordered ledger for the read / close / delete paths that genuinely need the whole
 Iteration, ``len()``, indexing and equality on an UNMATERIALIZED ledger raise — a hot path must
 never page the full ledger in by accident, and a caller that needs the list must say so.
 
-``assemble_attributed_manifest`` rebuilds the public manifest shape (header + ordered ranges,
-unioning any pre-table inline ``ranges`` still stored in ``meetings.data``) for every reader that
-keeps the attributed-audio.v1 JSON contract.
+``union_ranges`` is THE dedup/ordering contract shared by reads and migration: given the inline
+``manifest["ranges"]`` still stored in ``meetings.data`` and the meeting's table rows, it returns
+one collision-free ordered list — inline rows keep their positions, non-colliding table rows
+append after, and a collision adopts the more-advanced payload (a table row at uploaded/failed
+never regresses to a stale inline reservation). Readers union; migration writes the union back to
+the table — so a write that migrates cannot reorder or regress the externally visible manifest.
+
+``assemble_attributed_manifest`` applies ``union_ranges`` to rebuild the public manifest shape
+for every reader that keeps the attributed-audio.v1 JSON contract.
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+log = logging.getLogger("meeting_api.recordings.ledger")
 
 
 class RangeLedger:
@@ -36,8 +45,6 @@ class RangeLedger:
     async def find(self, idempotency_key) -> Optional[dict]:
         """The live row for one idempotency key, or ``None``."""
         raise NotImplementedError
-
-
 
     async def has_sequence(self, sequence: int) -> bool:
         raise NotImplementedError
@@ -98,6 +105,80 @@ class MemoryRangeLedger(RangeLedger):
 
     def append(self, row: dict) -> None:
         self._rows.append(row)
+
+
+# A range's lifecycle rank — used only to resolve inline↔table collisions so a stale inline row
+# can never regress a more-advanced table row (sealed reservation → uploaded/failed) during the
+# lazy migration. Unknown/absent states rank lowest (they lose).
+_RANGE_STATE_RANK = {"uploaded": 2, "failed": 2}
+
+
+def _merge_collision(existing: dict, incoming: dict) -> dict:
+    """One surviving payload for a (key|sequence) collision: the more-advanced state wins, ties
+    keep the row already in place. ``incoming`` is the TABLE row for union reads/migration —
+    the durable copy is preferred when states rank equal."""
+    if _RANGE_STATE_RANK.get(incoming.get("state"), 0) > _RANGE_STATE_RANK.get(existing.get("state"), 0):
+        return incoming
+    return existing
+
+
+def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None) -> list:
+    """The union of a header's inline ``ranges`` and the meeting's table rows, in THE canonical
+    order every reader and the lazy migration share:
+
+    1. Inline rows, in stored order, deduplicated first-wins on idempotency_key OR sequence
+       (a malformed legacy row carrying a duplicate can otherwise never migrate — its INSERT
+       would violate the unique constraints on every write, permanently 500-ing the meeting;
+       Opus L3). Drops are logged, not silent.
+    2. Each table row, in table order: a key/sequence collision merges INTO the inline row's
+       position (the collision payload keeps the inline row's place but may carry the table
+       payload — ``_merge_collision``), a non-colliding row appends.
+
+    Every element returned is a fresh dict — callers may mutate freely.
+    """
+    out: list = []
+    by_key: dict = {}
+    by_seq: dict = {}
+    dropped = 0
+    for row in inline_rows or []:
+        if not isinstance(row, dict):
+            dropped += 1
+            continue
+        key, seq = row.get("idempotency_key"), row.get("sequence")
+        if (key is not None and key in by_key) or (seq is not None and seq in by_seq):
+            dropped += 1
+            continue
+        pos = len(out)
+        out.append(dict(row))
+        if key is not None:
+            by_key[key] = pos
+        if seq is not None:
+            by_seq[seq] = pos
+    if dropped:
+        log.warning(
+            "attributed-audio migration dropped %d malformed/duplicate inline range row(s) "
+            "for meeting %s", dropped, meeting_id,
+        )
+    for row in table_rows or []:
+        if not isinstance(row, dict):
+            continue
+        row = dict(row)
+        key, seq = row.get("idempotency_key"), row.get("sequence")
+        pos = None
+        if key is not None and key in by_key:
+            pos = by_key[key]
+        elif seq is not None and seq in by_seq:
+            pos = by_seq[seq]
+        if pos is None:
+            pos = len(out)
+            out.append(row)
+        else:
+            out[pos] = _merge_collision(out[pos], row)
+        if key is not None:
+            by_key[key] = pos
+        if seq is not None:
+            by_seq[seq] = pos
+    return out
 
 
 class SqlRangeLedger(RangeLedger):
@@ -228,56 +309,48 @@ class SqlRangeLedger(RangeLedger):
     async def migrate(self, legacy_rows) -> None:
         """Move pre-table inline ``manifest["ranges"]`` rows into the ledger table.
 
-        A table row with the same idempotency key or sequence is rebound (payload UPDATE) rather
-        than duplicated, so mid-deployment overlap converges instead of violating the unique
-        constraints. Runs under the meetings-row lock that scopes this ledger.
+        The table is rewritten to EXACTLY ``union_ranges`` order — inline rows keep their
+        positions, non-colliding table rows follow — so a mutator whose first write migrates
+        never reorders the externally visible manifest (a read is the same union). Collisions
+        resolve via ``union_ranges``: the more-advanced payload survives, so a stale inline
+        reservation cannot regress a table row that already reached uploaded/failed, and a
+        malformed duplicate inline row is dropped (never an IntegrityError that 500s the
+        meeting's write path on every call). Runs under the meetings-row lock that scopes
+        this ledger.
         """
         rows = [dict(r) for r in legacy_rows if isinstance(r, dict)]
         if not rows:
             return
-        from sqlalchemy import select, update
+        from sqlalchemy import delete, select
 
         from ..sessions.models import AttributedAudioRange
 
         existing = (
             await self._db.execute(
-                select(
-                    AttributedAudioRange.id,
-                    AttributedAudioRange.idempotency_key,
-                    AttributedAudioRange.sequence,
-                ).where(AttributedAudioRange.meeting_id == self._meeting_id)
+                select(AttributedAudioRange.payload)
+                .where(AttributedAudioRange.meeting_id == self._meeting_id)
+                .order_by(AttributedAudioRange.id)
             )
-        ).all()
-        by_key = {}
-        by_seq = {}
-        for row_id, key, seq in existing:
-            if key is not None:
-                by_key.setdefault(key, row_id)
-            if seq is not None:
-                by_seq.setdefault(seq, row_id)
-        for row in rows:
-            row_id = by_key.get(row.get("idempotency_key"))
-            if row_id is None:
-                row_id = by_seq.get(row.get("sequence"))
-            if row_id is None:
-                self._db.add(
-                    AttributedAudioRange(
-                        meeting_id=self._meeting_id,
-                        sequence=row.get("sequence"),
-                        idempotency_key=row.get("idempotency_key"),
-                        payload=row,
-                    )
+        ).scalars().all()
+        merged = union_ranges(rows, existing, meeting_id=self._meeting_id)
+
+        # Wholesale rewrite in union order under the row lock — the row ids are internal, and
+        # migration runs at most once per meeting (the header's inline list is stripped on the
+        # same write), so the O(n) delete+insert is a one-time cost.
+        await self._db.execute(
+            delete(AttributedAudioRange).where(
+                AttributedAudioRange.meeting_id == self._meeting_id
+            )
+        )
+        for row in merged:
+            self._db.add(
+                AttributedAudioRange(
+                    meeting_id=self._meeting_id,
+                    sequence=row.get("sequence"),
+                    idempotency_key=row.get("idempotency_key"),
+                    payload=row,
                 )
-            else:
-                await self._db.execute(
-                    update(AttributedAudioRange)
-                    .where(AttributedAudioRange.id == row_id)
-                    .values(
-                        payload=row,
-                        sequence=row.get("sequence"),
-                        idempotency_key=row.get("idempotency_key"),
-                    )
-                )
+            )
         await self._db.flush()
 
     async def flush(self) -> None:
@@ -341,10 +414,10 @@ def stored_manifest(manifest: dict) -> dict:
 
 
 async def assemble_attributed_manifest(db, meeting_id: int, data: Optional[dict]) -> Optional[dict]:
-    """The public manifest shape: stored header + ordered table ranges, unioned with any
-    pre-table inline ``ranges`` (legacy rows win on key/sequence collisions, matching the lazy
-    migration's ordering). ``None`` when no manifest exists — a meeting without a header never
-    synthesized one."""
+    """The public manifest shape: stored header + the ``union_ranges`` merge of any pre-table
+    inline ``ranges`` with the meeting's table rows (inline position kept; collisions carry the
+    more-advanced payload — the same list a migration writes back). ``None`` when no manifest
+    exists — a meeting without a header never synthesized one."""
     from sqlalchemy import select
 
     from ..sessions.models import AttributedAudioRange
@@ -359,18 +432,10 @@ async def assemble_attributed_manifest(db, meeting_id: int, data: Optional[dict]
             .order_by(AttributedAudioRange.id)
         )
     ).scalars().all()
-    merged = [dict(r) for r in header.get("ranges") or [] if isinstance(r, dict)]
-    seen_keys = {r.get("idempotency_key") for r in merged if r.get("idempotency_key") is not None}
-    seen_seqs = {r.get("sequence") for r in merged if r.get("sequence") is not None}
-    for payload in records:
-        row = dict(payload or {})
-        if (row.get("idempotency_key") is not None and row.get("idempotency_key") in seen_keys) or (
-            row.get("sequence") is not None and row.get("sequence") in seen_seqs
-        ):
-            continue
-        merged.append(row)
     manifest = dict(header)
-    manifest["ranges"] = merged
+    manifest["ranges"] = union_ranges(
+        header.get("ranges") or [], records, meeting_id=meeting_id
+    )
     return manifest
 
 

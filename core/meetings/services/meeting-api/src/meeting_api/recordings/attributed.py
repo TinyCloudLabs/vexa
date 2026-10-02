@@ -6,7 +6,8 @@ import math
 from typing import Optional
 
 from .service import SessionNotFound
-from .ledger import ledger_empty, ledger_find, ledger_has_sequence, ledger_rows, materialize_manifest
+from .ledger import (ledger_empty, ledger_find, ledger_has_sequence, ledger_rows,
+                     materialize_manifest, union_ranges)
 
 MAX_ATTRIBUTED_AUDIO_BYTES = 32 * 1024 * 1024
 # Browser callbacks are timestamped on a scheduling clock while PCM is sample-clocked. The public
@@ -374,12 +375,34 @@ async def attributed_manifest_for_owner(repo, *, user_id: int, meeting_id: int) 
 
 
 async def attributed_range_for_owner(repo, storage, *, user_id: int, meeting_id: int, sequence: int) -> bytes:
-    artifact = await repo.attributed_artifacts_for_owner(user_id, meeting_id)
-    if artifact and (artifact.get("artifact_deletion") or {}).get("state") in ("pending", "completed"):
+    # One keyed index lookup — not the whole manifest. The owner download path fetches ranges
+    # one call at a time, so an assemble-per-download shape reads O(ranges²) per meeting (worse
+    # than the pre-table shape at 10k ranges). The keyed read returns header + range payload in
+    # the same snapshot, so the deletion/state checks see one consistent view.
+    snapshot = await repo.attributed_range_state_for_owner(user_id, meeting_id, sequence)
+    data = snapshot.get("data") if snapshot else None
+    deletion = (data or {}).get("artifact_deletion") or {}
+    if deletion.get("state") in ("pending", "completed"):
         raise SessionNotFound("attributed audio range not found")
-    manifest = artifact.get("manifest") if artifact else None
-    if not manifest or manifest.get("state") != "closed": raise SessionNotFound("attributed audio range not found")
-    value = next((r for r in manifest.get("ranges", []) if r.get("sequence") == sequence and r.get("state") == "uploaded"), None)
-    path = value.get("storage_path") if isinstance(value, dict) else None
+    manifest = (data or {}).get("attributed_audio_manifest")
+    if not isinstance(manifest, dict) or manifest.get("state") != "closed":
+        raise SessionNotFound("attributed audio range not found")
+    value = snapshot.get("range")
+    # Union semantics on a collision: the inline twin keeps its slot but the more-advanced
+    # payload wins — the same merge the manifest read and migration use.
+    inline = next(
+        (r for r in manifest.get("ranges") or []
+         if isinstance(r, dict) and r.get("sequence") == sequence),
+        None,
+    )
+    merged = union_ranges(
+        [inline] if isinstance(inline, dict) else [],
+        [value] if isinstance(value, dict) else [],
+        meeting_id=meeting_id,
+    )
+    value = merged[0] if merged else None
+    if not isinstance(value, dict) or value.get("state") != "uploaded":
+        raise SessionNotFound("attributed audio range not found")
+    path = value.get("storage_path")
     if not isinstance(path, str) or not path.startswith("attributed-audio/"): raise SessionNotFound("attributed audio range not found")
     return await storage.get(path)

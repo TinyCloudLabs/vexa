@@ -225,8 +225,8 @@ class AttributedAudioRange(Base):
 
     __tablename__ = "attributed_audio_ranges"
 
-    id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False)
     sequence = Column(Integer, nullable=True)
     idempotency_key = Column(Text, nullable=True)
     payload = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=lambda: {})

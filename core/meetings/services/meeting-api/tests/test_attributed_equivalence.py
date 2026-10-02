@@ -43,6 +43,7 @@ from meeting_api.recordings.ledger import (
     ledger_manifest,
     run_meeting_data_mutator,
     stored_manifest,
+    union_ranges,
 )
 
 SECRET = "test-admin-token"
@@ -113,29 +114,20 @@ class _TableRangeLedger(RangeLedger):
         self._appends.append(row)
         if self._rows is not None:
             self._rows.append(row)
-
     async def migrate(self, legacy_rows) -> None:
-        """Fold pre-table inline rows into the table (dedup by key, else sequence, else insert) —
-        same reconciliation as ``SqlRangeLedger.migrate``."""
-        for row in (r for r in legacy_rows if isinstance(r, dict)):
-            row = dict(row)
-            hit = next(
-                (p for _id, p in self._table
-                 if (p or {}).get("idempotency_key") == row.get("idempotency_key")),
-                None,
-            )
-            if hit is None:
-                hit = next(
-                    (p for _id, p in self._table
-                     if (p or {}).get("sequence") == row.get("sequence")),
-                    None,
-                )
-            if hit is None:
-                next_id = (max((_id for _id, _p in self._table), default=0) + 1)
-                self._table.append((next_id, row))
-            else:
-                hit.clear()
-                hit.update(row)
+        """Fold pre-table inline rows into the table in ``union_ranges`` order — the same
+        merge the SQL ledger writes back (inline positions kept, non-colliding table rows
+        appended, collisions carry the more-advanced payload, malformed/dup inline rows
+        dropped)."""
+        merged = union_ranges(
+            [dict(r) for r in legacy_rows if isinstance(r, dict)],
+            [dict(p) for _id, p in self._table],
+            meeting_id=None,
+        )
+        # Rewrite the table in union order (mirrors SqlRangeLedger.migrate's delete+reinsert).
+        self._table.clear()
+        for i, row in enumerate(merged):
+            self._table.append((i + 1, row))
 
     async def flush(self) -> None:
         """Persist staged appends and dirty vended rows; clean vended rows cost no write."""
@@ -210,27 +202,41 @@ class _TableRangeRepo(InMemoryRecordingRepo):
         header = data.get("attributed_audio_manifest")
         manifest = None
         if isinstance(header, dict):
-            # Same assembly as ``assemble_attributed_manifest``: stored header + ordered table
-            # rows, unioning any pre-table inline rows still in the header (inline first,
-            # dedup by idempotency_key then sequence).
-            merged = [dict(r) for r in header.get("ranges") or [] if isinstance(r, dict)]
-            seen_keys = {r.get("idempotency_key") for r in merged if r.get("idempotency_key") is not None}
-            seen_seqs = {r.get("sequence") for r in merged if r.get("sequence") is not None}
-            for _id, payload in self._table(meeting_id):
-                row = dict(payload or {})
-                if (row.get("idempotency_key") is not None and row.get("idempotency_key") in seen_keys) or (
-                    row.get("sequence") is not None and row.get("sequence") in seen_seqs
-                ):
-                    continue
-                merged.append(row)
+            # Same assembly as ``union_ranges``: stored header + ordered table rows, unioning
+            # any pre-table inline rows still in the header (inline positions kept).
             manifest = dict(header)
-            manifest["ranges"] = merged
+            manifest["ranges"] = union_ranges(
+                header.get("ranges") or [],
+                [payload for _id, payload in self._table(meeting_id)],
+                meeting_id=meeting_id,
+            )
         return {
             "manifest": manifest,
             "artifact_deletion": dict(data["artifact_deletion"])
             if isinstance(data.get("artifact_deletion"), dict) else None,
         }
 
+    async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
+        """Mirrors the SQL keyed read: one (meeting_id, sequence) probe over the table rows,
+        falling back to inline ``ranges`` when no table row exists (pre-migration meeting)."""
+        meeting = self._meetings.get(meeting_id)
+        if not meeting or meeting.get("user_id") != user_id:
+            return None
+        data = meeting.get("data") or {}
+        found = next(
+            (payload for _id, payload in self._table(meeting_id)
+             if (payload or {}).get("sequence") == sequence),
+            None,
+        )
+        if found is None:
+            manifest = data.get("attributed_audio_manifest")
+            ranges = manifest.get("ranges") if isinstance(manifest, dict) else []
+            found = next(
+                (r for r in ranges or []
+                 if isinstance(r, dict) and r.get("sequence") == sequence),
+                None,
+            )
+        return {"data": dict(data), "range": dict(found) if found else None}
 
 class InlineRangeRepo(InMemoryRecordingRepo):
     """Alias for readability: the inline-JSONB durable shape via the shared runner."""
@@ -564,3 +570,64 @@ def test_uncertain_upload_retains_cleanup_obligation_on_both_shapes():
         )
         assert [r["idempotency_key"] for r in manifest["ranges"]] == ["turn-0"]
         assert manifest["ranges"][0]["state"] == "failed"
+
+
+def test_overlap_preserves_union_order_and_more_advanced_state():
+    """Inline [2, 8] where the table already holds seq-8: reads see [2, 8] (inline positions
+    kept); the first write migrates THAT order — never [8, 2] — and the inline sealed twin does
+    not regress the table row's uploaded payload."""
+    pcm = b"\x00\x00\x80?" * 4
+    outcomes = {}
+    table_repo = None
+    for name, make_repo in (("inline", InlineRangeRepo), ("table", _TableRangeRepo)):
+        repo, storage = make_repo(), InMemoryStorage()
+        if name == "table":
+            table_repo = repo
+        _seed(repo)
+        data = repo._meetings[MEETING_ID].setdefault("data", {})
+        data["attributed_audio_manifest"] = {
+            "version": 1, "meeting_id": str(MEETING_ID),
+            "clock_origin": "first_admitted_capture_epoch_ms",
+            "clock_origin_ms": 500, "state": "open",
+            "ranges": [
+                dict(_meta(2, "in-2", pcm, clock_origin_ms=500), state="uploaded",
+                     storage_path="attributed-audio/7/1/s/2.pcm"),
+                dict(_meta(8, "tbl-8", pcm, clock_origin_ms=500), state="sealed",
+                     storage_path="attributed-audio/7/1/s/8.pcm"),
+            ],
+        }
+        if name == "table":
+            # A range the table shape wrote before this meeting's first write under the new code.
+            repo._table(MEETING_ID).append((1, dict(
+                _meta(8, "tbl-8", pcm, clock_origin_ms=500), state="uploaded",
+                storage_path="attributed-audio/7/1/s/8.pcm")))
+        storage.blobs["attributed-audio/7/1/s/2.pcm"] = pcm
+        storage.blobs["attributed-audio/7/1/s/8.pcm"] = pcm
+        client = _client(repo, storage)
+        token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+        meta9 = _meta(9, "turn-9", pcm, clock_origin_ms=500)
+        trace = [
+            ("pre", *_norm(_get_public_manifest(client))),
+            ("reserve-9", *_norm(_post_reserve(client, meta9, token))),
+            ("post", *_norm(_get_public_manifest(client))),
+        ]
+        outcomes[name] = trace
+
+    # The stacks legitimately differ on the collision: the table stack merges the uploaded table
+    # payload over the sealed inline twin (the no-regression rule); the inline stack has no such
+    # twin and serves the sealed row. What must NOT differ is ORDER — [2, 8] before the write,
+    # [2, 8, 9] after — on both.
+    assert [r["sequence"] for r in outcomes["inline"][0][2]["ranges"]] == [2, 8]
+    assert [r["sequence"] for r in outcomes["table"][0][2]["ranges"]] == [2, 8]
+    assert [r["sequence"] for r in outcomes["inline"][2][2]["ranges"]] == [2, 8, 9]
+    assert [r["sequence"] for r in outcomes["table"][2][2]["ranges"]] == [2, 8, 9]
+    # Table side: merged seq-8 kept uploaded; inline side: sealed (no table row existed there).
+    assert outcomes["table"][0][2]["ranges"][1]["state"] == "uploaded"
+    assert outcomes["inline"][0][2]["ranges"][1]["state"] == "sealed"
+    # Table-side durable order = union order — inline positions kept, table row merged in place,
+    # new range appended.
+    rows = table_repo._table(MEETING_ID)
+    assert [(p["sequence"], p["state"]) for _id, p in rows] == [
+        (2, "uploaded"), (8, "uploaded"), (9, "sealed")]
+    # The inline list left meetings.data on the migrating write.
+    assert "ranges" not in table_repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]

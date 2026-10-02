@@ -10,8 +10,21 @@ venv — which is why ``pyproject.toml`` needs no extra pins.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
 from typing import Optional
+
+log = logging.getLogger("meeting_api.recordings.adapters")
+
+# Advisory-lock key serializing attributed_audio_ranges DDL across concurrently-booting pods —
+# two replicas running CREATE TABLE/INDEX at once race on pg_type (DuplicateTableError /
+# UniqueViolation), witnessed 3/4 and 7/8 crashing in review.
+_ATTRIBUTED_DDL_LOCK_KEY = 0x7636_3538  # 'v658' — TC-583, fixed forever
+_ATTRIBUTED_DDL_LOCK_TIMEOUT_MS = 5_000
+_ATTRIBUTED_DDL_ATTEMPTS = 3
+
 
 async def _invoke_mutator(tx_guard, data, mutator):
     """Run one mutator inside its caller's row-locked transaction.
@@ -33,6 +46,7 @@ async def _flush_range_ledger(tx_guard, ledger):
     session; the ledger binds it at construction and needs no second handle)."""
     await ledger.flush()
 
+
 async def ensure_attributed_audio_schema(engine) -> None:
     """Guarantee ``attributed_audio_ranges`` exists before meeting-api serves attributed traffic.
 
@@ -44,13 +58,54 @@ async def ensure_attributed_audio_schema(engine) -> None:
     everything → no-op — scoped to ONE table's metadata so it can never touch the rest of the
     schema.
 
+    Concurrency is serialized by a transaction-scoped pg advisory lock taken before any catalog
+    read, so N booting replicas queue instead of racing pg_type. ``lock_timeout`` keeps the
+    convoy bounded: the CREATE's FK takes ShareRowExclusiveLock on ``meetings``, and an
+    unbounded wait would queue every meetings writer behind a blocked converger — a timed-out
+    attempt rolls its xact lock back and retries before startup fails loudly.
+
     A failed DDL raises: startup must not bind a port and serve attributed-audio requests whose
     every write faults on a missing table.
     """
+    from sqlalchemy import text
+
     from ..sessions.models import AttributedAudioRange
 
-    async with engine.begin() as conn:
-        await conn.run_sync(_sync_attributed_table, AttributedAudioRange.__table__)
+    last_error = None
+    for attempt in range(1, _ATTRIBUTED_DDL_ATTEMPTS + 1):
+        try:
+            async with engine.begin() as conn:
+                # lock_timeout is a GUC — SET never binds params, interpolate the constant.
+                await conn.execute(text(
+                    f"SET LOCAL lock_timeout = '{_ATTRIBUTED_DDL_LOCK_TIMEOUT_MS}ms'"))
+                await conn.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": _ATTRIBUTED_DDL_LOCK_KEY},
+                )
+                await conn.run_sync(
+                    _sync_attributed_table, AttributedAudioRange.__table__
+                )
+            return
+        except Exception as exc:
+            if not _is_lock_timeout(exc) or attempt == _ATTRIBUTED_DDL_ATTEMPTS:
+                raise
+            last_error = exc
+            log.warning(
+                "attributed_audio_ranges schema convergence timed out on lock (attempt %d/%d); "
+                "retrying", attempt, _ATTRIBUTED_DDL_ATTEMPTS,
+            )
+            await asyncio.sleep(0.25 * attempt)
+    if last_error is not None:  # unreachable — the loop raises on the final attempt
+        raise last_error
+
+
+def _is_lock_timeout(exc: Exception) -> bool:
+    """Postgres ``lock_not_available`` (55P03) — raised when lock_timeout aborts the wait."""
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "55P03":
+        return True
+    # Driver-agnostic fallback: the message is stable across asyncpg/psycopg.
+    return "lock timeout" in str(exc).lower() or "lock_not_available" in str(exc)
 
 
 def _sync_attributed_table(conn, table) -> None:
@@ -353,26 +408,79 @@ class SqlAlchemyRecordingRepo:
             return result
 
     async def attributed_artifacts_for_owner(self, user_id, meeting_id):
-        from sqlalchemy import select
+        from sqlalchemy import text
 
-        from ..sessions.models import Meeting
-        from .ledger import assemble_attributed_manifest
+        from .ledger import union_ranges
 
+        # ONE statement: header + ordered range payloads read under a single READ COMMITTED
+        # snapshot, so a deletion committing mid-read can never surface a closed manifest with
+        # zero ranges (a state that never durably existed). asyncpg returns JSONB aggregates
+        # as text — decode before handing to union_ranges.
         async with self._session_factory() as db:
-            m = (await db.execute(select(Meeting).where(
-                Meeting.id == meeting_id, Meeting.user_id == user_id
-            ))).scalars().first()
-            if m is None or not isinstance(m.data, dict):
+            row = (await db.execute(
+                text(
+                    "SELECT m.data, ("
+                    "  SELECT COALESCE(jsonb_agg(r.payload ORDER BY r.id), '[]'::jsonb)"
+                    "  FROM attributed_audio_ranges r WHERE r.meeting_id = m.id"
+                    ") FROM meetings m WHERE m.id = :mid AND m.user_id = :uid"
+                ),
+                {"mid": meeting_id, "uid": user_id},
+            )).first()
+            if row is None:
                 return None
-            # Header + range rows are assembled back into the attributed-audio.v1 shape the
-            # public endpoint has always returned (TC-583: ranges live in their own table).
+            data, payloads = row[0], row[1]
+            if not isinstance(data, dict):
+                return None
+            if isinstance(payloads, str):
+                payloads = json.loads(payloads)
+            header = data.get("attributed_audio_manifest")
+            manifest = None
+            if isinstance(header, dict):
+                manifest = dict(header)
+                manifest["ranges"] = union_ranges(
+                    header.get("ranges") or [], payloads or [], meeting_id=meeting_id
+                )
             return {
-                "manifest": await assemble_attributed_manifest(db, meeting_id, m.data),
+                "manifest": manifest,
                 "artifact_deletion": (
-                    dict(m.data["artifact_deletion"])
-                    if isinstance(m.data.get("artifact_deletion"), dict) else None
+                    dict(data["artifact_deletion"])
+                    if isinstance(data.get("artifact_deletion"), dict) else None
                 ),
             }
+
+    async def attributed_range_state_for_owner(self, user_id, meeting_id, sequence):
+        """Owner-scoped keyed range read — one statement, one index lookup.
+
+        ``GET /meetings/{id}/attributed-audio/ranges/{seq}`` downloads ranges one at a time;
+        resolving each through the assembled manifest is O(ranges) per call (O(n²) to fetch a
+        meeting's ranges — worse than the pre-table read on large meetings). The unique index
+        on (meeting_id, sequence) answers the lookup directly, and the LEFT JOIN keeps the
+        header + range payload in ONE snapshot (same interleaving guarantee as
+        ``attributed_artifacts_for_owner``).
+
+        Returns ``{"data": <meetings.data>, "range": <payload-or-None>}``, ``None`` for an
+        unknown or unowned meeting. Legacy inline ``ranges`` are still in ``data`` — the
+        caller falls back to scanning them when ``range`` is ``None``.
+        """
+        from sqlalchemy import text
+
+        async with self._session_factory() as db:
+            row = (await db.execute(
+                text(
+                    "SELECT m.data, r.payload"
+                    " FROM meetings m"
+                    " LEFT JOIN attributed_audio_ranges r"
+                    "   ON r.meeting_id = m.id AND r.sequence = :seq"
+                    " WHERE m.id = :mid AND m.user_id = :uid"
+                ),
+                {"seq": sequence, "mid": meeting_id, "uid": user_id},
+            )).first()
+            if row is None or not isinstance(row[0], dict):
+                return None
+            payload = row[1]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {"data": row[0], "range": payload if isinstance(payload, dict) else None}
 
     async def owner_of(self, meeting_id):
         from sqlalchemy import select
