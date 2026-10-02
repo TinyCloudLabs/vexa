@@ -20,11 +20,13 @@
  *   • close(key) is the final-signal FALLBACK: the live Stop race routinely drops the trailing
  *     is_final MediaRecorder chunk (the WS closes before it flushes), so on close we POST one empty
  *     is_final upload IF none was sent — the server then flips the recording to COMPLETED. Fires once.
- *   • uploads are serialized on an internal promise queue so parts land in seq order; a chunk that
- *     fails permanently is logged-and-skipped — the master assembles from the parts that DID arrive.
+ *   • uploads are serialized on an internal promise queue so parts land in seq order. Retryable
+ *     upload errors keep the head chunk in place with capped exponential backoff until recovery.
+ *     Abort wakes backoff and prevents a new sink attempt; an in-flight uploader may finish its
+ *     own internal retries. Non-retryable errors fail the sink closed without a final marker.
  *
  * L4-gated: the full page→Node→HTTP loss path is proven only by a live compose run. The SINK half
- * (per-chunk upload, correct seq/isFinal/session_uid, the close fallback) is offline-provable
+ * (per-chunk upload, correct seq/isFinal/session_uid, retry and loss behavior) is offline-provable
  * (recording.test.ts) — the P22/#224-class regression pin the 0.12 in-memory bot lacked. The
  * assembler stays in @vexa/recording (the desktop composition root still uses it) — only the cloud
  * bot's wiring changes.
@@ -37,7 +39,7 @@ import type { RecordingSink } from './ports.js';
  *  into. The orchestrator only sees close(key); the bridge holds the BotRecordingSink to feed chunks
  *  as they arrive from the page-side recorder. */
 export interface BotRecordingSink extends RecordingSink {
-  /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
+  /** One recording.v1 chunk for `key`: monotonic seq, final flag, format, bytes. */
   chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): Promise<void>;
   /** Mark page-side production as incomplete so close() cannot fabricate a completion marker. */
   abort(reason: unknown): void;
@@ -59,11 +61,32 @@ export interface RecordingSinkOptions {
   log?: (msg: string) => void;
   /** Maximum bytes admitted to Node-owned recording delivery. Default: 16 MiB. */
   maxRetainedBytes?: number;
+  /** Override per-retry delay (milliseconds); tests can return 0. */
+  retryDelayMs?: (retryIndex: number) => number;
 }
 
 /** The bot must never turn a slow uploader into an unbounded in-memory recording. */
 export const DEFAULT_MAX_RECORDING_RETAINED_BYTES = 16 * 1024 * 1024;
 const MAX_QUEUED_RECORDING_CHUNKS = 128;
+const CHUNK_RETRY_BASE_DELAY_MS = 1_000;
+const CHUNK_RETRY_MAX_DELAY_MS = 30_000;
+const RETRYABLE_NETWORK_CODES: Record<string, true> = {
+  ECONNABORTED: true, ECONNREFUSED: true, ECONNRESET: true, EHOSTUNREACH: true, EAI_AGAIN: true,
+  ENETUNREACH: true, ENOTFOUND: true, EPIPE: true, ETIMEDOUT: true,
+};
+
+function isRetryableChunkUploadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const failure = error as { permanent?: unknown; retryable?: unknown; status?: unknown; statusCode?: unknown; code?: unknown; message?: unknown };
+  if (failure.permanent === true || failure.retryable === false) return false;
+  const explicitStatus = failure.status ?? failure.statusCode;
+  const messageStatus = String(failure.message ?? '').match(/status\s+(\d{3})/i)?.[1];
+  const status = typeof explicitStatus === 'number' ? explicitStatus : messageStatus ? Number(messageStatus) : null;
+  if (status !== null) return status === 408 || status === 429 || (status >= 500 && status <= 599);
+  if (failure.retryable === true) return true;
+  if (typeof failure.code === 'string' && RETRYABLE_NETWORK_CODES[failure.code] === true) return true;
+  return /timed?\s*out|network|socket hang up|connection (?:reset|refused|aborted)/i.test(String(failure.message ?? ''));
+}
 
 /** The default chunk uploader: POST each chunk to meeting-api's internal upload endpoint via the
  *  shipped RecordingService.uploadChunk (multipart, retry+backoff, structured chunk-loss logging).
@@ -93,6 +116,10 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   const log = opts.log ?? (() => { /* silent by default */ });
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
   const maxRetainedBytes = opts.maxRetainedBytes ?? DEFAULT_MAX_RECORDING_RETAINED_BYTES;
+  const retryDelayMs = opts.retryDelayMs ?? ((retryIndex: number) => {
+    const cap = Math.min(CHUNK_RETRY_MAX_DELAY_MS, CHUNK_RETRY_BASE_DELAY_MS * (2 ** retryIndex));
+    return cap * (0.5 + Math.random() * 0.5);
+  });
   if (!Number.isSafeInteger(maxRetainedBytes) || maxRetainedBytes <= 0) throw new Error('recording maxRetainedBytes must be a positive integer');
 
   interface Job {
@@ -109,6 +136,19 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   let finalRequested = false;                          // has an is_final chunk been admitted? (fallback guard)
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
+  const retryWaiters = new Set<() => void>();
+  const waitForRetry = (delayMs: number): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (): void => {
+        clearTimeout(timer);
+        retryWaiters.delete(finish);
+        resolve();
+      };
+      timer = setTimeout(finish, delayMs);
+      retryWaiters.add(finish);
+    });
+  };
 
   // Upload failures may carry an object key, response body, or credential. The lifecycle error
   // and bot logs use only this stable code; raw provider exceptions never become bot state.
@@ -120,15 +160,26 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
     uploading = true;
     void (async () => {
       try {
-        if (failure) throw failure;
-        await upload(job.seq, job.isFinal, job.format, job.bytes);
-        job.resolve();
+        for (let retryIndex = 0; ; retryIndex++) {
+          if (failure) throw failure;
+          try {
+            await upload(job.seq, job.isFinal, job.format, job.bytes);
+            job.resolve();
+            return;
+          } catch (error) {
+            if (failure) throw failure;
+            if (!isRetryableChunkUploadError(error)) throw error;
+            const requestedDelay = retryDelayMs(retryIndex);
+            const delay = Number.isFinite(requestedDelay)
+              ? Math.min(CHUNK_RETRY_MAX_DELAY_MS, Math.max(0, requestedDelay))
+              : CHUNK_RETRY_MAX_DELAY_MS;
+            await waitForRetry(delay);
+          }
+        }
       } catch (error) {
         failure = fail(error);
         job.reject(failure);
         log(`recording: chunk ${job.seq} upload failed (stage=recording-upload code=operation_failed)`);
-        // Once durability is uncertain, never send a later final marker that would claim a
-        // complete recording. Reject all admitted-but-undelivered chunks and free their bytes.
         for (const pending of jobs.splice(0)) {
           retainedBytes -= pending.bytes.byteLength;
           pending.reject(failure);
@@ -143,7 +194,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
 
   const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, allowClosing = false): Promise<void> => {
     if (closed || (closing && !allowClosing)) return Promise.reject(new Error('recording sink is closed'));
-    if (failure) throw failure;
+    if (failure) return Promise.reject(failure);
     if (bytes.byteLength > maxRetainedBytes) return Promise.reject(new Error(`recording chunk ${seq} exceeds ${maxRetainedBytes}-byte admission budget`));
     // Reservation is synchronous and precedes every await. A caller whose bytes would exceed the
     // budget is rejected before this sink takes ownership; it cannot sit invisibly in a waiter.
@@ -166,8 +217,9 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
     chunk: (_key, seq, isFinal, format, bytes) => enqueue(seq, isFinal, format, bytes),
     abort(reason) {
       if (!failure) failure = fail(reason);
-      // A browser-side producer failure means an admitted part may be missing. Reject queued work
-      // and deliberately leave the server-side recording incomplete; no close fallback is allowed.
+      for (const wake of [...retryWaiters]) wake();
+      // A running uploader call cannot be cancelled and may finish its own retries; abort only
+      // prevents this sink from starting another attempt and rejects chunks still queued.
       for (const pending of jobs.splice(0)) {
         retainedBytes -= pending.bytes.byteLength;
         pending.reject(failure);
@@ -175,9 +227,6 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       log('recording: capture aborted (stage=recording-capture code=operation_failed)');
     },
     async close(_key) {
-      // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
-      // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
-      // (no phantom recording), and at most once (a real is_final already set finalSent).
       if (closed) {
         if (failure) throw failure;
         return;
@@ -185,12 +234,21 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       // Freeze ingress before selecting the fallback sequence. All pre-close calls reserve and
       // append synchronously, so the final marker follows them in the serialized queue.
       closing = true;
-      if (anyChunk && !finalRequested && !failure) await enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), true);
-      closed = true;
-      // A failing upload rejects close truthfully. Polling is only lifecycle observation; no
-      // caller bytes are parked outside `retainedBytes` while this waits.
+      let fallbackFailure: Error | null = null;
+      if (anyChunk && !finalRequested && !failure) {
+        void enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), true).catch((error) => {
+          fallbackFailure = error instanceof Error ? error : fail(error);
+        });
+      }
+      // Abort exits promptly; a fallback-admission rejection does not fail admitted data, which
+      // continues draining before close reports that it could not enqueue completion.
       while ((uploading || jobs.length) && !failure) await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (failure) throw failure;
+      if (failure) {
+        closed = true;
+        throw failure;
+      }
+      if (fallbackFailure) throw fallbackFailure;
+      closed = true;
     },
     resourceCounts() {
       return { retainedBytes, queuedChunks: jobs.length + (uploading ? 1 : 0), failed: !!failure };

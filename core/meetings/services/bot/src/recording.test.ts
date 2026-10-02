@@ -200,6 +200,142 @@ async function main(): Promise<void> {
     check('producer overflow: upload/capture exception is redacted before terminal state',
       fault === 'Error: recording delivery failed (code operation_failed)' && !fault.includes('credential-marker'), fault);
   }
+  // ── 6c) retry the queued stream in order until the head recovers ───────────────────────────────
+  {
+    const delivered: Array<{ seq: number; final: boolean; bytes: Uint8Array }> = [];
+    const original = new Uint8Array([1, 2, 3, 4, 5]);
+    let firstAttempts = 0;
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      retryDelayMs: () => 0,
+      uploadChunk: async (seq, final, _format, bytes) => {
+        if (seq === 0 && ++firstAttempts <= 5) {
+          throw Object.assign(new Error('service unavailable'), { statusCode: 503 });
+        }
+        delivered.push({ seq, final, bytes: new Uint8Array(bytes) });
+      },
+    });
+    const queued = [
+      sink.chunk('google_meet/recover', 0, false, 'webm', original.subarray(0, 2)),
+      sink.chunk('google_meet/recover', 1, false, 'webm', original.subarray(2, 3)),
+      sink.chunk('google_meet/recover', 2, false, 'webm', original.subarray(3)),
+      sink.chunk('google_meet/recover', 3, true, 'webm', new Uint8Array(0)),
+    ];
+    await Promise.all(queued);
+    await sink.close('google_meet/recover');
+    const data = delivered.filter((chunk) => !chunk.final);
+    const assembled = new Uint8Array(data.reduce((sum, chunk) => sum + chunk.bytes.length, 0));
+    let offset = 0;
+    for (const chunk of data) { assembled.set(chunk.bytes, offset); offset += chunk.bytes.length; }
+    check('retry recovery: head survives more than three retries', firstAttempts === 6, String(firstAttempts));
+    check('retry recovery: every data chunk is delivered once in order before final',
+      delivered.map((chunk) => `${chunk.seq}:${chunk.final}`).join(',') === '0:false,1:false,2:false,3:true',
+      JSON.stringify(delivered.map(({ seq, final }) => `${seq}:${final}`)));
+    check('retry recovery: delivered bytes remain contiguous and unchanged',
+      Buffer.from(assembled).equals(Buffer.from(original)), Buffer.from(assembled).toString('hex'));
+  }
+
+  // ── 6d) abort wakes a retry delay and fails queued data/final without another upload ────────────
+  {
+    let attempts = 0;
+    let releaseRetry: () => void = () => {};
+    const retryStarted = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      retryDelayMs: () => { releaseRetry(); return 60_000; },
+      uploadChunk: async () => {
+        attempts++;
+        throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+      },
+    });
+    const data = sink.chunk('google_meet/abort', 0, false, 'webm', new Uint8Array([1])).catch(() => {});
+    const later = sink.chunk('google_meet/abort', 1, false, 'webm', new Uint8Array([2])).catch(() => {});
+    const final = sink.chunk('google_meet/abort', 2, true, 'webm', new Uint8Array(0)).catch(() => {});
+    let closeRejected = false;
+    const closing = sink.close('google_meet/abort').catch(() => { closeRejected = true; });
+    await retryStarted;
+    sink.abort(new Error('capture stopped'));
+    await Promise.all([data, later, final, closing]);
+    check('abort: no retry begins after abort', attempts === 1, String(attempts));
+    check('abort: close rejects without sending a final marker', closeRejected, String(closeRejected));
+    check('abort: retained bytes are released', sink.resourceCounts().retainedBytes === 0,
+      JSON.stringify(sink.resourceCounts()));
+  }
+
+  // ── 6e) abort rejects close immediately even with an upload that never settles ─────────────────
+  {
+    let attempts = 0;
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      uploadChunk: async () => {
+        attempts++;
+        await new Promise<void>(() => {});
+      },
+    });
+    const active = sink.chunk('google_meet/in-flight-abort', 0, false, 'webm', new Uint8Array([1])).catch(() => {});
+    const final = sink.chunk('google_meet/in-flight-abort', 1, true, 'webm', new Uint8Array(0)).catch(() => {});
+    let closeRejected = false;
+    const closing = sink.close('google_meet/in-flight-abort').catch(() => { closeRejected = true; });
+    sink.abort(new Error('capture stopped'));
+    // Let close's already-scheduled zero-delay poll observe failure; don't wait on the stalled upload.
+    await flush();
+    await final;
+    check('abort in flight: close rejects without waiting for upload settlement', closeRejected,
+      String(closeRejected));
+    check('abort in flight: no queued final upload starts after abort', attempts === 1, String(attempts));
+    void active;
+  }
+
+  // ── 6f) a non-retryable client error keeps the sink fail-closed ─────────────────────────────────
+  {
+    let attempts = 0;
+    const delivered: number[] = [];
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      retryDelayMs: () => 0,
+      uploadChunk: async (seq) => {
+        attempts++;
+        if (seq === 0) throw Object.assign(new Error('bad request'), { statusCode: 400 });
+        delivered.push(seq);
+      },
+    });
+    const first = sink.chunk('google_meet/permanent', 0, false, 'webm', new Uint8Array([0])).catch(() => {});
+    const final = sink.chunk('google_meet/permanent', 1, true, 'webm', new Uint8Array(0)).catch(() => {});
+    let closeRejected = false;
+    const closing = sink.close('google_meet/permanent').catch(() => { closeRejected = true; });
+    await Promise.all([first, final, closing]);
+    check('non-retryable 400: only one upload attempt and queued final is not sent',
+      attempts === 1 && delivered.length === 0, JSON.stringify({ attempts, delivered }));
+    check('non-retryable 400: sink close rejects without completion', closeRejected && sink.resourceCounts().failed,
+      JSON.stringify({ closeRejected, resources: sink.resourceCounts() }));
+  }
+
+  // ── 6g) a full queue rejects the fallback but drains all already-admitted data ────────────────
+  {
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: Array<{ seq: number; final: boolean }> = [];
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      maxRetainedBytes: 1024,
+      uploadChunk: async (seq, final) => {
+        if (seq === 0) await blocked;
+        delivered.push({ seq, final });
+      },
+    });
+    const chunks = Array.from({ length: 128 }, (_, seq) =>
+      sink.chunk('google_meet/saturated', seq, false, 'webm', new Uint8Array([seq & 0xff])));
+    let closeError = '';
+    const closing = sink.close('google_meet/saturated').catch((error) => { closeError = String(error); });
+    release();
+    await Promise.all([...chunks, closing]);
+    check('fallback saturation: all 128 admitted data chunks drain in order',
+      delivered.length === 128 && delivered.every((chunk, seq) => chunk.seq === seq),
+      JSON.stringify({ count: delivered.length, first: delivered[0]?.seq, last: delivered.at(-1)?.seq }));
+    check('fallback saturation: close rejects admission failure without a completion marker',
+      closeError.includes('delivery admission budget exhausted') && delivered.every((chunk) => !chunk.final),
+      JSON.stringify({ closeError, finalCount: delivered.filter((chunk) => chunk.final).length }));
+  }
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
