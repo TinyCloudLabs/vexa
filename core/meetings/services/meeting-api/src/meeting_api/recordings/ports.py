@@ -86,7 +86,12 @@ class RecordingRepo(Protocol):
         ...
 
     async def mutate_meeting_data(self, meeting_id: int, mutator):
-        """Atomically mutate the complete meeting JSONB payload under the row lock."""
+        """Atomically mutate the complete meeting JSONB payload under the row lock.
+
+        ``mutator`` is ASYNC. ``data['attributed_audio_manifest']['ranges']`` is a ``RangeLedger``
+        view over the ``attributed_audio_ranges`` table (TC-583) — keyed probes
+        (``ledger_find`` / ``ledger_has_sequence`` / ``ledger_empty`` in ``recordings.ledger``)
+        are O(1); iteration requires ``await ranges.all()`` first."""
         ...
 
     async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:

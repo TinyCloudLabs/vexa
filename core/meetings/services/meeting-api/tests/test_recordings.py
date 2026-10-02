@@ -633,8 +633,12 @@ async def test_legacy_delete_race_restores_late_put_cleanup_evidence_for_same_ro
             return meeting.get("user_id") if meeting else None
 
         async def mutate_meeting_data(self, meeting_id, mutator):
+            # Same ledger-view contract as InMemoryRecordingRepo (TC-583): async mutator,
+            # manifest["ranges"] is a RangeLedger.
+            from meeting_api.recordings.ledger import run_meeting_data_mutator
+
             meeting = self._meetings[meeting_id]
-            next_data, result = mutator(dict(meeting.get("data") or {}))
+            next_data, result = await run_meeting_data_mutator(meeting.get("data") or {}, mutator)
             meeting["data"] = dict(next_data)
             return result
 

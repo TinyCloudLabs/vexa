@@ -839,7 +839,9 @@ function gateDataflow() {
   // (a2) completeness — the model covers EVERY real service/module/contract/client (no drift), and no
   // node points at a path that no longer exists (no phantom). This is the anti-drift guard: add a module
   // without registering it here and CI goes red.
-  const lsdirs = (p) => existsSync(join(ROOT, p)) ? readdirSync(join(ROOT, p)).filter((n) => { try { return statSync(join(ROOT, p, n)).isDirectory(); } catch { return false; } }) : [];
+  // Cache dirs left behind by test runs (pytest writes __pycache__ next to sources) are build
+  // artifacts, not modules — they must not demand a chart node.
+  const lsdirs = (p) => existsSync(join(ROOT, p)) ? readdirSync(join(ROOT, p)).filter((n) => n !== "__pycache__" && (() => { try { return statSync(join(ROOT, p, n)).isDirectory(); } catch { return false; } })()) : [];
   const required = new Set();
   const modelPaths = new Set(nodes.flatMap((n) => (n.metadata || []).map((m) => m.path).filter(Boolean)));
   for (const dom of lsdirs("core")) {

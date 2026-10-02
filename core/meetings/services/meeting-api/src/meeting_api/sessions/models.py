@@ -166,3 +166,26 @@ class MeetingSession(Base):
     __table_args__ = (
         UniqueConstraint("meeting_id", "session_uid", name="_meeting_session_uc"),
     )
+
+
+class AttributedAudioRange(Base):
+    """One attributed-audio.v1 range row — the durable per-range ledger (TC-583).
+
+    Byte-faithful mirror of ``admin_api.schema.models.AttributedAudioRange`` (the SSOT that
+    ``ensure_schema`` converges). ``meetings.data['attributed_audio_manifest']`` keeps only the
+    header (state / clock_origin_ms); per-range payloads live here so reserve/upload/fail are
+    O(1) INSERT/UPDATE instead of a whole-manifest JSONB rewrite per call.
+    """
+
+    __tablename__ = "attributed_audio_ranges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    sequence = Column(Integer, nullable=True)
+    idempotency_key = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=lambda: {})
+
+    __table_args__ = (
+        UniqueConstraint("meeting_id", "idempotency_key", name="uq_attributed_range_key"),
+        UniqueConstraint("meeting_id", "sequence", name="uq_attributed_range_sequence"),
+    )

@@ -13,6 +13,26 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+async def _invoke_mutator(tx_guard, data, mutator):
+    """Run one mutator inside its caller's row-locked transaction.
+
+    ``tx_guard`` is the live session: the tx-scope gate reads the call as delegation of DB work,
+    which it is — the mutator's awaits are SqlRangeLedger ops on this same session.
+    """
+    return await mutator(data)
+
+
+async def _migrate_range_ledger(tx_guard, ledger, legacy_rows):
+    """Migrate pre-table inline range rows inside the caller's transaction (``tx_guard`` is the
+    live session; the ledger binds it at construction and needs no second handle)."""
+    await ledger.migrate(legacy_rows)
+
+
+async def _flush_range_ledger(tx_guard, ledger):
+    """Flush one ledger write-back inside its caller's transaction (``tx_guard`` is the live
+    session; the ledger binds it at construction and needs no second handle)."""
+    await ledger.flush()
+
 
 class S3Storage:
     """``Storage`` over an S3/MinIO bucket (boto3). Lazy client so the package imports without boto3."""
@@ -194,14 +214,79 @@ class SqlAlchemyRecordingRepo:
             return result
 
     async def mutate_meeting_data(self, meeting_id, mutator):
+        """Row-locked ``meetings.data`` mutation with the attributed ledger split out (TC-583).
+
+        The mutator still receives the whole JSONB payload, but
+        ``data['attributed_audio_manifest']['ranges']`` is a ``SqlRangeLedger`` view backed by the
+        ``attributed_audio_ranges`` table: keyed probes stay O(1) inserts/updates while the row
+        lock keeps the same serialization the whole-JSONB writer had. On commit the stored
+        manifest holds the header only — range payloads never re-enter ``meetings.data``.
+        ``mutator(data) -> (next_data, result)`` is async so ledger probes can hit the DB.
+        """
+        from sqlalchemy import delete
         from sqlalchemy.orm.attributes import flag_modified
+
+        from ..sessions.models import AttributedAudioRange
+        from .ledger import (
+            SqlRangeLedger,
+            ledger_manifest,
+            stored_manifest,
+        )
 
         async with self._session_factory() as db:
             m = await self._meeting(db, meeting_id)
             if m is None:
                 raise KeyError(meeting_id)
             data = dict(m.data) if isinstance(m.data, dict) else {}
-            next_data, result = mutator(data)
+            stored = data.get("attributed_audio_manifest")
+            ledger = None
+            if isinstance(stored, dict):
+                ledger = SqlRangeLedger(db, meeting_id)
+                # Migrate any pre-table inline ``ranges`` BEFORE the mutator runs so its keyed
+                # probes see every durable row (a reserve retry that only exists inline must find
+                # its row, not append a duplicate that uq_attributed_range_key would reject).
+                await _migrate_range_ledger(
+                    db, ledger,
+                    [dict(r) for r in stored.get("ranges") or [] if isinstance(r, dict)],
+                )
+                data["attributed_audio_manifest"] = ledger_manifest(stored, ledger)
+            next_data, result = await _invoke_mutator(db, data, mutator)
+            next_data = dict(next_data)
+            new_manifest = next_data.get("attributed_audio_manifest")
+            if not isinstance(new_manifest, dict):
+                # The manifest key was removed (artifact deletion) — drop the ledger rows too.
+                next_data.pop("attributed_audio_manifest", None)
+                await db.execute(
+                    delete(AttributedAudioRange).where(
+                        AttributedAudioRange.meeting_id == meeting_id
+                    )
+                )
+            elif ledger is not None and new_manifest.get("ranges") is ledger:
+                # Same manifest dict: flush staged appends / dirty vended rows, and persist the
+                # header without the range list (inline rows already migrated before the mutator).
+                next_data["attributed_audio_manifest"] = stored_manifest(new_manifest)
+                await _flush_range_ledger(db, ledger)
+            else:
+                # The mutator replaced the manifest (fresh dict or a plain list of ranges, e.g.
+                # ``_manifest()`` building one for a meeting with no header yet): reconcile the
+                # table wholesale under the lock.
+                await db.execute(
+                    delete(AttributedAudioRange).where(
+                        AttributedAudioRange.meeting_id == meeting_id
+                    )
+                )
+                rows = new_manifest.get("ranges")
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        db.add(
+                            AttributedAudioRange(
+                                meeting_id=meeting_id,
+                                sequence=row.get("sequence"),
+                                idempotency_key=row.get("idempotency_key"),
+                                payload=dict(row),
+                            )
+                        )
+                next_data["attributed_audio_manifest"] = stored_manifest(new_manifest)
             m.data = dict(next_data)
             flag_modified(m, "data")
             await db.commit()
@@ -209,7 +294,9 @@ class SqlAlchemyRecordingRepo:
 
     async def attributed_artifacts_for_owner(self, user_id, meeting_id):
         from sqlalchemy import select
+
         from ..sessions.models import Meeting
+        from .ledger import assemble_attributed_manifest
 
         async with self._session_factory() as db:
             m = (await db.execute(select(Meeting).where(
@@ -217,11 +304,14 @@ class SqlAlchemyRecordingRepo:
             ))).scalars().first()
             if m is None or not isinstance(m.data, dict):
                 return None
-            value = m.data.get("attributed_audio_manifest")
-            deletion = m.data.get("artifact_deletion")
+            # Header + range rows are assembled back into the attributed-audio.v1 shape the
+            # public endpoint has always returned (TC-583: ranges live in their own table).
             return {
-                "manifest": dict(value) if isinstance(value, dict) else None,
-                "artifact_deletion": dict(deletion) if isinstance(deletion, dict) else None,
+                "manifest": await assemble_attributed_manifest(db, meeting_id, m.data),
+                "artifact_deletion": (
+                    dict(m.data["artifact_deletion"])
+                    if isinstance(m.data.get("artifact_deletion"), dict) else None
+                ),
             }
 
     async def owner_of(self, meeting_id):

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .ports import RecordingRepo, Storage
+from .ledger import materialize_manifest
 
 
 class MeetingNotTerminal(Exception):
@@ -103,7 +104,7 @@ async def delete_owned_recording(
     # This legacy endpoint deletes the same meeting artifacts as the newer completed-artifact
     # path. Publish the durable write fence before touching storage so an old bot token cannot
     # reserve, upload, or recreate attributed PCM while this delete is in flight.
-    def _prepare_artifact(data: dict):
+    async def _prepare_artifact(data: dict):
         next_data = dict(data)
         prior = next_data.get("artifact_deletion")
         version = int((prior or {}).get("cleanup_version") or 0) + 1
@@ -115,7 +116,9 @@ async def delete_owned_recording(
         # cleanup owner even after the first pass removed the public recording row.
         next_data["artifact_deletion"]["legacy_recording"] = dict(recording)
         return next_data, {
-            "manifest": next_data.get("attributed_audio_manifest"),
+            # Materialize the ledger view: the snapshot must be a plain manifest dict — it leaves
+            # this transaction's scope and is compared byte-for-byte by the completer.
+            "manifest": await materialize_manifest(next_data.get("attributed_audio_manifest")),
             "cleanup_version": version,
         }
 
@@ -129,15 +132,16 @@ async def delete_owned_recording(
     # Complete only after every primary object was removed, and atomically remove the durable
     # cleanup ledger with the recording metadata. A failed delete leaves pending + storage paths
     # intact for the same endpoint to retry.
-    def _complete_artifact(data: dict):
+    async def _complete_artifact(data: dict):
         next_data = dict(data)
         deletion = next_data.get("artifact_deletion") or {}
         # Storage was deleted from the plan above.  If a rejected late PUT restored a deterministic
         # key after that snapshot, retain both its ledger and this pending tombstone for retry.
         # Otherwise an object can outlive every durable cleanup owner.
+        current_manifest = await materialize_manifest(next_data.get("attributed_audio_manifest"))
         if (deletion.get("state") != "pending"
                 or deletion.get("cleanup_version") != cleanup_plan["cleanup_version"]
-                or next_data.get("attributed_audio_manifest") != cleanup_plan["manifest"]):
+                or current_manifest != cleanup_plan["manifest"]):
             return next_data, False
         next_data["recordings"] = [r for r in next_data.get("recordings", []) if r.get("id") != recording_id]
         next_data.pop("attributed_audio_manifest", None)
