@@ -235,7 +235,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       closed = true;
       // A failing upload rejects close truthfully. Polling is only lifecycle observation; no
       // caller bytes are parked outside `retainedBytes` while this waits.
-      while (uploading || jobs.length) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      while ((uploading || jobs.length) && !failure) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (failure) throw failure;
     },
     resourceCounts() {

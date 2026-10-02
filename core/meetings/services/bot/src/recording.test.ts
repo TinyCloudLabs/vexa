@@ -254,17 +254,39 @@ async function main(): Promise<void> {
     let closeRejected = false;
     const closing = sink.close('google_meet/abort').catch(() => { closeRejected = true; });
     await retryStarted.promise;
-    const abortAt = Date.now();
     sink.abort(new Error('capture stopped'));
     await Promise.all([data, later, final, closing]);
     check('abort: no retry begins after abort', attempts === 1, String(attempts));
-    check('abort: close rejects promptly without sending a final marker', closeRejected && Date.now() - abortAt < 1_000,
-      JSON.stringify({ closeRejected, elapsedMs: Date.now() - abortAt }));
+    check('abort: close rejects without sending a final marker', closeRejected, String(closeRejected));
     check('abort: retained bytes are released', sink.resourceCounts().retainedBytes === 0,
       JSON.stringify(sink.resourceCounts()));
   }
 
-  // ── 6e) a non-retryable client error keeps the sink fail-closed ─────────────────────────────────
+  // ── 6e) abort rejects close immediately even with an upload that never settles ─────────────────
+  {
+    let attempts = 0;
+    const sink = createBotRecordingSink({
+      inv: inv(),
+      uploadChunk: async () => {
+        attempts++;
+        await new Promise<void>(() => {});
+      },
+    });
+    const active = sink.chunk('google_meet/in-flight-abort', 0, false, 'webm', new Uint8Array([1])).catch(() => {});
+    const final = sink.chunk('google_meet/in-flight-abort', 1, true, 'webm', new Uint8Array(0)).catch(() => {});
+    let closeRejected = false;
+    const closing = sink.close('google_meet/in-flight-abort').catch(() => { closeRejected = true; });
+    sink.abort(new Error('capture stopped'));
+    // Let close's already-scheduled zero-delay poll observe failure; don't wait on the stalled upload.
+    await flush();
+    await final;
+    check('abort in flight: close rejects without waiting for upload settlement', closeRejected,
+      String(closeRejected));
+    check('abort in flight: no queued final upload starts after abort', attempts === 1, String(attempts));
+    void active;
+  }
+
+  // ── 6f) a non-retryable client error keeps the sink fail-closed ─────────────────────────────────
   {
     let attempts = 0;
     const delivered: number[] = [];
