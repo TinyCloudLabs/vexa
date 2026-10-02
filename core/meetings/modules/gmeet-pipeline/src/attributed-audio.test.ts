@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createAttributedAudioRecorder, createAttributedAudioSink, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
+import { createAttributedAudioRecorder, createAttributedAudioSink, type AttributedAudioFrame, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
 
 const row = (range: any, state: AttributedAudioRange['state']) => ({ ...range, state });
 function memoryStore(stall?: Promise<void>): AttributedAudioStore & { rows: AttributedAudioRange[]; uploaded: Uint8Array[] } {
@@ -152,4 +152,112 @@ openGate(); await first;
 const completeRetry = await idem.seal(idemInput, [new Float32Array([1])]);
 assert.equal(completeRetry.sequence, 0); assert.equal(idem.manifest().ranges.length, 1);
 assert.throws(() => idem.seal({ ...idemInput, speaker_key: 'changed' }, [new Float32Array([1])]), /conflicts/);
+
+// TC-560: one upload timeout mid-meeting becomes a durable 'failed' range. Later frames are
+// still admitted and the manifest closes — a rejected range is not a terminal capture fault.
+const transient = memoryStore();
+const realTransientUpload = transient.upload;
+transient.upload = async (range, chunks) => {
+  if (range.sequence === 0) throw new Error('injected upload timeout');
+  return realTransientUpload(range, chunks);
+};
+const surviving = createAttributedAudioRecorder('tc560', transient, { cadenceMs: 5_000, gapMs: 10 });
+await surviving.ready;
+const midFrame = (channel: number, capture_ms: number): AttributedAudioFrame =>
+  ({ channel, speaker_key: `channel:${channel}`, speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(10), capture_ms, sample_rate: 100 });
+surviving.feed(midFrame(0, 1_000));
+surviving.feed(midFrame(0, 2_000));   // scheduling gap seals seq0 while capture continues
+await new Promise(resolve => setImmediate(resolve)); // the seal task's microtasks run before this turn
+surviving.feed(midFrame(1, 3_000));   // admission still works after the failed range
+const survivingManifest = await surviving.stop();
+assert.equal(survivingManifest.state, 'closed');
+const survivingStates = new Map(transient.rows.map(range => [range.sequence, range.state]));
+assert.equal(survivingStates.get(0), 'failed', 'the timed-out range keeps a durable failed outcome');
+assert.equal(survivingStates.get(1), 'uploaded', 'later frames on the same channel are admitted');
+assert.equal(survivingStates.get(2), 'uploaded', 'later frames on a new channel are admitted');
+
+// A range whose outcome cannot be made durable at all — reservation rejected and the fail marker
+// rejected too — is a real invariant break and still faults the recorder terminally.
+const undurable = memoryStore();
+undurable.reserve = async () => { throw new Error('ledger unreachable'); };
+undurable.fail = async () => { throw new Error('ledger unreachable'); };
+const faulted = createAttributedAudioRecorder('tc560-undurable', undurable, { cadenceMs: 5_000, gapMs: 10 });
+await faulted.ready;
+faulted.feed(midFrame(0, 1_000));
+faulted.feed(midFrame(0, 2_000));   // gap seals a turn whose reserve and fail both reject
+await new Promise(resolve => setImmediate(resolve));
+assert.throws(() => faulted.feed(midFrame(0, 3_000)), /storage_admission/);
+await assert.rejects(faulted.stop(), /storage_admission/);
+
+// Reviewer regression (TC-560 follow-up): retrying ranges hold storage-task slots through their
+// backoff, so a burst of flushes can exhaust the task table while the PCM budget is far from
+// full. The dropped turns must become queued missing rows — durable 'failed' evidence — not a
+// terminal fault, and they must be admitted once slots free, before close.
+const slotStore = memoryStore();
+const saturating = createAttributedAudioRecorder('tc560-slots', slotStore, { cadenceMs: 5_000, gapMs: 10, maxPendingTasks: 4 });
+await saturating.ready;
+const slotFrame = (channel: number, capture_ms: number): AttributedAudioFrame =>
+  ({ channel, speaker_key: `channel:${channel}`, speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(10), capture_ms, sample_rate: 100 });
+// Feed synchronously: no task can settle mid-loop, so every flush after the fourth is a slot
+// refusal even though each range is tiny.
+for (let i = 0; i < 12; i++) saturating.feed(slotFrame(i % 3, 1_000 + i * 1_000));
+assert.equal(saturating.pendingTasks(), 4, 'the task table is exactly full');
+const slotManifest = await saturating.stop();   // stop drains the queued missing rows before close
+assert.equal(slotManifest.state, 'closed');
+const slotStates = slotStore.rows.map(range => [range.sequence, range.state]);
+assert.deepEqual(slotStates.map(([, state]) => state), Array.from({ length: 12 }, (_, i) => (i < 4 ? 'uploaded' : 'failed')));
+assert.deepEqual(slotStates.map(([sequence]) => sequence), Array.from({ length: 12 }, (_, i) => i), 'no sequence gaps in the durable ledger');
+
+// A missing row parked behind saturated slots is admitted from inside stop(): the drain waits on
+// freed slots instead of closing over dropped evidence.
+const drainStore = memoryStore();
+let releaseDrain!: () => void; const drainGate = new Promise<void>(resolve => { releaseDrain = resolve; });
+const realDrainUpload = drainStore.upload;
+drainStore.upload = async (range, chunks) => { await drainGate; return realDrainUpload(range, chunks); };
+const parked = createAttributedAudioRecorder('tc560-drain', drainStore, { cadenceMs: 5_000, gapMs: 10, maxPendingTasks: 2 });
+await parked.ready;
+for (let i = 0; i < 5; i++) parked.feed(slotFrame(i % 2, 2_000 + i * 1_000));
+assert.equal(parked.pendingTasks(), 2);
+const parkedStop = parked.stop();        // parks on waitForSlot while uploads are gated
+releaseDrain();                          // tasks settle → slots free → queued rows admit → close
+const parkedManifest = await parkedStop;
+assert.equal(parkedManifest.state, 'closed');
+assert.equal(drainStore.rows.filter(range => range.state === 'failed').length, 3, 'every slot-starved turn is durably failed');
+assert.equal(drainStore.rows.filter(range => range.state === 'uploaded').length, 2);
+
+// Reviewer regression: the page admission fence stops forwarding frames and waits on the
+// boundary callback before stopping capture, so no feed() or stop() drives the drain. A queued
+// boundary row must be admitted when a settling task frees its slot — the drain hangs off task
+// settlement, not off the frame path.
+const settleStore = memoryStore();
+let releaseSettle!: () => void; const settleGate = new Promise<void>(resolve => { releaseSettle = resolve; });
+const realSettleUpload = settleStore.upload;
+settleStore.upload = async (range, chunks) => { await settleGate; return realSettleUpload(range, chunks); };
+const settled = createAttributedAudioRecorder('tc560-settle', settleStore, { cadenceMs: 5_000, gapMs: 10, maxPendingTasks: 4 });
+await settled.ready;
+for (let i = 0; i < 8; i++) settled.feed(slotFrame(i % 2, 3_000 + i * 1_000));
+assert.equal(settled.pendingTasks(), 4, 'the task table is full behind gated uploads');
+// Page-boundary overflow while every slot is held: the boundary row joins the queue.
+const boundaryRow = settled.incomplete({ channel: 2, speaker_key: 'channel:2', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, capture_ms: 9_000, sample_rate: 100 });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(settleStore.rows.length, 4, 'nothing is admitted while uploads are gated');
+releaseSettle();                         // no further feed(): task settlement alone drains the queue
+const boundaryResult = await boundaryRow;
+assert.equal(boundaryResult.state, 'failed', 'the queued boundary row becomes durable without a later frame');
+assert.equal(settleStore.rows.some(range => String(range.idempotency_key).includes('page-boundary')), true, 'the boundary row reached the ledger');
+const settledManifest = await settled.stop();
+assert.equal(settledManifest.state, 'closed');
+assert.equal(settleStore.rows.filter(range => range.state === 'uploaded').length, 6);
+assert.equal(settleStore.rows.filter(range => range.state === 'failed').length, 3, 'two slot-starved turns plus the boundary row are durably failed');
+
+// A page-boundary overflow row that can never reach the ledger still faults: the queue defers
+// only transient capacity refusals, not outcomes that cannot be made durable.
+const boundaryStore = memoryStore();
+boundaryStore.reserve = async () => { throw new Error('ledger unreachable'); };
+boundaryStore.fail = async () => { throw new Error('ledger unreachable'); };
+const boundary = createAttributedAudioRecorder('tc560-boundary', boundaryStore, { cadenceMs: 5_000 });
+await boundary.ready;
+boundary.feed(midFrame(0, 1_000));      // set the clock origin
+await assert.rejects(boundary.incomplete({ channel: 0, speaker_key: 'channel:0', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, capture_ms: 2_000, sample_rate: 100 }), /ledger unreachable/);
+await assert.rejects(boundary.stop(), /storage_admission/);
 console.log('attributed-audio capture ledger passes');

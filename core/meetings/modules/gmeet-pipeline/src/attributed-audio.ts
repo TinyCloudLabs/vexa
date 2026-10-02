@@ -13,6 +13,19 @@ export const MAX_PENDING_ATTRIBUTED_STORAGE_TASKS = 64;
 export const MAX_RETAINED_ATTRIBUTED_RECEIPTS = 8;
 /** A missing row is metadata, but it still has to fit the HTTP body's hard limit. */
 const MAX_MISSING_BYTES = 32 * 1024 * 1024;
+/** A transient capacity refusal — a full storage task table or an exhausted PCM budget —
+ * never an invariant break. Callers may drop PCM and retry the outcome row later. */
+export class AttributedAudioBusyError extends Error {
+  constructor(message: string) { super(message); this.name = 'AttributedAudioBusyError'; }
+}
+/** The package targets ES2022, which predates Promise.withResolvers; same shape, one helper. */
+type Deferred<T> = { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (error?: unknown) => void };
+const defer = <T>(): Deferred<T> => {
+  let resolve!: Deferred<T>['resolve'], reject!: Deferred<T>['reject'];
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
+
 export type Attribution = { source: 'glow-bound' | 'provisional' | 'unresolved'; confidence: number };
 
 export interface AttributedAudioRange {
@@ -52,6 +65,11 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
   let bufferedBytes = 0, nextSequence = 0, closing = false, closed = false, initialized = !store.load;
   const tasks = new Map<string, { range: ImmutableRange; task: Promise<AttributedAudioRange> }>();
   if (!Number.isSafeInteger(taskLimit) || taskLimit < 1) throw new Error('invalid attributed-audio storage task limit');
+  const slotWaiters = new Set<() => void>();
+  const notifySlots = () => { for (const resolve of slotWaiters) resolve(); slotWaiters.clear(); };
+  // Persistent settle listeners run before one-shot slot waiters so a queued-missing drain can
+  // fill the just-freed slot before a stop()-time drain re-checks the queue.
+  const settleListeners = new Set<() => void>();
   const sameImmutable = (left: ImmutableRange, right: ImmutableRange) =>
     Object.keys(left).filter(key => key !== 'attribution' && key !== 'state' && key !== 'path').every(key =>
       (left as Record<string, unknown>)[key] === (right as Record<string, unknown>)[key])
@@ -78,24 +96,43 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     const bytes = pcm?.reduce((total, chunk) => total + chunk.byteLength, 0) ?? 0;
     const task = (async () => {
       try {
-        const reserved = await store.reserve(range); replace(reserved);
-        if (!pcm) { const failed = await store.fail(range); replace(failed); return failed; }
+        let reserved: AttributedAudioRange;
         try {
-          const receipt = await store.upload(range, pcm);
-          const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+          reserved = await store.reserve(range);
         } catch (error) {
-          try { const failed = await store.fail(range); replace(failed); } catch { /* close exposes unresolved reservation */ }
-          throw error;
+          // A rejected reservation may still have reached the ledger (timeout, dropped
+          // acknowledgement). fail() is idempotent for that key: it durably marks an existing
+          // reservation failed and is a harmless conflict when none exists.
+          try { reserved = await store.fail(range); } catch { throw error; }
         }
+        replace(reserved);
+        // A replayed reserve can answer an already-terminal row: uploaded is a durable receipt
+        // and failed needs no bytes.
+        if (reserved.state === 'uploaded' || (reserved.state === 'failed' && pcm)) return reserved;
+        if (pcm) {
+          try {
+            const receipt = await store.upload(range, pcm);
+            const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+          } catch (error) {
+            // The upload outcome is made durable as 'failed' rather than faulting the capture:
+            // a recorded failed range keeps the ledger complete and close() resolvable.
+            try { const failed = await store.fail(range); replace(failed); return failed; } catch { /* fall through to the local row */ }
+            replace({ ...range, state: 'failed' });
+            throw error;
+          }
+        }
+        try { const failed = await store.fail(range); replace(failed); return failed; } catch { /* fall through to the local row */ }
+        replace({ ...range, state: 'failed' });
+        throw new Error('attributed-audio missing-range outcome is not durable');
       } catch (error) {
-        // A failed reservation never owns PCM. Keep a local failed row so close remains an
-        // observable incomplete outcome; a later restart/retry can durably reserve this key.
+        // Keep a local failed row so close remains an observable incomplete outcome; a later
+        // restart/retry can durably reserve this key. The rejection is what faults the capture.
         const failed = { ...range, state: 'failed' as const }; replace(failed);
         throw error;
       } finally { bufferedBytes -= bytes; }
     })();
     tasks.set(range.idempotency_key, { range, task });
-    void task.finally(() => tasks.delete(range.idempotency_key)).catch(() => undefined);
+    void task.finally(() => { tasks.delete(range.idempotency_key); for (const listener of settleListeners) listener(); notifySlots(); }).catch(() => undefined);
     return task;
   };
   const reconcile = async () => {
@@ -136,8 +173,8 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
       if (!sameImmutable(prior as ImmutableRange, proposed)) throw new Error('attributed-audio idempotency key conflicts with durable ledger');
       return Promise.resolve(clone(prior));
     }
-    if (tasks.size >= taskLimit) throw new Error('attributed-audio storage task admission exhausted');
-    if (pcm) { if (bufferedBytes + byteCount > budgetBytes) throw new Error('attributed-audio PCM budget exceeded before durable handoff'); bufferedBytes += byteCount; }
+    if (tasks.size >= taskLimit) throw new AttributedAudioBusyError('attributed-audio storage task admission exhausted');
+    if (pcm) { if (bufferedBytes + byteCount > budgetBytes) throw new AttributedAudioBusyError('attributed-audio PCM budget exceeded before durable handoff'); bufferedBytes += byteCount; }
     const range = immutable(input, byteCount, sha256, audioDurationMs, nextSequence++);
     manifest.ranges.push({ ...range, state: 'sealed' }); compact();
     return run(range, pcm);
@@ -154,12 +191,27 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
       const closingManifest = { ...clone(manifest), state: 'closed' as const };
       // Do not serialize a worker-side manifest: it is deliberately only a receipt tail.  The
       // meeting-api seals and retains its authoritative durable ledger itself.
-      await store.close(); manifest = closingManifest; closed = true; return clone(manifest);
+      try {
+        await store.close();
+      } finally {
+        // Unblock any queued-missing waiter still parked on a slot once close is settled.
+        notifySlots();
+      }
+      manifest = closingManifest; closed = true; return clone(manifest);
     },
     bufferedBytes: () => bufferedBytes, taskCount: () => tasks.size,
     // ``manifest.ranges`` is the one retained durable-accounting collection; settled tasks are
     // removed in ``finally``. Expose both so memory probes cannot hide historical metadata.
     retainedMetadataCount: () => manifest.ranges.length + tasks.size,
+    /** Resolve once a storage-task slot is free (or immediately when one already is). */
+    waitForSlot(): Promise<void> {
+      if (tasks.size < taskLimit) return Promise.resolve();
+      const { promise, resolve } = defer<void>();
+      slotWaiters.add(resolve);
+      return promise;
+    },
+    /** Invoke `listener` each time a storage task settles and frees its slot. */
+    onTaskSettled(listener: () => void) { settleListeners.add(listener); },
   };
 }
 
@@ -169,6 +221,11 @@ export interface AttributedAudioFrame {
 }
 type Active = Omit<AttributedAudioFrame, 'pcm' | 'capture_ms'> & { generation: number; start_ms: number; end_ms: number; audio_duration_ms: number; chunks: Float32Array[]; bytes: number; idle?: ReturnType<typeof setTimeout> };
 type Missing = Omit<SealInput, 'byte_count' | 'sha256' | 'audio_duration_ms'> & { byte_count: number; audio_duration_ms: number };
+/** A failed-outcome row waiting for a storage slot, plus the caller's deferred when one listens. */
+type MissingRow = SealInput & { byte_count: number; sha256: string; audio_duration_ms: number };
+type PendingMissing = { row: MissingRow; deferred: Deferred<AttributedAudioRange> };
+/** Queued missing rows bound the window in which task saturation can accumulate evidence. */
+export const MAX_PENDING_ATTRIBUTED_MISSING_RANGES = 1_024;
 
 /** Per-channel bounded capture buffers. Feed admits or rejects synchronously and never queues PCM. */
 export function createAttributedAudioRecorder(meetingId: string, store: AttributedAudioStore, options: { cadenceMs?: number; budgetBytes?: number; gapMs?: number; maxPendingTasks?: number } = {}) {
@@ -187,19 +244,76 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
   const activeBytes = () => [...active.values()].reduce((total, value) => total + value.bytes, 0);
   const identity = (frame: AttributedAudioFrame) => `${frame.speaker_key}\u0000${frame.speaker_name}\u0000${frame.attribution.source}\u0000${frame.attribution.confidence}\u0000${frame.sample_rate}\u0000${frame.channels ?? 1}`;
   const activeIdentity = (value: Active) => `${value.speaker_key}\u0000${value.speaker_name}\u0000${value.attribution.source}\u0000${value.attribution.confidence}\u0000${value.sample_rate}\u0000${value.channels ?? 1}`;
+  // Storage-task admission is capacity, not a verdict. PCM already handed off stays gone; what
+  // survives is the row describing the lost span, queued until a slot frees (feed drains
+  // opportunistically, stop drains to empty before close) or the recorder faults.
+  const pendingMissing: PendingMissing[] = [];
+  const submitMissing = (row: MissingRow, deferred: Deferred<AttributedAudioRange>): void => {
+    // Preserve submission order: anything offered while rows wait takes the queue tail.
+    if (pendingMissing.length) {
+      if (pendingMissing.length >= MAX_PENDING_ATTRIBUTED_MISSING_RANGES) { failClosed(); deferred.reject(terminalFault); return; }
+      pendingMissing.push({ row, deferred });
+      return;
+    }
+    try {
+      const task = sink.fail(row);
+      void task.catch(failClosed);
+      deferred.resolve(task);
+      return;
+    } catch (error) {
+      if (error instanceof AttributedAudioBusyError && pendingMissing.length < MAX_PENDING_ATTRIBUTED_MISSING_RANGES) {
+        pendingMissing.push({ row, deferred });
+        return;
+      }
+      failClosed();
+      deferred.reject(terminalFault ?? error);
+    }
+  };
+  const enqueueMissing = (row: MissingRow): void => {
+    const deferred = defer<AttributedAudioRange>();
+    void deferred.promise.catch(() => undefined);   // flush paths report through the fault, not a caller
+    submitMissing(row, deferred);
+  };
+  const drainMissing = () => {
+    while (pendingMissing.length && !terminalFault) {
+      const entry = pendingMissing[0];
+      try {
+        const task = sink.fail(entry.row);
+        void task.catch(failClosed);
+        pendingMissing.shift();
+        entry.deferred.resolve(task);
+      } catch (error) {
+        if (error instanceof AttributedAudioBusyError) break;
+        pendingMissing.shift();
+        entry.deferred.reject(error);
+        failClosed();
+      }
+    }
+  };
+
+  // Queued missing rows must not wait for the next frame: a stopped page boundary or a drained
+  // backlog frees slots without new input, so settle events drive the drain too.
+  sink.onTaskSettled(drainMissing);
   const flush = (channel: number) => {
-    const value = active.get(channel); if (!value) return; active.delete(channel); if (value.idle) clearTimeout(value.idle);
+    const value = active.get(channel); if (!value) return; active.delete(channel); clearTimeout(value.idle);
     try {
       void sink.seal({ speaker_key: value.speaker_key, speaker_name: value.speaker_name, channel, turn_generation: value.generation, attribution: value.attribution,
         start_ms: value.start_ms, end_ms: value.end_ms, audio_duration_ms: value.audio_duration_ms, codec: 'pcm_f32le', sample_rate: value.sample_rate, channels: value.channels ?? 1 }, value.chunks).catch(failClosed);
-    } catch { failClosed(); }
+    } catch (error) {
+      if (error instanceof AttributedAudioBusyError) {
+        // The PCM could not be handed to storage right now — the same outcome as a feed-time
+        // budget refusal: drop it and queue the missing row for a freer moment.
+        enqueueMissing({ speaker_key: value.speaker_key, speaker_name: value.speaker_name, channel, turn_generation: value.generation,
+          attribution: value.attribution, start_ms: value.start_ms, end_ms: value.end_ms, codec: 'pcm_f32le', sample_rate: value.sample_rate, channels: value.channels ?? 1,
+          idempotency_key: `${meetingId}:missing:${value.speaker_key}:${value.generation}:${value.start_ms}:${value.end_ms}`,
+          byte_count: value.bytes, sha256: '0'.repeat(64), audio_duration_ms: value.audio_duration_ms });
+      } else failClosed();
+    }
     value.chunks = [];
   };
   const flushMissing = (channel: number) => {
     const value = missing.get(channel); if (!value) return; missing.delete(channel);
-    try {
-      void sink.fail({ ...value, idempotency_key: `${meetingId}:missing:${value.speaker_key}:${value.turn_generation}:${value.start_ms}:${value.end_ms}`, sha256: '0'.repeat(64) }).catch(failClosed);
-    } catch { failClosed(); }
+    enqueueMissing({ ...value, idempotency_key: `${meetingId}:missing:${value.speaker_key}:${value.turn_generation}:${value.start_ms}:${value.end_ms}`, sha256: '0'.repeat(64) });
   };
   const recordMissing = (frame: AttributedAudioFrame, start: number, end: number) => {
     let value = missing.get(frame.channel);
@@ -240,6 +354,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     if (terminalFault) throw terminalFault;
     if (!Number.isFinite(frame.capture_ms) || !Number.isInteger(frame.channel) || frame.channel < 0 || frame.sample_rate <= 0) throw new Error('invalid attributed-audio frame');
     if (!frame.pcm.length) return;
+    drainMissing();   // slots freed since the last frame admit queued missing rows first
     const start = relative(frame.capture_ms), end = start + frame.pcm.length / frame.sample_rate * 1000;
     let value = active.get(frame.channel);
     // The server validates the whole range's wall-clock/sample-clock delta, not each callback in
@@ -267,7 +382,7 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     }
     value.chunks.push(frame.pcm); value.bytes += frame.pcm.byteLength; value.audio_duration_ms += frame.pcm.length / frame.sample_rate * 1000; value.end_ms = end;
     if (end - value.start_ms >= cadenceMs) flush(frame.channel);
-    else { if (value.idle) clearTimeout(value.idle); value.idle = setTimeout(() => flush(frame!.channel), cadenceMs); }
+    else { clearTimeout(value.idle); value.idle = setTimeout(() => flush(frame!.channel), cadenceMs); }
   };
   return {
     feed, ready,
@@ -276,21 +391,30 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
     incomplete(frame: Omit<AttributedAudioFrame, 'pcm'>): Promise<AttributedAudioRange> {
       const start = relative(frame.capture_ms);
       const turn = nextGeneration++;
-      return sink.fail({
+      const deferred = defer<AttributedAudioRange>();
+      submitMissing({
         idempotency_key: `${meetingId}:page-boundary:${frame.channel}:${turn}:${start}`,
         speaker_key: frame.speaker_key || `channel:${frame.channel}`, speaker_name: frame.speaker_name,
         channel: frame.channel, turn_generation: turn, attribution: frame.attribution,
         start_ms: start, end_ms: start, audio_duration_ms: 0, codec: 'pcm_f32le',
         sample_rate: frame.sample_rate, channels: 1, byte_count: 0, sha256: '0'.repeat(64),
-      });
+      }, deferred);
+      // A slot-starved boundary row rides the missing queue; its promise settles when the row is
+      // admitted or rejected — an outcome that never becomes durable rejects the caller.
+      return deferred.promise;
     },
     async stop(): Promise<AttributedAudioManifest> {
       stopping = true; for (const channel of [...active.keys()]) flush(channel); for (const channel of [...missing.keys()]) flushMissing(channel); await sink.ready;
+      // Every queued missing row must reach a durable outcome before the manifest may close.
+      // A full task table parks the drain until a slot frees rather than dropping the evidence.
+      while (pendingMissing.length && !terminalFault) { drainMissing(); if (pendingMissing.length) await sink.waitForSlot(); }
+      const stoppedFault = terminalFault;
+      for (const entry of pendingMissing.splice(0)) entry.deferred.reject(stoppedFault ?? new Error('attributed-audio recorder is stopped'));
       if (terminalFault) throw terminalFault;
       const result = await sink.close();
       if (terminalFault) throw terminalFault;
       return result;
     },
-    retainedBytes: () => sink.bufferedBytes() + activeBytes(), pendingTasks: () => sink.taskCount(), metadataCount: () => missing.size + active.size + sink.retainedMetadataCount(),
+    retainedBytes: () => sink.bufferedBytes() + activeBytes(), pendingTasks: () => sink.taskCount(), metadataCount: () => missing.size + active.size + pendingMissing.length + sink.retainedMetadataCount(),
   };
 }
