@@ -631,3 +631,67 @@ def test_overlap_preserves_union_order_and_more_advanced_state():
         (2, "uploaded"), (8, "uploaded"), (9, "sealed")]
     # The inline list left meetings.data on the migrating write.
     assert "ranges" not in table_repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+
+
+def test_union_ranges_crossed_collision_is_unique_in_both_axes():
+    """Astra P3: inline (a,1,sealed),(b,2,sealed) + table (a,2,uploaded) — key collides at
+    position 0 while sequence collides at position 1. The union must carry exactly one row per
+    (key, sequence): the table's uploaded payload at the earliest slot, the crossed inline row
+    dropped."""
+    pcm = b"\x00\x00\x80?" * 4
+    dropped = []
+    merged = union_ranges(
+        [dict(_meta(1, "a", pcm), state="sealed"),
+         dict(_meta(2, "b", pcm), state="sealed")],
+        [dict(_meta(2, "a", pcm), state="uploaded")],
+        dropped_out=dropped,
+    )
+    assert [(r["sequence"], r["idempotency_key"], r["state"]) for r in merged] == [
+        (2, "a", "uploaded")]
+    assert [r["idempotency_key"] for r in dropped] == ["b"]
+
+
+def test_union_ranges_rank_uploaded_above_failed():
+    """Opus L4: a failed retry must never replace the uploaded row's storage_path."""
+    uploaded = {"idempotency_key": "k", "sequence": 1, "state": "uploaded",
+                "storage_path": "attributed-audio/7/1/s/1.pcm"}
+    failed = {"idempotency_key": "k", "sequence": 1, "state": "failed"}
+    assert union_ranges([], [uploaded, failed]) == [uploaded]
+    assert union_ranges([], [failed, uploaded]) == [uploaded]
+    # And an inline failed twin never displaces the table's uploaded row either.
+    assert union_ranges([failed], [uploaded]) == [uploaded]
+
+
+def test_crossed_collision_migrates_through_table_repo():
+    """The crossed case end-to-end on the emulated table stack: the union read is unique on both
+    axes, the first write migrates without a UniqueViolation, and the durable order equals the
+    union order the read served."""
+    pcm = b"\x00\x00\x80?" * 4
+    repo, storage = _TableRangeRepo(), InMemoryStorage()
+    _seed(repo)
+    data = repo._meetings[MEETING_ID].setdefault("data", {})
+    data["attributed_audio_manifest"] = {
+        "version": 1, "meeting_id": str(MEETING_ID),
+        "clock_origin": "first_admitted_capture_epoch_ms",
+        "clock_origin_ms": 500, "state": "open",
+        "ranges": [dict(_meta(1, "a", pcm, clock_origin_ms=500), state="sealed"),
+                   dict(_meta(2, "b", pcm, clock_origin_ms=500), state="sealed")],
+    }
+    repo._table(MEETING_ID).append((1, dict(
+        _meta(2, "a", pcm, clock_origin_ms=500), state="uploaded",
+        storage_path="attributed-audio/7/1/s/2.pcm")))
+    storage.blobs["attributed-audio/7/1/s/2.pcm"] = pcm
+
+    client = _client(repo, storage)
+    pre = _get_public_manifest(client).json()
+    assert [(r["sequence"], r["idempotency_key"]) for r in pre["ranges"]] == [(2, "a")]
+
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    resp = _post_reserve(client, _meta(9, "post", pcm, clock_origin_ms=500), token)
+    assert resp.status_code == 200  # migration wrote the union — no IntegrityError
+    post = _get_public_manifest(client).json()
+    assert [(r["sequence"], r["idempotency_key"]) for r in post["ranges"]] == [
+        (2, "a"), (9, "post")]
+    assert [(p["sequence"], p["idempotency_key"]) for _id, p in repo._table(MEETING_ID)] == [
+        (2, "a"), (9, "post")]
+    assert "ranges" not in repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]

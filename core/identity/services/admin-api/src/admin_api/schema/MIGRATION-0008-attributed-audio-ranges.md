@@ -76,32 +76,32 @@ start new replicas → the advisory-locked DDL converges once while others queue
 
 ## Rollback
 
-If this image must be rolled back, the table rows have to be moved back into
+If this image must be rolled back, the table rows have to be folded back into
 `meetings.data['attributed_audio_manifest']['ranges']` BEFORE the base image runs again —
-otherwise every migrated meeting reads as a 200-with-zero-ranges. Run
-`MIGRATION-0008-rollback.sql` in this directory (its UPDATE is also inlined below and exercised
-verbatim by `tests/test_attributed_ledger_pg.py::test_rollback_sql_restores_inline_manifest`):
+otherwise every migrated meeting reads as a 200-with-zero-ranges, and a base-image
+completed-artifact deletion cannot see table rows at all (the fold AND the row cleanup are the
+rollback). Pure SQL cannot express the fold — the union contract (inline positions kept,
+crossed key/sequence collisions resolved, the more-advanced payload surviving) lives in
+`union_ranges` — so the rollback is a meeting-api entry point that runs the same code as the
+readers and the lazy migration. With meeting-api stopped:
 
-```sql
--- MIGRATION-0008 rollback: fold attributed_audio_ranges back into the JSONB manifest.
--- Safe to run repeatedly (idempotent); run while meeting-api is STOPPED.
-UPDATE meetings m
-SET data = jsonb_set(
-    m.data, '{attributed_audio_manifest,ranges}',
-    COALESCE((
-        SELECT jsonb_agg(r.payload ORDER BY r.id)
-        FROM attributed_audio_ranges r
-        WHERE r.meeting_id = m.id
-    ), '[]'::jsonb)
-)
-WHERE m.data ? 'attributed_audio_manifest';
+```bash
+DATABASE_URL=postgresql+asyncpg://… uv run python -m meeting_api.recordings.rollback
 ```
 
-The pre-table image reads `manifest["ranges"]` straight from the JSONB — a table row appended by
-a crashed/mid-deployed new image (never folded back) would be invisible to it; this script is the
-fold-back. After it runs, `attributed_audio_ranges` is stale but harmless; the next forward
-deploy re-migrates via the union path (a table row that advanced past its inline twin keeps its
-payload — see "Legacy rows").
+`meeting_api.recordings.rollback.rollback_attributed_ranges` folds each meeting's table rows
+into its header in `union_ranges` order and deletes that meeting's table rows in the SAME
+transaction, then drops `attributed_audio_ranges` — the post-run schema is exactly the
+pre-migration one, so a base image behaves identically to a never-migrated database (pg tests
+prove it: `test_rollback_folds_rows_and_drops_table`,
+`test_rollback_restores_base_semantics`). Meetings carrying no table rows and no inline
+`ranges` are untouched; rows of a meeting whose header is gone (mid-delete crash) are swept,
+not resurrected. Re-running is a no-op.
+
+The pre-table image reads `manifest["ranges"]` straight from the JSONB — the folded union is
+exactly what it serves. Rolling forward again re-creates the table via the startup
+`ensure_attributed_audio_schema` and re-migrates the inline ranges on the first write.
+
 
 ## Blast radius
 

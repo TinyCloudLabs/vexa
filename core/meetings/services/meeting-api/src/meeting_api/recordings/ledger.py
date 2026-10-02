@@ -107,10 +107,11 @@ class MemoryRangeLedger(RangeLedger):
         self._rows.append(row)
 
 
-# A range's lifecycle rank — used only to resolve inline↔table collisions so a stale inline row
-# can never regress a more-advanced table row (sealed reservation → uploaded/failed) during the
-# lazy migration. Unknown/absent states rank lowest (they lose).
-_RANGE_STATE_RANK = {"uploaded": 2, "failed": 2}
+# A range's lifecycle rank — used only to resolve collisions so a stale reservation can never
+# regress a more-advanced row. ``uploaded`` outranks ``failed``: a delivered object's
+# storage_path must never be replaced by a failed retry's payload (Opus L4). Unknown/absent
+# states rank lowest (they lose).
+_RANGE_STATE_RANK = {"uploaded": 3, "failed": 2}
 
 
 def _merge_collision(existing: dict, incoming: dict) -> dict:
@@ -122,31 +123,52 @@ def _merge_collision(existing: dict, incoming: dict) -> dict:
     return existing
 
 
-def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None) -> list:
+def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None,
+                 dropped_out: Optional[list] = None) -> list:
     """The union of a header's inline ``ranges`` and the meeting's table rows, in THE canonical
-    order every reader and the lazy migration share:
+    order every reader, the lazy migration and the offline rollback share:
 
     1. Inline rows, in stored order, deduplicated first-wins on idempotency_key OR sequence
        (a malformed legacy row carrying a duplicate can otherwise never migrate — its INSERT
        would violate the unique constraints on every write, permanently 500-ing the meeting;
-       Opus L3). Drops are logged, not silent.
-    2. Each table row, in table order: a key/sequence collision merges INTO the inline row's
-       position (the collision payload keeps the inline row's place but may carry the table
-       payload — ``_merge_collision``), a non-colliding row appends.
+       Opus L3).
+    2. Each table row, in table order: a key/sequence collision merges INTO the colliding
+       position (the survivor keeps the earliest slot but may carry the table payload —
+       ``_merge_collision``), a non-colliding row appends.
 
-    Every element returned is a fresh dict — callers may mutate freely.
+    The result is unique in BOTH dimensions even when a key collision and a sequence collision
+    cross — inline (a,1),(b,2) vs table (a,2): the table row's identity merges at the earliest
+    colliding position and the now-conflicting sibling slot is dropped (Astra P3). A dropped
+    sibling is always an inline-identity row (table rows are unique per meeting on both axes
+    and can only merge INTO a slot), so no table payload is ever dropped here; a merged table
+    payload survives even when a sibling slot is consumed.
+
+    Rows dropped from the union are appended to ``dropped_out`` when provided — logging is the
+    caller's job (migrate warns once; readers stay silent). Every returned element is a fresh
+    dict — callers may mutate freely.
     """
     out: list = []
     by_key: dict = {}
     by_seq: dict = {}
-    dropped = 0
+    dropped: list = dropped_out if dropped_out is not None else []
+
+    def _drop_pos(p: int) -> None:
+        row = out[p]
+        out[p] = None
+        dropped.append(row)
+        k, s = row.get("idempotency_key"), row.get("sequence")
+        if k is not None and by_key.get(k) == p:
+            del by_key[k]
+        if s is not None and by_seq.get(s) == p:
+            del by_seq[s]
+
     for row in inline_rows or []:
         if not isinstance(row, dict):
-            dropped += 1
+            dropped.append(row)
             continue
         key, seq = row.get("idempotency_key"), row.get("sequence")
         if (key is not None and key in by_key) or (seq is not None and seq in by_seq):
-            dropped += 1
+            dropped.append(dict(row))
             continue
         pos = len(out)
         out.append(dict(row))
@@ -154,31 +176,45 @@ def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None) -
             by_key[key] = pos
         if seq is not None:
             by_seq[seq] = pos
-    if dropped:
-        log.warning(
-            "attributed-audio migration dropped %d malformed/duplicate inline range row(s) "
-            "for meeting %s", dropped, meeting_id,
-        )
     for row in table_rows or []:
         if not isinstance(row, dict):
             continue
         row = dict(row)
         key, seq = row.get("idempotency_key"), row.get("sequence")
-        pos = None
+        positions = []
         if key is not None and key in by_key:
-            pos = by_key[key]
-        elif seq is not None and seq in by_seq:
-            pos = by_seq[seq]
-        if pos is None:
+            positions.append(by_key[key])
+        if seq is not None and seq in by_seq and by_seq[seq] not in positions:
+            positions.append(by_seq[seq])
+        if not positions:
             pos = len(out)
             out.append(row)
-        else:
-            out[pos] = _merge_collision(out[pos], row)
-        if key is not None:
-            by_key[key] = pos
-        if seq is not None:
-            by_seq[seq] = pos
-    return out
+            if key is not None:
+                by_key[key] = pos
+            if seq is not None:
+                by_seq[seq] = pos
+            continue
+        target = min(positions)
+        merged = row
+        for p in sorted(positions):
+            merged = _merge_collision(out[p], merged)
+        out[target] = merged
+        # The merge may consume or lose collisions: every other colliding slot is dropped, and
+        # any surviving slot colliding with the MERGED identity (e.g. inline (b,2) after (a,2)
+        # merges at the earlier slot) is dropped too — the union stays unique on both axes.
+        for p in positions:
+            if p != target and out[p] is not None:
+                _drop_pos(p)
+        mk, ms = merged.get("idempotency_key"), merged.get("sequence")
+        for other in (by_key.get(mk) if mk is not None else None,
+                      by_seq.get(ms) if ms is not None else None):
+            if other is not None and other != target and out[other] is not None:
+                _drop_pos(other)
+        if mk is not None:
+            by_key[mk] = target
+        if ms is not None:
+            by_seq[ms] = target
+    return [r for r in out if r is not None]
 
 
 class SqlRangeLedger(RangeLedger):
@@ -314,9 +350,9 @@ class SqlRangeLedger(RangeLedger):
         never reorders the externally visible manifest (a read is the same union). Collisions
         resolve via ``union_ranges``: the more-advanced payload survives, so a stale inline
         reservation cannot regress a table row that already reached uploaded/failed, and a
-        malformed duplicate inline row is dropped (never an IntegrityError that 500s the
-        meeting's write path on every call). Runs under the meetings-row lock that scopes
-        this ledger.
+        malformed duplicate or crossed-identity inline row is dropped (never an IntegrityError
+        that 500s the meeting's write path on every call). Runs under the meetings-row lock
+        that scopes this ledger.
         """
         rows = [dict(r) for r in legacy_rows if isinstance(r, dict)]
         if not rows:
@@ -332,7 +368,14 @@ class SqlRangeLedger(RangeLedger):
                 .order_by(AttributedAudioRange.id)
             )
         ).scalars().all()
-        merged = union_ranges(rows, existing, meeting_id=self._meeting_id)
+        dropped: list = []
+        merged = union_ranges(rows, existing, meeting_id=self._meeting_id,
+                              dropped_out=dropped)
+        if dropped:
+            log.warning(
+                "attributed-audio migration dropped %d malformed/duplicate inline range "
+                "row(s) for meeting %s", len(dropped), self._meeting_id,
+            )
 
         # Wholesale rewrite in union order under the row lock — the row ids are internal, and
         # migration runs at most once per meeting (the header's inline list is stripped on the
