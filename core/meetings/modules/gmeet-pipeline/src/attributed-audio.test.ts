@@ -225,6 +225,31 @@ assert.equal(parkedManifest.state, 'closed');
 assert.equal(drainStore.rows.filter(range => range.state === 'failed').length, 3, 'every slot-starved turn is durably failed');
 assert.equal(drainStore.rows.filter(range => range.state === 'uploaded').length, 2);
 
+// Reviewer regression: the page admission fence stops forwarding frames and waits on the
+// boundary callback before stopping capture, so no feed() or stop() drives the drain. A queued
+// boundary row must be admitted when a settling task frees its slot — the drain hangs off task
+// settlement, not off the frame path.
+const settleStore = memoryStore();
+let releaseSettle!: () => void; const settleGate = new Promise<void>(resolve => { releaseSettle = resolve; });
+const realSettleUpload = settleStore.upload;
+settleStore.upload = async (range, chunks) => { await settleGate; return realSettleUpload(range, chunks); };
+const settled = createAttributedAudioRecorder('tc560-settle', settleStore, { cadenceMs: 5_000, gapMs: 10, maxPendingTasks: 4 });
+await settled.ready;
+for (let i = 0; i < 8; i++) settled.feed(slotFrame(i % 2, 3_000 + i * 1_000));
+assert.equal(settled.pendingTasks(), 4, 'the task table is full behind gated uploads');
+// Page-boundary overflow while every slot is held: the boundary row joins the queue.
+const boundaryRow = settled.incomplete({ channel: 2, speaker_key: 'channel:2', speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, capture_ms: 9_000, sample_rate: 100 });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(settleStore.rows.length, 4, 'nothing is admitted while uploads are gated');
+releaseSettle();                         // no further feed(): task settlement alone drains the queue
+const boundaryResult = await boundaryRow;
+assert.equal(boundaryResult.state, 'failed', 'the queued boundary row becomes durable without a later frame');
+assert.equal(settleStore.rows.some(range => String(range.idempotency_key).includes('page-boundary')), true, 'the boundary row reached the ledger');
+const settledManifest = await settled.stop();
+assert.equal(settledManifest.state, 'closed');
+assert.equal(settleStore.rows.filter(range => range.state === 'uploaded').length, 6);
+assert.equal(settleStore.rows.filter(range => range.state === 'failed').length, 3, 'two slot-starved turns plus the boundary row are durably failed');
+
 // A page-boundary overflow row that can never reach the ledger still faults: the queue defers
 // only transient capacity refusals, not outcomes that cannot be made durable.
 const boundaryStore = memoryStore();

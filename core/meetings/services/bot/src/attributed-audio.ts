@@ -47,16 +47,18 @@ export function createHttpAttributedAudioRecorder(inv: Invocation, options: { re
     // idempotency/metadata 409 is deterministic and fails immediately.
     const retryable = (error: AttributedAudioRequestError) =>
       error.code === 'network' || error.status === 429 || (error.status !== undefined && error.status >= 500);
-  /** Per-attempt delay: full jitter on the configured bound, a Retry-After header honored but
-   * still capped by that bound so one response cannot stretch the retry budget. */
+  /** Per-attempt delay: full jitter on the configured bound with no hint; a Retry-After header
+   * is a minimum wait honored up to the bound, with jitter spread between the two so the retry
+   * never fires inside the server's advertised cooldown. */
   const delayFor = (attempt: number, response?: Response): number => {
     const bound = retryDelays[attempt];
     const header = response?.headers.get('retry-after');
     const hinted = header === null || header === undefined ? NaN
       : /^\d+$/.test(header.trim()) ? Number(header.trim()) * 1_000
       : Date.parse(header) - Date.now();
-    const base = Number.isFinite(hinted) && hinted >= 0 ? Math.min(hinted, bound) : bound;
-    return base * Math.random();
+    return Number.isFinite(hinted) && hinted >= 0
+      ? Math.min(hinted, bound) + Math.random() * Math.max(0, bound - Math.min(hinted, bound))
+      : bound * Math.random();
   };
     for (let attempt = 0; ; attempt++) {
       let response: Response;
@@ -77,8 +79,9 @@ export function createHttpAttributedAudioRecorder(inv: Invocation, options: { re
         continue;
       }
       try {
-        // read the body first: a network drop or abort while streaming it is a transport
-        // failure the server may never have observed, not malformed JSON.
+        // Read the body first: a 2xx means the server already committed the request, and a mid-body
+        // network drop loses only our view of the acknowledgement — the idempotency key makes the
+        // retry replay-safe, while malformed JSON after a complete body is a real protocol break.
         const body = await response.text();
         try {
           return JSON.parse(body) as Record<string, unknown>;

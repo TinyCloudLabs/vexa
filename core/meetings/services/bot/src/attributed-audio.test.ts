@@ -194,6 +194,35 @@ try {
   globalThis.fetch = originalFetch;
 }
 
+// Retry-After is a floor, not a jitter ceiling: a 429 advertising one second with a two-second
+// bound must wait ≥1 s before retrying — a ceiling would fire inside the cooldown and burn the
+// attempt. One real second is spent here because the header's granularity is seconds and the
+// wait itself is the observable behavior.
+let floorCalls = 0;
+globalThis.fetch = async (input, init) => {
+  if (init?.method === 'GET') return Response.json({ version: 1, meeting_id: '1', clock_origin: 'first_admitted_capture_epoch_ms', clock_origin_ms: 0, state: 'open', ranges: [] });
+  if (String(input).endsWith('/close')) {
+    floorCalls++;
+    return floorCalls === 1 ? new Response('throttled', { status: 429, headers: { 'retry-after': '1' } }) : Response.json({ state: 'closed' });
+  }
+  return Response.json({});
+};
+try {
+  const recorder = createHttpAttributedAudioRecorder({
+    platform: 'google_meet', meetingUrl: 'https://meet.test/a', botName: 'Vexa', redisUrl: 'redis://x',
+    transcribeEnabled: false, meeting_id: 1, connectionId: 's', attributedAudioUploadUrl: 'https://api.test/internal/attributed-audio/upload',
+  }, { retryDelaysMs: [2_000], warn: () => {} });
+  assert.ok(recorder);
+  await recorder.ready;
+  const started = Date.now();
+  const closed = await recorder.stop();
+  assert.equal(closed.state, 'closed');
+  assert.equal(floorCalls, 2, 'the hinted retry succeeds instead of exhausting attempts in the cooldown');
+  assert.ok(Date.now() - started >= 1_000, `retry fired ${Date.now() - started}ms into a 1s cooldown`);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
 // fetch() resolves on headers: a body stream that dies mid-read is a transport failure the
 // server may already have acted on (here: the close is durably recorded but its acknowledgement
 // is lost). The request retries under the same bounded policy and the receipt still lands.

@@ -67,6 +67,9 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
   if (!Number.isSafeInteger(taskLimit) || taskLimit < 1) throw new Error('invalid attributed-audio storage task limit');
   const slotWaiters = new Set<() => void>();
   const notifySlots = () => { for (const resolve of slotWaiters) resolve(); slotWaiters.clear(); };
+  // Persistent settle listeners run before one-shot slot waiters so a queued-missing drain can
+  // fill the just-freed slot before a stop()-time drain re-checks the queue.
+  const settleListeners = new Set<() => void>();
   const sameImmutable = (left: ImmutableRange, right: ImmutableRange) =>
     Object.keys(left).filter(key => key !== 'attribution' && key !== 'state' && key !== 'path').every(key =>
       (left as Record<string, unknown>)[key] === (right as Record<string, unknown>)[key])
@@ -129,7 +132,7 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
       } finally { bufferedBytes -= bytes; }
     })();
     tasks.set(range.idempotency_key, { range, task });
-    void task.finally(() => { tasks.delete(range.idempotency_key); notifySlots(); }).catch(() => undefined);
+    void task.finally(() => { tasks.delete(range.idempotency_key); for (const listener of settleListeners) listener(); notifySlots(); }).catch(() => undefined);
     return task;
   };
   const reconcile = async () => {
@@ -207,6 +210,8 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
       slotWaiters.add(resolve);
       return promise;
     },
+    /** Invoke `listener` each time a storage task settles and frees its slot. */
+    onTaskSettled(listener: () => void) { settleListeners.add(listener); },
   };
 }
 
@@ -285,6 +290,10 @@ export function createAttributedAudioRecorder(meetingId: string, store: Attribut
       }
     }
   };
+
+  // Queued missing rows must not wait for the next frame: a stopped page boundary or a drained
+  // backlog frees slots without new input, so settle events drive the drain too.
+  sink.onTaskSettled(drainMissing);
   const flush = (channel: number) => {
     const value = active.get(channel); if (!value) return; active.delete(channel); clearTimeout(value.idle);
     try {
