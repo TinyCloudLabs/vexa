@@ -78,18 +78,37 @@ export function createAttributedAudioSink(meetingId: string, store: AttributedAu
     const bytes = pcm?.reduce((total, chunk) => total + chunk.byteLength, 0) ?? 0;
     const task = (async () => {
       try {
-        const reserved = await store.reserve(range); replace(reserved);
-        if (!pcm) { const failed = await store.fail(range); replace(failed); return failed; }
+        let reserved: AttributedAudioRange;
         try {
-          const receipt = await store.upload(range, pcm);
-          const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+          reserved = await store.reserve(range);
         } catch (error) {
-          try { const failed = await store.fail(range); replace(failed); } catch { /* close exposes unresolved reservation */ }
-          throw error;
+          // A rejected reservation may still have reached the ledger (timeout, dropped
+          // acknowledgement). fail() is idempotent for that key: it durably marks an existing
+          // reservation failed and is a harmless conflict when none exists.
+          try { reserved = await store.fail(range); } catch { throw error; }
         }
+        replace(reserved);
+        // A replayed reserve can answer an already-terminal row: uploaded is a durable receipt
+        // and failed needs no bytes.
+        if (reserved.state === 'uploaded' || (reserved.state === 'failed' && pcm)) return reserved;
+        if (pcm) {
+          try {
+            const receipt = await store.upload(range, pcm);
+            const uploaded = { ...range, state: 'uploaded' as const, path: receipt.path }; replace(uploaded); return uploaded;
+          } catch (error) {
+            // The upload outcome is made durable as 'failed' rather than faulting the capture:
+            // a recorded failed range keeps the ledger complete and close() resolvable.
+            try { const failed = await store.fail(range); replace(failed); return failed; } catch { /* fall through to the local row */ }
+            replace({ ...range, state: 'failed' });
+            throw error;
+          }
+        }
+        try { const failed = await store.fail(range); replace(failed); return failed; } catch { /* fall through to the local row */ }
+        replace({ ...range, state: 'failed' });
+        throw new Error('attributed-audio missing-range outcome is not durable');
       } catch (error) {
-        // A failed reservation never owns PCM. Keep a local failed row so close remains an
-        // observable incomplete outcome; a later restart/retry can durably reserve this key.
+        // Keep a local failed row so close remains an observable incomplete outcome; a later
+        // restart/retry can durably reserve this key. The rejection is what faults the capture.
         const failed = { ...range, state: 'failed' as const }; replace(failed);
         throw error;
       } finally { bufferedBytes -= bytes; }

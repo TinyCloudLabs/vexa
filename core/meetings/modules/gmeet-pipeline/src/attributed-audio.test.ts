@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createAttributedAudioRecorder, createAttributedAudioSink, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
+import { createAttributedAudioRecorder, createAttributedAudioSink, type AttributedAudioFrame, type AttributedAudioManifest, type AttributedAudioRange, type AttributedAudioStore } from './attributed-audio.js';
 
 const row = (range: any, state: AttributedAudioRange['state']) => ({ ...range, state });
 function memoryStore(stall?: Promise<void>): AttributedAudioStore & { rows: AttributedAudioRange[]; uploaded: Uint8Array[] } {
@@ -152,4 +152,40 @@ openGate(); await first;
 const completeRetry = await idem.seal(idemInput, [new Float32Array([1])]);
 assert.equal(completeRetry.sequence, 0); assert.equal(idem.manifest().ranges.length, 1);
 assert.throws(() => idem.seal({ ...idemInput, speaker_key: 'changed' }, [new Float32Array([1])]), /conflicts/);
+
+// TC-560: one upload timeout mid-meeting becomes a durable 'failed' range. Later frames are
+// still admitted and the manifest closes — a rejected range is not a terminal capture fault.
+const transient = memoryStore();
+const realTransientUpload = transient.upload;
+transient.upload = async (range, chunks) => {
+  if (range.sequence === 0) throw new Error('injected upload timeout');
+  return realTransientUpload(range, chunks);
+};
+const surviving = createAttributedAudioRecorder('tc560', transient, { cadenceMs: 5_000, gapMs: 10 });
+await surviving.ready;
+const midFrame = (channel: number, capture_ms: number): AttributedAudioFrame =>
+  ({ channel, speaker_key: `channel:${channel}`, speaker_name: '', attribution: { source: 'unresolved', confidence: 0 }, pcm: new Float32Array(10), capture_ms, sample_rate: 100 });
+surviving.feed(midFrame(0, 1_000));
+surviving.feed(midFrame(0, 2_000));   // scheduling gap seals seq0 while capture continues
+await new Promise(resolve => setImmediate(resolve)); // the seal task's microtasks run before this turn
+surviving.feed(midFrame(1, 3_000));   // admission still works after the failed range
+const survivingManifest = await surviving.stop();
+assert.equal(survivingManifest.state, 'closed');
+const survivingStates = new Map(transient.rows.map(range => [range.sequence, range.state]));
+assert.equal(survivingStates.get(0), 'failed', 'the timed-out range keeps a durable failed outcome');
+assert.equal(survivingStates.get(1), 'uploaded', 'later frames on the same channel are admitted');
+assert.equal(survivingStates.get(2), 'uploaded', 'later frames on a new channel are admitted');
+
+// A range whose outcome cannot be made durable at all — reservation rejected and the fail marker
+// rejected too — is a real invariant break and still faults the recorder terminally.
+const undurable = memoryStore();
+undurable.reserve = async () => { throw new Error('ledger unreachable'); };
+undurable.fail = async () => { throw new Error('ledger unreachable'); };
+const faulted = createAttributedAudioRecorder('tc560-undurable', undurable, { cadenceMs: 5_000, gapMs: 10 });
+await faulted.ready;
+faulted.feed(midFrame(0, 1_000));
+faulted.feed(midFrame(0, 2_000));   // gap seals a turn whose reserve and fail both reject
+await new Promise(resolve => setImmediate(resolve));
+assert.throws(() => faulted.feed(midFrame(0, 3_000)), /storage_admission/);
+await assert.rejects(faulted.stop(), /storage_admission/);
 console.log('attributed-audio capture ledger passes');
