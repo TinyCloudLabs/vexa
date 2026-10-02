@@ -105,11 +105,15 @@ class RecordingRepo(Protocol):
     async def attributed_range_state_for_owner(
         self, user_id: int, meeting_id: int, sequence: int
     ) -> Optional[dict]:
-        """One owner-scoped read returning ``{"data": meetings.data, "range": payload|None}`` —
-        the keyed path for ``GET /meetings/{id}/attributed-audio/ranges/{seq}``: an index lookup
-        on ``(meeting_id, sequence)`` instead of assembling the whole manifest, with the header
-        and range payload in the same snapshot. ``range`` is ``None`` for a pre-table manifest
-        (inline ``ranges`` still live in ``data`` — the caller scans them).
+        """One owner-scoped read returning ``{"data": meetings.data, "range": payload|None,
+        "key_range": payload|None}`` — the keyed path for
+        ``GET /meetings/{id}/attributed-audio/ranges/{seq}``: index lookups on
+        ``(meeting_id, sequence)`` and ``(meeting_id, idempotency_key)`` instead of assembling
+        the whole manifest, with the header and both payloads in the same snapshot. ``range``
+        holds the table row at the requested sequence; ``key_range`` holds the table row at
+        the FIRST inline row's key at that sequence (the union contract drops a crossed inline
+        row — both axes must be probed to answer what the manifest answers). Probes are
+        ``None`` for a pre-table meeting — inline ``ranges`` still live in ``data``.
         """
         ...
 

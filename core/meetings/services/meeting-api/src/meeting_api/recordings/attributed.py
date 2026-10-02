@@ -387,21 +387,50 @@ async def attributed_range_for_owner(repo, storage, *, user_id: int, meeting_id:
     manifest = (data or {}).get("attributed_audio_manifest")
     if not isinstance(manifest, dict) or manifest.get("state") != "closed":
         raise SessionNotFound("attributed audio range not found")
-    value = snapshot.get("range")
-    # Union semantics: a same-identity pair merges to the more-advanced payload; a crossed
-    # inline twin drops (the table row owns the axis) — the same merge the manifest read and
-    # migration use.
-    inline = next(
-        (r for r in manifest.get("ranges") or []
-         if isinstance(r, dict) and r.get("sequence") == sequence),
+    # Union semantics over the bounded probe set: a same-identity pair merges to the
+    # more-advanced payload; a crossed inline twin drops because its key OR sequence is owned
+    # by a different table row — the sequence probe alone cannot see that, so the keyed read
+    # also probed the table for the inline twin's key (``key_range``). Serving the union's
+    # answer keeps the keyed path identical to the manifest before AND after migration.
+    inline_rows = [r for r in manifest.get("ranges") or [] if isinstance(r, dict)]
+    inline_idx = next(
+        (i for i, r in enumerate(inline_rows) if r.get("sequence") == sequence),
         None,
     )
+    inline = inline_rows[inline_idx] if inline_idx is not None else None
+    probes: list = []
+    seen_ids: set = set()
+    for probe in (snapshot.get("range"), snapshot.get("key_range")):
+        if not isinstance(probe, dict):
+            continue
+        # Both probes can return the same table row — the union requires axis-unique input,
+        # so one identity enters once.
+        ident = (probe.get("idempotency_key"), probe.get("sequence"))
+        if ident not in seen_ids:
+            seen_ids.add(ident)
+            probes.append(probe)
     merged = union_ranges(
         [inline] if isinstance(inline, dict) else [],
-        [value] if isinstance(value, dict) else [],
+        probes,
         meeting_id=meeting_id,
     )
-    value = merged[0] if merged else None
+    if isinstance(inline, dict):
+        key = inline.get("idempotency_key")
+        if (key is not None
+                and any(r.get("idempotency_key") == key
+                        for r in inline_rows[:inline_idx])
+                and not isinstance(snapshot.get("key_range"), dict)):
+            # An earlier inline row shares the key: if it survives, the full union's dedup
+            # drops this candidate (first-wins). Its fate hinges on a table probe the keyed
+            # read does not hold — fail closed rather than serve a row the manifest may not
+            # list. Requires hand-edited duplicate keys; no writer produces them.
+            merged = []
+    # The served row is whatever the union holds at the requested sequence — the surviving
+    # inline twin, the merge winner, or the table row that displaced a crossed twin (the
+    # manifest lists that table row at this sequence, so it is what a download serves). If the
+    # union holds nothing at this sequence — inline twin crossed/dropped and no table row
+    # there — there is nothing to serve: 404, exactly like the manifest.
+    value = next((r for r in merged if r.get("sequence") == sequence), None)
     if not isinstance(value, dict) or value.get("state") != "uploaded":
         raise SessionNotFound("attributed audio range not found")
     path = value.get("storage_path")

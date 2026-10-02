@@ -449,38 +449,61 @@ class SqlAlchemyRecordingRepo:
             }
 
     async def attributed_range_state_for_owner(self, user_id, meeting_id, sequence):
-        """Owner-scoped keyed range read — one statement, one index lookup.
+        """Owner-scoped keyed range read — one statement, bounded indexed probes.
 
         ``GET /meetings/{id}/attributed-audio/ranges/{seq}`` downloads ranges one at a time;
         resolving each through the assembled manifest is O(ranges) per call (O(n²) to fetch a
         meeting's ranges — worse than the pre-table read on large meetings). The unique index
-        on (meeting_id, sequence) answers the lookup directly, and the LEFT JOIN keeps the
-        header + range payload in ONE snapshot (same interleaving guarantee as
+        on (meeting_id, sequence) answers the sequence probe directly, and a second scalar
+        subquery probes (meeting_id, idempotency_key) for the inline twin's key — the union
+        contract drops a crossed inline row (key collides at a DIFFERENT sequence), so the
+        keyed read must see both axes or it would serve a row the manifest excludes (TC-583
+        round-7). Everything resolves in ONE snapshot (same interleaving guarantee as
         ``attributed_artifacts_for_owner``).
 
-        Returns ``{"data": <meetings.data>, "range": <payload-or-None>}``, ``None`` for an
-        unknown or unowned meeting. Legacy inline ``ranges`` are still in ``data`` — the
-        caller falls back to scanning them when ``range`` is ``None``.
+        Returns ``{"data": <meetings.data>, "range": <payload-at-sequence-or-None>,
+        "key_range": <payload-at-inline-key-or-None>}``, ``None`` for an unknown or unowned
+        meeting. Legacy inline ``ranges`` are still in ``data`` — the caller scans them and
+        runs the union over the bounded row set.
         """
         from sqlalchemy import text
 
         async with self._session_factory() as db:
             row = (await db.execute(
                 text(
-                    "SELECT m.data, r.payload"
+                    "SELECT m.data, r.payload, rk.payload"
                     " FROM meetings m"
                     " LEFT JOIN attributed_audio_ranges r"
                     "   ON r.meeting_id = m.id AND r.sequence = :seq"
+                    " LEFT JOIN attributed_audio_ranges rk"
+                    "   ON rk.meeting_id = m.id"
+                    "  AND rk.idempotency_key = ("
+                    "    SELECT elem ->> 'idempotency_key'"
+                    "    FROM jsonb_array_elements("
+                    "      CASE jsonb_typeof(m.data #> '{attributed_audio_manifest,ranges}')"
+                    "        WHEN 'array'"
+                    "        THEN m.data #> '{attributed_audio_manifest,ranges}'"
+                    "        ELSE '[]'::jsonb END"
+                    "    ) WITH ORDINALITY AS t(elem, n)"
+                    "    WHERE jsonb_typeof(elem) = 'object'"
+                    "      AND elem ->> 'sequence' = :seq_text"
+                    "    ORDER BY n LIMIT 1"
+                    "  )"
                     " WHERE m.id = :mid AND m.user_id = :uid"
                 ),
-                {"seq": sequence, "mid": meeting_id, "uid": user_id},
+                {"seq": sequence, "seq_text": str(sequence),
+                 "mid": meeting_id, "uid": user_id},
             )).first()
             if row is None or not isinstance(row[0], dict):
                 return None
-            payload = row[1]
+            payload, key_payload = row[1], row[2]
             if isinstance(payload, str):
                 payload = json.loads(payload)
-            return {"data": row[0], "range": payload if isinstance(payload, dict) else None}
+            if isinstance(key_payload, str):
+                key_payload = json.loads(key_payload)
+            return {"data": row[0],
+                    "range": payload if isinstance(payload, dict) else None,
+                    "key_range": key_payload if isinstance(key_payload, dict) else None}
 
     async def owner_of(self, meeting_id):
         from sqlalchemy import select

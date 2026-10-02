@@ -217,26 +217,33 @@ class _TableRangeRepo(InMemoryRecordingRepo):
         }
 
     async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
-        """Mirrors the SQL keyed read: one (meeting_id, sequence) probe over the table rows,
-        falling back to inline ``ranges`` when no table row exists (pre-migration meeting)."""
+        """Mirrors the SQL keyed read: ``range`` is the (meeting_id, sequence) table probe and
+        ``key_range`` the (meeting_id, idempotency_key) probe for the FIRST inline twin's key —
+        both over table rows, in one snapshot, exactly as the production SQL."""
         meeting = self._meetings.get(meeting_id)
         if not meeting or meeting.get("user_id") != user_id:
             return None
         data = meeting.get("data") or {}
+        manifest = data.get("attributed_audio_manifest")
+        inline = next(
+            (r for r in (manifest.get("ranges") if isinstance(manifest, dict) else []) or []
+             if isinstance(r, dict) and r.get("sequence") == sequence),
+            None,
+        )
+        key = inline.get("idempotency_key") if isinstance(inline, dict) else None
         found = next(
             (payload for _id, payload in self._table(meeting_id)
              if (payload or {}).get("sequence") == sequence),
             None,
         )
-        if found is None:
-            manifest = data.get("attributed_audio_manifest")
-            ranges = manifest.get("ranges") if isinstance(manifest, dict) else []
-            found = next(
-                (r for r in ranges or []
-                 if isinstance(r, dict) and r.get("sequence") == sequence),
-                None,
-            )
-        return {"data": dict(data), "range": dict(found) if found else None}
+        key_found = next(
+            (payload for _id, payload in self._table(meeting_id)
+             if key is not None and (payload or {}).get("idempotency_key") == key),
+            None,
+        )
+        return {"data": dict(data),
+                "range": dict(found) if isinstance(found, dict) else None,
+                "key_range": dict(key_found) if isinstance(key_found, dict) else None}
 
 class InlineRangeRepo(InMemoryRecordingRepo):
     """Alias for readability: the inline-JSONB durable shape via the shared runner."""
@@ -725,6 +732,42 @@ def test_crossed_collision_migrates_through_table_repo():
     assert [(p["sequence"], p["idempotency_key"]) for _id, p in repo._table(MEETING_ID)] == [
         (2, "a"), (9, "post")]
     assert "ranges" not in repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+
+
+async def test_keyed_download_honors_crossed_identity():
+    """R7 keyed-path repro on the emulated table stack: a crossed inline twin drops under the
+    union, so GET …/ranges/{seq} on its sequence 404s — matching the manifest — while the
+    surviving same-key table row still downloads."""
+    pcm = b"\x00\x00\x80?" * 4
+    repo, storage = _TableRangeRepo(), InMemoryStorage()
+    _seed(repo)
+    repo._meetings[MEETING_ID].setdefault("data", {})["attributed_audio_manifest"] = {
+        "version": 1, "meeting_id": str(MEETING_ID),
+        "clock_origin": "first_admitted_capture_epoch_ms",
+        "clock_origin_ms": 500, "state": "closed",
+        "ranges": [dict(_meta(1, "a", pcm, clock_origin_ms=500), state="uploaded",
+                        storage_path="attributed-audio/7/1/a/1.pcm")],
+    }
+    repo._table(MEETING_ID).append((1, dict(
+        _meta(2, "a", pcm, clock_origin_ms=500), state="uploaded",
+        storage_path="attributed-audio/7/1/a/2.pcm")))
+    storage.blobs["attributed-audio/7/1/a/1.pcm"] = pcm
+    storage.blobs["attributed-audio/7/1/a/2.pcm"] = pcm
+
+    client = _client(repo, storage)
+    # Manifest shows only the survivor; the dropped twin's download must agree.
+    pre = _get_public_manifest(client).json()
+    assert [(r["sequence"], r["idempotency_key"]) for r in pre["ranges"]] == [(2, "a")]
+    assert _get_range(client, 1).status_code == 404
+    assert _get_range(client, 2).status_code == 200
+    assert _get_range(client, 2).content == pcm
+
+    # After migration (any row-locked mutation forces it) the answer is unchanged.
+    async def _noop(data):
+        return dict(data), True
+    assert await repo.mutate_meeting_data(MEETING_ID, _noop) is True
+    assert _get_range(client, 1).status_code == 404
+    assert _get_range(client, 2).status_code == 200
 
 
 def test_union_ranges_stale_slot_regression():

@@ -43,7 +43,7 @@ async def rollback_attributed_ranges(session_factory) -> dict:
     from sqlalchemy.orm.attributes import flag_modified
 
     from ..sessions.models import AttributedAudioRange, Meeting
-    from .ledger import union_ranges
+    from .ledger import report_dropped_union_rows, union_ranges
 
     stats = {"meetings_folded": 0, "rows_folded": 0, "dropped": 0,
              "orphan_rows_deleted": 0, "table_present": True}
@@ -93,11 +93,10 @@ async def rollback_attributed_ranges(session_factory) -> dict:
                         header.get("ranges") or [], payloads,
                         meeting_id=meeting_id, dropped_out=dropped,
                     )
-                    if dropped:
-                        log.warning(
-                            "rollback dropped %d duplicate/displaced range row(s) "
-                            "for meeting %s", len(dropped), meeting_id,
-                        )
+                    report_dropped_union_rows(
+                        dropped, merged, meeting_id=meeting_id,
+                        context="attributed-audio rollback",
+                    )
                     header = dict(header)
                     header["ranges"] = merged
                     data["attributed_audio_manifest"] = header

@@ -209,6 +209,51 @@ def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None,
     return out
 
 
+def report_dropped_union_rows(dropped, merged, *, meeting_id, context: str) -> None:
+    """One WARNING line per row the union displaced — enough identity to find the orphaned
+    storage object later. A row whose (key AND sequence) identity survives is a same-identity
+    merge's superseded LOSER; anything else (crossed key/sequence collision, malformed or
+    duplicate row) is an outright drop — the two read differently because only the second can
+    leave an untracked ``attributed-audio/…`` object that nothing references."""
+    if not dropped:
+        return
+    survivor_ids = {
+        (r.get("idempotency_key"), r.get("sequence"))
+        for r in merged if isinstance(r, dict)
+    }
+    superseded = dropped_lost = 0
+    for row in dropped:
+        is_superseded = (
+            isinstance(row, dict)
+            and row.get("idempotency_key") is not None
+            and row.get("sequence") is not None
+            and (row.get("idempotency_key"), row.get("sequence")) in survivor_ids
+        )
+        if is_superseded:
+            superseded += 1
+        else:
+            dropped_lost += 1
+        if isinstance(row, dict):
+            log.warning(
+                "%s: %s range row sequence=%r idempotency_key=%r storage_path=%r "
+                "for meeting %s",
+                context,
+                "superseded same-identity" if is_superseded else "dropped",
+                row.get("sequence"), row.get("idempotency_key"),
+                row.get("storage_path"), meeting_id,
+            )
+        else:
+            log.warning(
+                "%s: dropped malformed range row %r for meeting %s",
+                context, row, meeting_id,
+            )
+    log.warning(
+        "%s: %d range row(s) not in the union for meeting %s "
+        "(%d superseded by a same-identity merge, %d dropped)",
+        context, len(dropped), meeting_id, superseded, dropped_lost,
+    )
+
+
 class SqlRangeLedger(RangeLedger):
     """``RangeLedger`` over the ``attributed_audio_ranges`` table inside the caller's session.
 
@@ -363,11 +408,10 @@ class SqlRangeLedger(RangeLedger):
         dropped: list = []
         merged = union_ranges(rows, existing, meeting_id=self._meeting_id,
                               dropped_out=dropped)
-        if dropped:
-            log.warning(
-                "attributed-audio migration dropped %d duplicate/displaced range row(s) "
-                "for meeting %s", len(dropped), self._meeting_id,
-            )
+        report_dropped_union_rows(
+            dropped, merged, meeting_id=self._meeting_id,
+            context="attributed-audio migration",
+        )
 
         # Wholesale rewrite in union order under the row lock — the row ids are internal, and
         # migration runs at most once per meeting (the header's inline list is stripped on the

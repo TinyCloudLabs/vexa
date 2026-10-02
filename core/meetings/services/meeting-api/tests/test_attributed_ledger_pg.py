@@ -1084,3 +1084,77 @@ async def test_r6_crossed_identity_repros_through_read_migrate_rollback(pg):
                 ("post", 9)], label
             assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid))[
                 "attributed_audio_manifest"], label
+
+
+async def test_r7_keyed_download_honors_crossed_identity(pg):
+    """Astra P2 / Opus L7 keyed-path repros — the crossed inline row the manifest drops must
+    NOT download, before AND after migration:
+
+    R7a: inline (a,1,uploaded) + table (a,2,uploaded) — the manifest lists only seq 2, but the
+    old keyed read served seq 1's inline bytes until the table check was added.
+    R7b: inline (x,5,uploaded) + table (x,1,uploaded) — same flaw with distant sequences.
+    """
+    pcm = b"\x00\x00\x80?" * 4
+    from sqlalchemy import insert
+    from meeting_api.sessions.models import AttributedAudioRange
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import (
+        attributed_range_for_owner, attributed_manifest_for_owner)
+    from meeting_api.recordings.fakes import InMemoryStorage
+    from meeting_api.recordings.service import SessionNotFound
+
+    cases = [
+        ("r7a", [dict(_meta(1, "a", pcm), state="uploaded",
+                      storage_path="attributed-audio/7/1/a/1.pcm")],
+                [dict(_meta(2, "a", pcm), state="uploaded",
+                      storage_path="attributed-audio/7/1/a/2.pcm")],
+                1, 2),
+        ("r7b", [dict(_meta(5, "x", pcm), state="uploaded",
+                      storage_path="attributed-audio/7/1/x/5.pcm")],
+                [dict(_meta(1, "x", pcm), state="uploaded",
+                      storage_path="attributed-audio/7/1/x/1.pcm")],
+                5, 1),
+    ]
+    for label, inline, table, dropped_seq, kept_seq in cases:
+        async with _scratch_database() as (e2, sf2):
+            repo = SqlAlchemyRecordingRepo(sf2)
+            storage = InMemoryStorage()
+            mid = MEETING_ID
+            for row in inline + table:
+                storage.blobs[row["storage_path"]] = pcm
+            await _seed_meeting(sf2, data={"attributed_audio_manifest": {
+                "version": 1, "meeting_id": str(mid),
+                "clock_origin": "first_admitted_capture_epoch_ms",
+                "clock_origin_ms": 500, "state": "closed",
+                "ranges": inline}}, meeting_id=mid)
+            async with sf2() as db:
+                for row in table:
+                    await db.execute(insert(AttributedAudioRange).values(
+                        meeting_id=mid, sequence=row["sequence"],
+                        idempotency_key=row["idempotency_key"], payload=dict(row)))
+                await db.commit()
+
+            # The manifest excludes the crossed row; the keyed download must agree — the
+            # request never hit migration.
+            manifest = await attributed_manifest_for_owner(repo, user_id=USER, meeting_id=mid)
+            assert [(r["idempotency_key"], r["sequence"]) for r in
+                    manifest["ranges"]] == [(inline[0]["idempotency_key"], kept_seq)], label
+            with pytest.raises(SessionNotFound):
+                await attributed_range_for_owner(
+                    repo, storage, user_id=USER, meeting_id=mid, sequence=dropped_seq)
+            # The surviving union row still downloads its own bytes.
+            assert await attributed_range_for_owner(
+                repo, storage, user_id=USER, meeting_id=mid, sequence=kept_seq) == pcm, label
+
+            # Force the lazy migration (a no-op mutation under the row lock writes the union
+            # into the table and strips the inline list) — the answer must not change.
+            async def _noop(data):
+                return dict(data), True
+            assert await repo.mutate_meeting_data(mid, _noop) is True
+            assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid))[
+                "attributed_audio_manifest"], label
+            with pytest.raises(SessionNotFound):
+                await attributed_range_for_owner(
+                    repo, storage, user_id=USER, meeting_id=mid, sequence=dropped_seq)
+            assert await attributed_range_for_owner(
+                repo, storage, user_id=USER, meeting_id=mid, sequence=kept_seq) == pcm, label
