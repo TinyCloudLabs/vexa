@@ -47,6 +47,17 @@ export function createHttpAttributedAudioRecorder(inv: Invocation, options: { re
     // idempotency/metadata 409 is deterministic and fails immediately.
     const retryable = (error: AttributedAudioRequestError) =>
       error.code === 'network' || error.status === 429 || (error.status !== undefined && error.status >= 500);
+  /** Per-attempt delay: full jitter on the configured bound, a Retry-After header honored but
+   * still capped by that bound so one response cannot stretch the retry budget. */
+  const delayFor = (attempt: number, response?: Response): number => {
+    const bound = retryDelays[attempt];
+    const header = response?.headers.get('retry-after');
+    const hinted = header === null || header === undefined ? NaN
+      : /^\d+$/.test(header.trim()) ? Number(header.trim()) * 1_000
+      : Date.parse(header) - Date.now();
+    const base = Number.isFinite(hinted) && hinted >= 0 ? Math.min(hinted, bound) : bound;
+    return base * Math.random();
+  };
     for (let attempt = 0; ; attempt++) {
       let response: Response;
       try {
@@ -55,22 +66,33 @@ export function createHttpAttributedAudioRecorder(inv: Invocation, options: { re
         const error = new AttributedAudioRequestError(stage, 'network');
         reportOnce(error);
         if (attempt >= retryDelays.length || !retryable(error)) throw error;
-        await sleep(retryDelays[attempt]);
+        await sleep(delayFor(attempt));
         continue;
       }
       if (!response.ok) {
         const error = new AttributedAudioRequestError(stage, 'http', response.status);
         reportOnce(error);
         if (attempt >= retryDelays.length || !retryable(error)) throw error;
-        await sleep(retryDelays[attempt]);
+        await sleep(delayFor(attempt, response));
         continue;
       }
       try {
-        return await response.json() as Record<string, unknown>;
-      } catch {
-        const error = new AttributedAudioRequestError(stage, 'invalid_response');
-        reportOnce(error);
-        throw error;
+        // read the body first: a network drop or abort while streaming it is a transport
+        // failure the server may never have observed, not malformed JSON.
+        const body = await response.text();
+        try {
+          return JSON.parse(body) as Record<string, unknown>;
+        } catch {
+          const error = new AttributedAudioRequestError(stage, 'invalid_response');
+          reportOnce(error);
+          throw error;
+        }
+      } catch (error) {
+        if (error instanceof AttributedAudioRequestError) throw error;
+        const transport = new AttributedAudioRequestError(stage, 'network');
+        reportOnce(transport);
+        if (attempt >= retryDelays.length) throw transport;
+        await sleep(delayFor(attempt));
       }
     }
   };
