@@ -11,11 +11,12 @@ never page the full ledger in by accident, and a caller that needs the list must
 
 ``union_ranges`` is THE dedup/ordering contract shared by reads, migration and rollback: given
 the inline ``manifest["ranges"]`` still stored in ``meetings.data`` and the meeting's table
-rows, it returns one collision-free ordered list — inline rows keep their positions,
-non-colliding table rows append after, and a collision keeps the strictly more-advanced payload
-(equal rank prefers the durable table row over its inline twin). Readers union; migration
-writes the union back to the table — so a write that migrates cannot reorder or regress the
-externally visible manifest.
+rows, it returns one collision-free ordered list — table rows always survive, surviving
+inline rows keep their positions, non-merged table rows append after, a same-identity pair
+(key AND sequence equal) merges to the more-advanced payload (equal rank prefers the durable
+table row), and every other inline row that collides on either axis is dropped. Readers union;
+migration writes the union back to the table — so a write that migrates cannot reorder or
+regress the externally visible manifest.
 
 ``assemble_attributed_manifest`` applies ``union_ranges`` to rebuild the public manifest shape
 for every reader that keeps the attributed-audio.v1 JSON contract.
@@ -113,128 +114,99 @@ class MemoryRangeLedger(RangeLedger):
 # states rank lowest (they lose).
 _RANGE_STATE_RANK = {"uploaded": 3, "failed": 2}
 
-
-def _supersedes(new: dict, new_from_table: bool, old: dict, old_from_table: bool) -> bool:
-    """``new`` may take ``old``'s slot only when strictly more advanced — or, at equal rank,
-    when ``new`` is the durable TABLE row displacing an inline twin (the durable copy is
-    preferred at equal rank; a table payload is only ever superseded by a strictly
-    more-advanced row, so a stored upload's evidence can never silently regress)."""
-    rn = _RANGE_STATE_RANK.get(new.get("state"), 0)
-    ro = _RANGE_STATE_RANK.get(old.get("state"), 0)
-    if rn > ro:
-        return True
-    if rn < ro:
-        return False
-    return new_from_table and not old_from_table
+def _merge_collision(existing: dict, incoming: dict) -> dict:
+    """One surviving payload for a same-identity collision (key AND sequence equal — the same
+    range): the strictly more-advanced state wins; ties take ``existing``, which is the TABLE
+    payload at the merge site — the durable copy is preferred when states rank equal."""
+    if _RANGE_STATE_RANK.get(incoming.get("state"), 0) > _RANGE_STATE_RANK.get(existing.get("state"), 0):
+        return incoming
+    return existing
 
 
 def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None,
                  dropped_out: Optional[list] = None) -> list:
-    """The union of a header's inline ``ranges`` and the meeting's table rows, in THE canonical
-    order every reader, the lazy migration and the offline rollback share:
+    """The union of a header's inline ``ranges`` and the meeting's table rows — THE contract
+    every reader, the lazy migration and the offline rollback share:
 
-    1. Inline rows, in stored order, deduplicated first-wins on idempotency_key OR sequence
-       (a malformed legacy row carrying a duplicate can otherwise never migrate — its INSERT
-       would violate the unique constraints on every write, permanently 500-ing the meeting;
-       Opus L3).
-    2. Each table row, in table order: a row whose key or sequence collides with one or more
-       live slots merges ALL of them — the surviving payload occupies the earliest colliding
-       slot, and the survivor is chosen by ``_supersedes`` (strict rank win; equal rank prefers
-       the table copy over an inline twin, and the earlier slot between two table payloads).
-       A non-colliding row appends.
+    1. Table rows are authoritative and ALWAYS survive: the table is unique per meeting on
+       both axes by constraint, so table rows never collide with each other.
+    2. An inline row whose key AND sequence both equal a table row's is the SAME range: one
+       row occupies the inline position with the more-advanced payload (rank
+       uploaded > failed > sealed; equal rank takes the table payload — an uploaded copy is
+       never downgraded, Opus L4).
+    3. Any OTHER inline row that collides with any table row on key OR sequence is dropped:
+       a crossed identity (key hits one row, sequence hits another, or only one axis hits)
+       means the inline row is a pre-migration leftover whose range the table already owns
+       under a different pairing — keeping it would either duplicate an axis or resurrect a
+       stale reservation (the Astra/Opus round-5 fuzz cases). Crossed identities only arise
+       from forbidden old/new overlap or hand edits.
+    4. Order: surviving inline rows (including same-identity merged slots) keep their inline
+       order; table rows that merged into no inline slot append in table order.
 
-    The identity maps are maintained exactly: every slot the merge consumes is unregistered
-    before the survivor's identity is installed, so a later row can never merge into a dropped
-    slot or silently skip a table row (the Astra/Opus round-4 defects). The result is unique
-    in BOTH dimensions even when a key collision and a sequence collision cross — inline
-    (a,1),(b,2) vs table (a,2): the table payload merges at the earliest slot and the
-    conflicting inline sibling drops.
+    Inline rows are additionally deduplicated first-wins on key OR sequence (a malformed legacy
+    duplicate can otherwise never migrate — its INSERT would violate the unique constraints on
+    every write, Opus L3), and non-dict rows never enter the union.
 
-    Every non-surviving row — malformed, duplicate, displaced or superseded, inline or table —
-    is appended to ``dropped_out`` when provided (reporting is the caller's job: migrate warns
-    once, rollback counts, readers stay silent). Every returned element is a fresh dict —
-    callers may mutate freely.
+    Every row that does not appear in the result — malformed, duplicate, collision-dropped or
+    merge-superseded, inline or table — is appended to ``dropped_out`` when provided (the
+    caller reports: migrate warns once, rollback counts, readers stay silent). Every returned
+    element is a fresh dict — callers may mutate freely.
     """
-    out: list = []
-    origins: list = []          # parallel to ``out``: True = payload came from the table
-    by_key: dict = {}
-    by_seq: dict = {}
     dropped: list = dropped_out if dropped_out is not None else []
 
-    def _unregister(p: int) -> None:
-        """Remove every identity mapping of slot ``p`` — a slot that changes identity or is
-        dropped must leave no stale key/sequence pointing at it."""
-        row = out[p]
-        k, s = row.get("idempotency_key"), row.get("sequence")
-        if k is not None and by_key.get(k) == p:
-            del by_key[k]
-        if s is not None and by_seq.get(s) == p:
-            del by_seq[s]
-
-    for row in inline_rows or []:
-        if not isinstance(row, dict):
-            dropped.append(row)
-            continue
-        key, seq = row.get("idempotency_key"), row.get("sequence")
-        if (key is not None and key in by_key) or (seq is not None and seq in by_seq):
-            dropped.append(dict(row))
-            continue
-        pos = len(out)
-        out.append(dict(row))
-        origins.append(False)
-        if key is not None:
-            by_key[key] = pos
-        if seq is not None:
-            by_seq[seq] = pos
+    table: list = []
+    tb_key: dict = {}
+    tb_seq: dict = {}
     for row in table_rows or []:
         if not isinstance(row, dict):
             dropped.append(row)
             continue
         row = dict(row)
-        key, seq = row.get("idempotency_key"), row.get("sequence")
-        positions = []
-        if key is not None and key in by_key:
-            positions.append(by_key[key])
-        if seq is not None and seq in by_seq and by_seq[seq] not in positions:
-            positions.append(by_seq[seq])
-        if not positions:
-            pos = len(out)
-            out.append(row)
-            origins.append(True)
-            if key is not None:
-                by_key[key] = pos
-            if seq is not None:
-                by_seq[seq] = pos
-            continue
-        # Merge every colliding slot: fold candidates left-to-right — the table row under
-        # merge counts LAST (wins equal rank against inline twins but never supersedes a
-        # table payload of equal rank), and between two colliding slot payloads the earlier
-        # position wins the tie.
-        positions.sort()
-        target = positions[0]
-        merged, merged_from_table = row, True
-        for p in positions:
-            if _supersedes(out[p], origins[p], merged, merged_from_table):
-                merged, merged_from_table = out[p], origins[p]
-        # Unregister + report every displaced payload BEFORE the survivor is installed — the
-        # survivor's own registrations point at ``target`` and every other slot is dead.
-        for p in positions:
-            if out[p] is not merged:
-                dropped.append(out[p])
-            _unregister(p)
-            if p != target:
-                out[p] = None
-                origins[p] = False
-        if merged is not row:
+        table.append(row)
+        k, s = row.get("idempotency_key"), row.get("sequence")
+        if k is not None:
+            tb_key[k] = row
+        if s is not None:
+            tb_seq[s] = row
+
+    out: list = []
+    claimed: set = set()          # id() of table rows merged into an inline slot
+    seen_key: set = set()
+    seen_seq: set = set()
+    for row in inline_rows or []:
+        if not isinstance(row, dict):
             dropped.append(row)
-        out[target] = merged
-        origins[target] = merged_from_table
-        mk, ms = merged.get("idempotency_key"), merged.get("sequence")
-        if mk is not None:
-            by_key[mk] = target
-        if ms is not None:
-            by_seq[ms] = target
-    return [r for r in out if r is not None]
+            continue
+        row = dict(row)
+        k, s = row.get("idempotency_key"), row.get("sequence")
+        if (k is not None and k in seen_key) or (s is not None and s in seen_seq):
+            dropped.append(row)
+            continue
+        tk = tb_key.get(k) if k is not None else None
+        ts = tb_seq.get(s) if s is not None else None
+        if tk is not None and tk is ts:
+            # Same-identity merge: the inline slot survives carrying the more-advanced payload.
+            merged = _merge_collision(tk, row)
+            out.append(dict(merged))
+            claimed.add(id(tk))
+            dropped.append(row if merged is tk else tk)
+            if k is not None:
+                seen_key.add(k)
+            if s is not None:
+                seen_seq.add(s)
+        elif tk is not None or ts is not None:
+            # Crossed or partial collision — the table owns the axis; the inline row drops.
+            dropped.append(row)
+        else:
+            out.append(row)
+            if k is not None:
+                seen_key.add(k)
+            if s is not None:
+                seen_seq.add(s)
+    for row in table:
+        if id(row) not in claimed:
+            out.append(row)
+    return out
 
 
 class SqlRangeLedger(RangeLedger):

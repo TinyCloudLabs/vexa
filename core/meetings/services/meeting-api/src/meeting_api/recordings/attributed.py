@@ -388,8 +388,9 @@ async def attributed_range_for_owner(repo, storage, *, user_id: int, meeting_id:
     if not isinstance(manifest, dict) or manifest.get("state") != "closed":
         raise SessionNotFound("attributed audio range not found")
     value = snapshot.get("range")
-    # Union semantics on a collision: the inline twin keeps its slot but the more-advanced
-    # payload wins — the same merge the manifest read and migration use.
+    # Union semantics: a same-identity pair merges to the more-advanced payload; a crossed
+    # inline twin drops (the table row owns the axis) — the same merge the manifest read and
+    # migration use.
     inline = next(
         (r for r in manifest.get("ranges") or []
          if isinstance(r, dict) and r.get("sequence") == sequence),

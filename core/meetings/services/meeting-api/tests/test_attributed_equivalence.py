@@ -657,10 +657,39 @@ def test_union_ranges_rank_uploaded_above_failed():
     uploaded = {"idempotency_key": "k", "sequence": 1, "state": "uploaded",
                 "storage_path": "attributed-audio/7/1/s/1.pcm"}
     failed = {"idempotency_key": "k", "sequence": 1, "state": "failed"}
-    assert union_ranges([], [uploaded, failed]) == [uploaded]
-    assert union_ranges([], [failed, uploaded]) == [uploaded]
-    # And an inline failed twin never displaces the table's uploaded row either.
-    assert union_ranges([failed], [uploaded]) == [uploaded]
+    # Same-identity merge: the uploaded payload survives from EITHER side of the union.
+    assert union_ranges([dict(failed)], [dict(uploaded)])[0]["state"] == "uploaded"
+    assert union_ranges([dict(uploaded)], [dict(failed)])[0]["state"] == "uploaded"
+
+
+def test_union_ranges_round6_reviewer_counterexamples():
+    """The round-6 reviewer fuzz cases — inline rows crossed against the table on EITHER axis
+    drop; only a same-identity (key AND sequence) pair merges payloads."""
+    # Astra R6a: an unrelated uploaded inline row cannot consume a slot its sibling lost.
+    out = union_ranges(
+        [{"idempotency_key": "b", "sequence": 2, "state": "uploaded"},
+         {"idempotency_key": "a", "sequence": 1, "state": "uploaded"}],
+        [{"idempotency_key": "c", "sequence": 1, "state": "sealed"},
+         {"idempotency_key": "a", "sequence": 2, "state": "sealed"}],
+    )
+    assert [(r["idempotency_key"], r["sequence"]) for r in out] == [("c", 1), ("a", 2)]
+
+    # Astra R6b: a table row survives although its would-be blocker was displaced.
+    out = union_ranges(
+        [{"idempotency_key": "a", "sequence": 1, "state": "uploaded"}],
+        [{"idempotency_key": "a", "sequence": 2, "state": "sealed"},
+         {"idempotency_key": "b", "sequence": 1, "state": "uploaded"}],
+    )
+    assert [(r["idempotency_key"], r["sequence"]) for r in out] == [("a", 2), ("b", 1)]
+
+    # Opus L7: (k1,2,failed) crossed — key hits (k1,0), sequence hits (k0,2); both survive.
+    out = union_ranges(
+        [{"idempotency_key": "k1", "sequence": 2, "state": "failed"}],
+        [{"idempotency_key": "k1", "sequence": 0, "state": "sealed"},
+         {"idempotency_key": "k0", "sequence": 2, "state": "failed"}],
+    )
+    assert [(r["idempotency_key"], r["sequence"]) for r in out] == [("k1", 0), ("k0", 2)]
+
 
 
 def test_crossed_collision_migrates_through_table_repo():
@@ -721,68 +750,142 @@ def test_union_ranges_stale_slot_regression():
         dropped_out=dropped,
     )
     assert [(r["idempotency_key"], r["sequence"]) for r in opus] == [
-        ("a", 0), ("b", 1), ("d", 2)]
-    # All three table payloads survived; the three displaced inline rows are reported.
+        ("b", 1), ("a", 0), ("d", 2)]
+    # All three table payloads survived in table order; the three displaced inline rows are
+    # reported.
     assert sorted(r["idempotency_key"] for r in dropped) == ["a", "b", "d"]
 
 
 def test_union_ranges_randomized_invariants():
-    """Opus R5 property: for thousands of seeded random cases — each input unique on both axes,
-    random states — the union never raises, is unique on key and on sequence, is deterministic,
-    reports every non-surviving row, and never drops a table row except superseded by a
-    strictly more-advanced row sharing an identity axis."""
+    """Round-6 contract property test — shared key/sequence domains between inline and table,
+    thousands of seeded cases plus malformed/NULL identities. Asserts: no exception; unique
+    keys and sequences; every table row's identity present (payload upgraded only by a
+    same-identity inline row of strictly higher rank); an inline row survives iff it collides
+    with no table row or its payload wins a same-identity merge; complete accounting;
+    determinism."""
     import random
     rng = random.Random(0x7C583)
     states = ["sealed", "uploaded", "failed"]
+    rank_of_state = {"sealed": 0, "failed": 2, "uploaded": 3}
 
-    def gen(prefix):
-        keys = [f"{prefix}-k{i}" for i in range(rng.randint(2, 8))]
-        seqs = list(range(rng.randint(2, 8)))
-        n = min(len(keys), len(seqs), rng.randint(0, 6))
-        rng.shuffle(keys)
-        rng.shuffle(seqs)
-        return [{"idempotency_key": keys[i], "sequence": seqs[i],
-                 "state": rng.choice(states), "rowid": f"{prefix}{i}"}
-                for i in range(n)]
+    def make_row(k, s, prefix, i):
+        return {"idempotency_key": k, "sequence": s,
+                "state": rng.choice(states), "rowid": f"{prefix}{i}"}
 
-    def rank(row):
-        return {"sealed": 0, "failed": 2, "uploaded": 3}.get(row["state"], 0)
+    def gen(prefix, key_pool, seq_pool, allow_dupes, allow_bad):
+        # n keys and n sequences sampled independently — deduped per axis so each side stays
+        # unique on both axes; ~10% NULL identities; optional malformed/duplicate rows.
+        n = rng.randint(0, 6)
+        rows, used_k, used_s = [], set(), set()
+        for _ in range(n * 3):
+            if len(rows) >= n:
+                break
+            k = rng.choice(key_pool) if rng.random() > 0.1 else None
+            s = rng.choice(seq_pool) if rng.random() > 0.1 else None
+            if (k is not None and k in used_k) or (s is not None and s in used_s):
+                continue
+            if k is not None:
+                used_k.add(k)
+            if s is not None:
+                used_s.add(s)
+            rows.append(make_row(k, s, prefix, len(rows)))
+        if allow_bad and rows and rng.random() < 0.15:
+            rows.insert(rng.randint(0, len(rows)), "not-a-dict")
+        dicts = [r for r in rows if isinstance(r, dict)]
+        if allow_dupes and dicts and rng.random() < 0.2:
+            dup = dict(rng.choice(dicts))
+            dup["rowid"] = f"{prefix}dup{len(rows)}"
+            rows.insert(rng.randint(0, len(rows)), dup)
+        return rows
+
+    def identity(row):
+        return (row.get("idempotency_key"), row.get("sequence"))
 
     for trial in range(4000):
-        inline, table = gen("in"), gen("tb")
+        key_pool = [f"k{i}" for i in range(rng.randint(2, 10))]
+        seq_pool = list(range(rng.randint(2, 10)))
+        inline = gen("in", key_pool, seq_pool, allow_dupes=True, allow_bad=True)
+        table = gen("tb", key_pool, seq_pool, allow_dupes=False, allow_bad=False)
+
         dropped1, dropped2 = [], []
         first = union_ranges(inline, table, dropped_out=dropped1)
-        # Determinism: same inputs, fresh copies, same output.
-        second = union_ranges([dict(r) for r in inline], [dict(r) for r in table],
-                              dropped_out=dropped2)
-        assert first == second
-        keys = [r["idempotency_key"] for r in first]
-        seqs = [r["sequence"] for r in first]
-        assert len(keys) == len(set(keys))
-        assert len(seqs) == len(set(seqs))
-        survived = {r["rowid"] for r in first}
-        reported = {r["rowid"] for r in dropped1}
-        every = {r["rowid"] for r in inline} | {r["rowid"] for r in table}
+        second = union_ranges(
+            [dict(r) if isinstance(r, dict) else r for r in inline],
+            [dict(r) for r in table], dropped_out=dropped2)
+        assert first == second, f"nondeterministic (trial {trial})"
+
+        keys = [r["idempotency_key"] for r in first if r.get("idempotency_key") is not None]
+        seqs = [r["sequence"] for r in first if r.get("sequence") is not None]
+        assert len(keys) == len(set(keys)), f"dup keys (trial {trial})"
+        assert len(seqs) == len(set(seqs)), f"dup sequences (trial {trial})"
+
+        survived = {r["rowid"] for r in first if isinstance(r, dict)}
+        reported = {r["rowid"] for r in dropped1 if isinstance(r, dict)}
+        inputs = {r["rowid"] for r in inline + table if isinstance(r, dict)}
         assert survived.isdisjoint(reported)
-        assert survived | reported == every  # every row accounted for exactly once
-        # A table row absent from the union must chain strictly-upward in rank to a survivor
-        # through shared-identity supersessions (transitively superseded rows count too).
-        rank_of = {id(r): rank(r) for r in inline + table}
-        edges = {}
-        for r in inline + table:
-            cand = [q for q in inline + table
-                    if q is not r and rank(q) > rank(r)
-                    and (q["idempotency_key"] == r["idempotency_key"]
-                         or q["sequence"] == r["sequence"])]
-            if cand:
-                edges[r["rowid"]] = max(cand, key=lambda q: rank_of[id(q)])["rowid"]
-        for r in table:
-            if r["rowid"] in survived:
+        assert survived | reported == inputs, f"incomplete accounting (trial {trial})"
+        assert sum(1 for r in dropped1 if not isinstance(r, dict)) == sum(
+            1 for r in inline if not isinstance(r, dict)), (
+            f"malformed row not reported (trial {trial})")
+
+        out_by_id = {identity(r): r for r in first}
+        inline_by_id: dict = {}
+        for r in inline:  # first occurrence wins, matching the union's dedup
+            if isinstance(r, dict):
+                inline_by_id.setdefault(identity(r), r)
+        for t in table:
+            if t["idempotency_key"] is None or t["sequence"] is None:
+                # A NULL-identity row can never same-identity merge — it survives literally.
+                assert t["rowid"] in survived, (
+                    f"NULL-identity table row {t['rowid']} dropped (trial {trial})")
                 continue
-            seen, cur = set(), r["rowid"]
-            while cur not in survived and cur in edges and cur not in seen:
-                seen.add(cur)
-                cur = edges[cur]
-            assert cur in survived, (
-                f"table row {r['rowid']} vanished without a strictly-more-advanced "
-                f"same-identity successor (trial {trial})")
+            pos = out_by_id.get(identity(t))
+            assert pos is not None, f"table row {t['rowid']} lost identity (trial {trial})"
+            if pos["rowid"] != t["rowid"]:
+                donor = inline_by_id[identity(t)]
+                assert pos["rowid"] == donor["rowid"] and (
+                    rank_of_state.get(donor["state"], 0)
+                    > rank_of_state.get(t["state"], 0)
+                ), f"table row {t['rowid']} payload regressed (trial {trial})"
+        tb_keys = {r["idempotency_key"] for r in table
+                   if r["idempotency_key"] is not None}
+        tb_seqs = {r["sequence"] for r in table if r["sequence"] is not None}
+        # Identities are only comparable when BOTH components are present — a NULL axis can
+        # never collide or merge (matching SQL unique-index NULL semantics and the union).
+        tb_ids = {identity(r) for r in table
+                  if r["idempotency_key"] is not None and r["sequence"] is not None}
+        inline_src = {r["rowid"]: r for r in inline if isinstance(r, dict)}
+        for row in first:
+            if not row["rowid"].startswith("in"):
+                continue
+            src = inline_src[row["rowid"]]
+            ident = identity(src)
+            if ident in tb_ids:
+                t = next(r for r in table if identity(r) == ident)
+                assert rank_of_state.get(src["state"], 0) > rank_of_state.get(
+                    t["state"], 0), (
+                    f"inline {row['rowid']} survived a same-identity merge it did not "
+                    f"strictly outrank (trial {trial})")
+            else:
+                assert src["idempotency_key"] not in tb_keys \
+                    and src["sequence"] not in tb_seqs, (
+                    f"inline {row['rowid']} collides with the table (trial {trial})")
+        seen_before = set()
+        for row in inline:
+            if not isinstance(row, dict):
+                continue
+            rid = row["rowid"]
+            if rid in survived or rid in reported:
+                pass
+            else:
+                raise AssertionError(f"inline {rid} unaccounted (trial {trial})")
+            if rid in reported:
+                k, s = row["idempotency_key"], row["sequence"]
+                dup = (k is not None and ("k", k) in seen_before) \
+                    or (s is not None and ("s", s) in seen_before)
+                assert dup or identity(row) in tb_ids or k in tb_keys or s in tb_seqs, (
+                    f"inline {rid} dropped without cause (trial {trial})")
+            if row.get("idempotency_key") is not None:
+                seen_before.add(("k", row["idempotency_key"]))
+            if row.get("sequence") is not None:
+                seen_before.add(("s", row["sequence"]))

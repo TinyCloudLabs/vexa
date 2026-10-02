@@ -54,19 +54,28 @@ closing semantics are unchanged.
 
 ## Legacy rows
 
-Manifests written before this release still carry `ranges` inline in `meetings.data`. Readers
-**union** inline ranges with table rows — inline rows keep their positions, table rows that do
-not collide on `idempotency_key` **or** `sequence` append after — and the first row-locked write
-migrates that exact union into `attributed_audio_ranges` and strips the inline list from the
-JSONB, so a write can never reorder the externally visible manifest. A collision adopts the
-more-advanced payload, with equal rank preferring the durable table row: an inline reservation
-(sealed) never overwrites a table row that already reached uploaded/failed, and a table payload
-is superseded only by a strictly more-advanced row sharing an identity axis — including the
-crossed case where key and sequence collide at different positions (the union stays unique on
-both axes). Malformed inline rows that duplicate a key or sequence are dropped (first
-occurrence wins, logged once at migration) rather than faulting the meeting's write path.
-A completed-artifact deletion removes the key and deletes every table row for the meeting in
-the same transaction.
+Manifests written before this release still carry `ranges` inline in `meetings.data`. Readers,
+the lazy migration and the rollback fold all share ONE contract (`union_ranges`):
+
+- Table rows are authoritative and **always** survive — the table is unique per meeting on
+  both axes by constraint, so table rows never collide with each other.
+- An inline row whose key **and** sequence both equal a table row's is the same range: one row
+  occupies the inline position carrying the more-advanced payload (rank
+  `uploaded > failed > sealed`; equal rank keeps the table payload — an uploaded copy is
+  never downgraded). The losing payload is reported through `dropped_out`.
+- Any other inline row that collides with any table row on key **or** sequence is dropped and
+  reported: a crossed identity means the table already owns the axis under a different
+  pairing, and keeping it would duplicate an axis or resurrect a stale reservation. Crossed
+  identities only arise from forbidden old/new overlap or hand edits.
+- Order never changes across the boundary: surviving inline rows (including merged slots)
+  keep their positions; table rows that merged into no inline slot append in row-id order.
+
+Malformed inline rows that duplicate a key or sequence are deduplicated first-wins, dropped,
+and logged once at migration rather than faulting the meeting's write path on every call —
+the first row-locked write then migrates that exact union into `attributed_audio_ranges` and
+strips the inline list from the JSONB, so a write can never reorder the externally visible
+manifest. A completed-artifact deletion removes the key and deletes every table row for the
+meeting in the same transaction.
 
 ## Deploy ordering — stop-then-start only
 
@@ -84,7 +93,7 @@ If this image must be rolled back, the table rows have to be folded back into
 otherwise every migrated meeting reads as a 200-with-zero-ranges, and a base-image
 completed-artifact deletion cannot see table rows at all (the fold AND the row cleanup are the
 rollback). Pure SQL cannot express the fold — the union contract (inline positions kept,
-crossed key/sequence collisions resolved, the more-advanced payload surviving) lives in
+same-identity collisions merged by rank, crossed key/sequence collisions dropped) lives in
 `union_ranges` — so the rollback is a meeting-api entry point that runs the same code as the
 readers and the lazy migration. With meeting-api stopped:
 

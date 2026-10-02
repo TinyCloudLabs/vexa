@@ -984,7 +984,7 @@ async def test_r5_stale_slot_repros_through_read_migrate_rollback(pg):
 
         artifact = await repo2.attributed_artifacts_for_owner(USER, mid2)
         assert [(r["idempotency_key"], r["sequence"]) for r in
-                artifact["manifest"]["ranges"]] == [("a", 0), ("b", 1), ("d", 2)]
+                artifact["manifest"]["ranges"]] == [("b", 1), ("a", 0), ("d", 2)]
 
         # Rollback on the UNMIGRATED mixed state folds the union — the three crossed inline
         # rows are displaced (all three table payloads survive) and counted.
@@ -993,7 +993,7 @@ async def test_r5_stale_slot_repros_through_read_migrate_rollback(pg):
         data = await _meeting_data(sf2, meeting_id=mid2)
         assert [(r["idempotency_key"], r["sequence"]) for r in
                 data["attributed_audio_manifest"]["ranges"]] == [
-            ("a", 0), ("b", 1), ("d", 2)]
+            ("b", 1), ("a", 0), ("d", 2)]
         assert "attributed_audio_ranges" not in await _table_names(e2)
 
         # The same union migrates cleanly when the table is converged again — the order the
@@ -1005,6 +1005,82 @@ async def test_r5_stale_slot_repros_through_read_migrate_rollback(pg):
             range_data=_meta(9, "post", pcm, clock_origin_ms=500))
         rows = await _range_rows(sf2, meeting_id=mid2)
         assert [(r.idempotency_key, r.sequence) for r in rows] == [
-            ("a", 0), ("b", 1), ("d", 2), ("post", 9)]
+            ("b", 1), ("a", 0), ("d", 2), ("post", 9)]
         assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid2))[
             "attributed_audio_manifest"]
+
+
+async def test_r6_crossed_identity_repros_through_read_migrate_rollback(pg):
+    """Round-6 reviewer counterexamples — every inline row whose key OR sequence collides with
+    the table under a DIFFERENT pairing is dropped (the union never duplicates an axis, never
+    resurrects a stale reservation):
+
+    Astra R6a — inline (b,2,up),(a,1,up) + table (c,1,sealed),(a,2,sealed) -> [(c,1),(a,2)]:
+      the uploaded inline (b,2) still drops — an unrelated inline row cannot consume the slot.
+    Astra R6b — inline (a,1,up) + table (a,2,sealed),(b,1,up) -> [(a,2),(b,1)]: the table row
+      (a,2) survives although its would-be blocker was displaced.
+    Opus L7 — inline (k1,2,failed) + table (k1,0,sealed),(k0,2,failed) -> [(k1,0),(k0,2)].
+    """
+    pcm = b"\x00\x00\x80?" * 4
+    from sqlalchemy import insert
+    from meeting_api.sessions.models import AttributedAudioRange
+    from meeting_api.recordings.adapters import (
+        SqlAlchemyRecordingRepo, ensure_attributed_audio_schema)
+    from meeting_api.recordings.attributed import reserve_attributed_range
+    from meeting_api.recordings.rollback import rollback_attributed_ranges
+
+    cases = [
+        ("r6a", [dict(_meta(2, "b", pcm), state="uploaded"),
+                 dict(_meta(1, "a", pcm), state="uploaded")],
+                [dict(_meta(1, "c", pcm), state="sealed"),
+                 dict(_meta(2, "a", pcm), state="sealed")],
+                [("c", 1), ("a", 2)], 2),
+        ("r6b", [dict(_meta(1, "a", pcm), state="uploaded")],
+                [dict(_meta(2, "a", pcm), state="sealed"),
+                 dict(_meta(1, "b", pcm), state="uploaded")],
+                [("a", 2), ("b", 1)], 1),
+        ("l7",  [dict(_meta(2, "k1", pcm), state="failed")],
+                [dict(_meta(0, "k1", pcm), state="sealed"),
+                 dict(_meta(2, "k0", pcm), state="failed")],
+                [("k1", 0), ("k0", 2)], 1),
+    ]
+    for label, inline, table, union, n_dropped in cases:
+        async with _scratch_database() as (e2, sf2):
+            repo2 = SqlAlchemyRecordingRepo(sf2)
+            mid = MEETING_ID
+            await _seed_meeting(sf2, data={"attributed_audio_manifest": {
+                "version": 1, "meeting_id": str(mid),
+                "clock_origin": "first_admitted_capture_epoch_ms",
+                "clock_origin_ms": 500, "state": "open",
+                "ranges": [dict(r, clock_origin_ms=500) for r in inline]}},
+                meeting_id=mid)
+            async with sf2() as db:
+                for row in table:
+                    await db.execute(insert(AttributedAudioRange).values(
+                        meeting_id=mid, sequence=row["sequence"],
+                        idempotency_key=row["idempotency_key"], payload=dict(row)))
+                await db.commit()
+
+            artifact = await repo2.attributed_artifacts_for_owner(USER, mid)
+            assert [(r["idempotency_key"], r["sequence"]) for r in
+                    artifact["manifest"]["ranges"]] == union, label
+
+            # Rollback on the un-migrated mixed state folds the union — the crossed inline
+            # rows are dropped and counted.
+            stats = await rollback_attributed_ranges(sf2)
+            assert stats["meetings_folded"] == 1, label
+            assert stats["dropped"] == n_dropped, label
+            data = await _meeting_data(sf2, meeting_id=mid)
+            assert [(r["idempotency_key"], r["sequence"]) for r in
+                    data["attributed_audio_manifest"]["ranges"]] == union, label
+
+            # A write after re-creating the table migrates the same union — no IntegrityError.
+            await ensure_attributed_audio_schema(e2)
+            await reserve_attributed_range(
+                repo2, token_meeting_id=mid, session_uid=SESSION_UID,
+                range_data=_meta(9, "post", pcm, clock_origin_ms=500))
+            rows = await _range_rows(sf2, meeting_id=mid)
+            assert [(r.idempotency_key, r.sequence) for r in rows] == union + [
+                ("post", 9)], label
+            assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid))[
+                "attributed_audio_manifest"], label

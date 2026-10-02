@@ -4,9 +4,9 @@ The pre-table meeting-api image reads ``meetings.data['attributed_audio_manifest
 straight out of the JSONB — a meeting whose ranges were migrated to (or appended in) the table
 would serve a 200 with zero ranges to it, and a base-image completed-artifact deletion cannot
 see table rows at all. Pure SQL cannot express the fold faithfully — the union contract
-(inline positions kept, crossed key/sequence collisions resolved, the more-advanced payload
-surviving) lives in ``ledger.union_ranges``, so this module runs the same code the readers and
-the lazy migration run.
+(inline positions kept, same-identity pairs merged to the more-advanced payload, crossed
+key/sequence collisions dropped) lives in ``ledger.union_ranges``, so this module runs the
+same code the readers and the lazy migration run.
 
 Run it while meeting-api is STOPPED:
 
