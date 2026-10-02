@@ -95,7 +95,7 @@ async def rollback_attributed_ranges(session_factory) -> dict:
                     )
                     if dropped:
                         log.warning(
-                            "rollback dropped %d malformed/duplicate range row(s) "
+                            "rollback dropped %d duplicate/displaced range row(s) "
                             "for meeting %s", len(dropped), meeting_id,
                         )
                     header = dict(header)

@@ -905,3 +905,106 @@ async def test_write_volume_stays_flat_as_ranges_grow(pg):
     # index-page splits and autovacuum noise on the fresh rows.
     assert wal_late <= max(wal_early * 3, wal_early + 8192), (
         f"per-reserve WAL grew with range count: {wal_early:.0f}B -> {wal_late:.0f}B")
+
+
+async def test_r5_stale_slot_repros_through_read_migrate_rollback(pg):
+    """Astra R5 (silent loss): inline (a,1,sealed) + table (a,2,uploaded),(b,1,uploaded) must
+    keep BOTH table rows through read, migration and rollback. Opus R5 (crash): inline
+    (a,2),(d,1),(b,0) + table (b,1),(a,0),(d,2) must merge cleanly — union, migration and
+    rollback all agree."""
+    engine, sf = pg
+    pcm = b"\x00\x00\x80?" * 4
+    from sqlalchemy import insert, select
+    from sqlalchemy.orm.attributes import flag_modified
+    from meeting_api.sessions.models import AttributedAudioRange, Meeting
+    from meeting_api.recordings.adapters import SqlAlchemyRecordingRepo
+    from meeting_api.recordings.attributed import reserve_attributed_range
+    from meeting_api.recordings.rollback import rollback_attributed_ranges
+
+    async def seed_case(mid, inline, table):
+        await _seed_meeting(sf, data={"attributed_audio_manifest": {
+            "version": 1, "meeting_id": str(mid),
+            "clock_origin": "first_admitted_capture_epoch_ms",
+            "clock_origin_ms": 500, "state": "open", "ranges": inline}},
+            meeting_id=mid)
+        async with sf() as db:
+            for row in table:
+                await db.execute(insert(AttributedAudioRange).values(
+                    meeting_id=mid, sequence=row["sequence"],
+                    idempotency_key=row["idempotency_key"], payload=dict(row)))
+            await db.commit()
+
+    repo = SqlAlchemyRecordingRepo(sf)
+
+    # --- Astra's silent-loss repro -------------------------------------------------------
+    mid = MEETING_ID
+    seed_inline = [dict(_meta(1, "a", pcm), state="sealed")]
+    seed_table = [dict(_meta(2, "a", pcm), state="uploaded"),
+                  dict(_meta(1, "b", pcm), state="uploaded")]
+    await seed_case(mid, seed_inline, seed_table)
+    artifact = await repo.attributed_artifacts_for_owner(USER, mid)
+    assert [(r["idempotency_key"], r["sequence"]) for r in
+            artifact["manifest"]["ranges"]] == [("a", 2), ("b", 1)]
+
+    # The migrating write must persist BOTH table rows — (b,1) must not vanish.
+    await reserve_attributed_range(
+        repo, token_meeting_id=mid, session_uid=SESSION_UID,
+        range_data=_meta(9, "post", pcm, clock_origin_ms=500))
+    rows = await _range_rows(sf, meeting_id=mid)
+    assert [(r.idempotency_key, r.sequence) for r in rows] == [
+        ("a", 2), ("b", 1), ("post", 9)]
+
+    # Rollback folds the union back — (b,1) reappears inline, table is dropped.
+    stats = await rollback_attributed_ranges(sf)
+    assert stats["meetings_folded"] >= 1
+    data = await _meeting_data(sf, meeting_id=mid)
+    assert [(r["idempotency_key"], r["sequence"]) for r in
+            data["attributed_audio_manifest"]["ranges"]] == [("a", 2), ("b", 1), ("post", 9)]
+    assert "attributed_audio_ranges" not in await _table_names(engine)
+
+    # --- Opus's crash repro (fresh scratch DB, still converged) --------------------------
+    async with _scratch_database() as (e2, sf2):
+        repo2 = SqlAlchemyRecordingRepo(sf2)
+        mid2 = MEETING_ID
+        await _seed_meeting(sf2, data={"attributed_audio_manifest": {
+            "version": 1, "meeting_id": str(mid2),
+            "clock_origin": "first_admitted_capture_epoch_ms",
+            "clock_origin_ms": 500, "state": "open",
+            "ranges": [dict(_meta(2, "a", pcm), state="sealed"),
+                       dict(_meta(1, "d", pcm), state="sealed"),
+                       dict(_meta(0, "b", pcm), state="sealed")]}}, meeting_id=mid2)
+        async with sf2() as db:
+            for row in [dict(_meta(1, "b", pcm), state="sealed"),
+                        dict(_meta(0, "a", pcm), state="sealed"),
+                        dict(_meta(2, "d", pcm), state="sealed")]:
+                await db.execute(insert(AttributedAudioRange).values(
+                    meeting_id=mid2, sequence=row["sequence"],
+                    idempotency_key=row["idempotency_key"], payload=dict(row)))
+            await db.commit()
+
+        artifact = await repo2.attributed_artifacts_for_owner(USER, mid2)
+        assert [(r["idempotency_key"], r["sequence"]) for r in
+                artifact["manifest"]["ranges"]] == [("a", 0), ("b", 1), ("d", 2)]
+
+        # Rollback on the UNMIGRATED mixed state folds the union — the three crossed inline
+        # rows are displaced (all three table payloads survive) and counted.
+        stats = await rollback_attributed_ranges(sf2)
+        assert stats["meetings_folded"] == 1 and stats["dropped"] == 3
+        data = await _meeting_data(sf2, meeting_id=mid2)
+        assert [(r["idempotency_key"], r["sequence"]) for r in
+                data["attributed_audio_manifest"]["ranges"]] == [
+            ("a", 0), ("b", 1), ("d", 2)]
+        assert "attributed_audio_ranges" not in await _table_names(e2)
+
+        # The same union migrates cleanly when the table is converged again — the order the
+        # read served is the order the durable table keeps.
+        from meeting_api.recordings.adapters import ensure_attributed_audio_schema
+        await ensure_attributed_audio_schema(e2)
+        await reserve_attributed_range(
+            repo2, token_meeting_id=mid2, session_uid=SESSION_UID,
+            range_data=_meta(9, "post", pcm, clock_origin_ms=500))
+        rows = await _range_rows(sf2, meeting_id=mid2)
+        assert [(r.idempotency_key, r.sequence) for r in rows] == [
+            ("a", 0), ("b", 1), ("d", 2), ("post", 9)]
+        assert "ranges" not in (await _meeting_data(sf2, meeting_id=mid2))[
+            "attributed_audio_manifest"]

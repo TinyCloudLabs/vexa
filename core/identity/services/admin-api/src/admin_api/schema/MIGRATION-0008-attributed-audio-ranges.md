@@ -59,9 +59,12 @@ Manifests written before this release still carry `ranges` inline in `meetings.d
 not collide on `idempotency_key` **or** `sequence` append after — and the first row-locked write
 migrates that exact union into `attributed_audio_ranges` and strips the inline list from the
 JSONB, so a write can never reorder the externally visible manifest. A collision adopts the
-more-advanced payload: an inline reservation (sealed) never overwrites a table row that already
-reached uploaded/failed. Malformed inline rows that duplicate a key or sequence are dropped
-(first occurrence wins, logged) rather than faulting the meeting's write path on every call.
+more-advanced payload, with equal rank preferring the durable table row: an inline reservation
+(sealed) never overwrites a table row that already reached uploaded/failed, and a table payload
+is superseded only by a strictly more-advanced row sharing an identity axis — including the
+crossed case where key and sequence collide at different positions (the union stays unique on
+both axes). Malformed inline rows that duplicate a key or sequence are dropped (first
+occurrence wins, logged once at migration) rather than faulting the meeting's write path.
 A completed-artifact deletion removes the key and deletes every table row for the meeting in
 the same transaction.
 

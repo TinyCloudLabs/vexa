@@ -648,7 +648,8 @@ def test_union_ranges_crossed_collision_is_unique_in_both_axes():
     )
     assert [(r["sequence"], r["idempotency_key"], r["state"]) for r in merged] == [
         (2, "a", "uploaded")]
-    assert [r["idempotency_key"] for r in dropped] == ["b"]
+    # Both displaced inline rows are reported — the merged-out twin AND the crossed sibling.
+    assert [r["idempotency_key"] for r in dropped] == ["a", "b"]
 
 
 def test_union_ranges_rank_uploaded_above_failed():
@@ -695,3 +696,93 @@ def test_crossed_collision_migrates_through_table_repo():
     assert [(p["sequence"], p["idempotency_key"]) for _id, p in repo._table(MEETING_ID)] == [
         (2, "a"), (9, "post")]
     assert "ranges" not in repo._meetings[MEETING_ID]["data"]["attributed_audio_manifest"]
+
+
+def test_union_ranges_stale_slot_regression():
+    """Astra R5: inline (a,1,sealed) + table (a,2,uploaded),(b,1,uploaded) — the (a,2) merge
+    displaces slot 0's sequence-1 registration; (b,1) must still land. And Opus R5: inline
+    (a,2),(d,1),(b,0) + table (b,1),(a,0),(d,2) — no stale-slot merge, no crash, all table
+    rows survive."""
+    astra = union_ranges(
+        [{"idempotency_key": "a", "sequence": 1, "state": "sealed"}],
+        [{"idempotency_key": "a", "sequence": 2, "state": "uploaded"},
+         {"idempotency_key": "b", "sequence": 1, "state": "uploaded"}],
+    )
+    assert [(r["idempotency_key"], r["sequence"]) for r in astra] == [("a", 2), ("b", 1)]
+
+    dropped = []
+    opus = union_ranges(
+        [{"idempotency_key": "a", "sequence": 2, "state": "sealed"},
+         {"idempotency_key": "d", "sequence": 1, "state": "sealed"},
+         {"idempotency_key": "b", "sequence": 0, "state": "sealed"}],
+        [{"idempotency_key": "b", "sequence": 1, "state": "sealed"},
+         {"idempotency_key": "a", "sequence": 0, "state": "sealed"},
+         {"idempotency_key": "d", "sequence": 2, "state": "sealed"}],
+        dropped_out=dropped,
+    )
+    assert [(r["idempotency_key"], r["sequence"]) for r in opus] == [
+        ("a", 0), ("b", 1), ("d", 2)]
+    # All three table payloads survived; the three displaced inline rows are reported.
+    assert sorted(r["idempotency_key"] for r in dropped) == ["a", "b", "d"]
+
+
+def test_union_ranges_randomized_invariants():
+    """Opus R5 property: for thousands of seeded random cases — each input unique on both axes,
+    random states — the union never raises, is unique on key and on sequence, is deterministic,
+    reports every non-surviving row, and never drops a table row except superseded by a
+    strictly more-advanced row sharing an identity axis."""
+    import random
+    rng = random.Random(0x7C583)
+    states = ["sealed", "uploaded", "failed"]
+
+    def gen(prefix):
+        keys = [f"{prefix}-k{i}" for i in range(rng.randint(2, 8))]
+        seqs = list(range(rng.randint(2, 8)))
+        n = min(len(keys), len(seqs), rng.randint(0, 6))
+        rng.shuffle(keys)
+        rng.shuffle(seqs)
+        return [{"idempotency_key": keys[i], "sequence": seqs[i],
+                 "state": rng.choice(states), "rowid": f"{prefix}{i}"}
+                for i in range(n)]
+
+    def rank(row):
+        return {"sealed": 0, "failed": 2, "uploaded": 3}.get(row["state"], 0)
+
+    for trial in range(4000):
+        inline, table = gen("in"), gen("tb")
+        dropped1, dropped2 = [], []
+        first = union_ranges(inline, table, dropped_out=dropped1)
+        # Determinism: same inputs, fresh copies, same output.
+        second = union_ranges([dict(r) for r in inline], [dict(r) for r in table],
+                              dropped_out=dropped2)
+        assert first == second
+        keys = [r["idempotency_key"] for r in first]
+        seqs = [r["sequence"] for r in first]
+        assert len(keys) == len(set(keys))
+        assert len(seqs) == len(set(seqs))
+        survived = {r["rowid"] for r in first}
+        reported = {r["rowid"] for r in dropped1}
+        every = {r["rowid"] for r in inline} | {r["rowid"] for r in table}
+        assert survived.isdisjoint(reported)
+        assert survived | reported == every  # every row accounted for exactly once
+        # A table row absent from the union must chain strictly-upward in rank to a survivor
+        # through shared-identity supersessions (transitively superseded rows count too).
+        rank_of = {id(r): rank(r) for r in inline + table}
+        edges = {}
+        for r in inline + table:
+            cand = [q for q in inline + table
+                    if q is not r and rank(q) > rank(r)
+                    and (q["idempotency_key"] == r["idempotency_key"]
+                         or q["sequence"] == r["sequence"])]
+            if cand:
+                edges[r["rowid"]] = max(cand, key=lambda q: rank_of[id(q)])["rowid"]
+        for r in table:
+            if r["rowid"] in survived:
+                continue
+            seen, cur = set(), r["rowid"]
+            while cur not in survived and cur in edges and cur not in seen:
+                seen.add(cur)
+                cur = edges[cur]
+            assert cur in survived, (
+                f"table row {r['rowid']} vanished without a strictly-more-advanced "
+                f"same-identity successor (trial {trial})")
