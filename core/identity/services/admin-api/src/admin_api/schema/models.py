@@ -207,3 +207,31 @@ class MeetingSession(Base):
     __table_args__ = (
         UniqueConstraint("meeting_id", "session_uid", name="_meeting_session_uc"),
     )
+
+
+class AttributedAudioRange(Base):
+    """One attributed-audio.v1 range row — the durable per-range ledger (TC-583).
+
+    The ledger used to live inside ``meetings.data['attributed_audio_manifest']['ranges']``, so
+    every reserve/upload/fail call rewrote the whole manifest JSONB (O(ranges) per call, O(n²)
+    per meeting). Ranges are first-class rows now: reserve is one INSERT, upload/fail one UPDATE,
+    and ``meetings.data`` keeps only the manifest header. The manifest API assembles
+    header + ordered payload rows on read, so the wire shape is unchanged.
+
+    ``idempotency_key`` / ``sequence`` are the two identity probes reserve resolves; both are
+    nullable only so a syntactically odd legacy row can migrate instead of faulting its meeting's
+    write path (validated ingress always sets both).
+    """
+
+    __tablename__ = "attributed_audio_ranges"
+
+    id = Column(Integer, primary_key=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False)
+    sequence = Column(Integer, nullable=True)
+    idempotency_key = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=lambda: {})
+
+    __table_args__ = (
+        UniqueConstraint("meeting_id", "idempotency_key", name="uq_attributed_range_key"),
+        UniqueConstraint("meeting_id", "sequence", name="uq_attributed_range_sequence"),
+    )

@@ -58,7 +58,9 @@ def _columns(cls: ast.ClassDef) -> dict:
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             target, value = stmt.target.id, stmt.value
         if target and _is_column_call(value):
-            cols[target] = ast.unparse(value)  # normalized column definition (type + flags)
+            # ast.unparse renders lambdas as "lambda : x" on 3.14+ vs "lambda: x" before —
+            # normalize to the canonical seal spelling so the digest is version-stable.
+            cols[target] = ast.unparse(value).replace("lambda :", "lambda:")
     return cols
 
 

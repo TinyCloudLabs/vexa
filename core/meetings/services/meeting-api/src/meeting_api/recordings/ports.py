@@ -86,7 +86,12 @@ class RecordingRepo(Protocol):
         ...
 
     async def mutate_meeting_data(self, meeting_id: int, mutator):
-        """Atomically mutate the complete meeting JSONB payload under the row lock."""
+        """Atomically mutate the complete meeting JSONB payload under the row lock.
+
+        ``mutator`` is ASYNC. ``data['attributed_audio_manifest']['ranges']`` is a ``RangeLedger``
+        view over the ``attributed_audio_ranges`` table (TC-583) — keyed probes
+        (``ledger_find`` / ``ledger_has_sequence`` / ``ledger_empty`` in ``recordings.ledger``)
+        are O(1); iteration requires ``await ranges.all()`` first."""
         ...
 
     async def attributed_artifacts_for_owner(self, user_id: int, meeting_id: int) -> Optional[dict]:
@@ -94,6 +99,21 @@ class RecordingRepo(Protocol):
 
         Public retrieval must fail closed while cleanup owns the artifact, whereas the internal
         deletion path still needs the retained manifest and deterministic object keys.
+        """
+        ...
+
+    async def attributed_range_state_for_owner(
+        self, user_id: int, meeting_id: int, sequence: int
+    ) -> Optional[dict]:
+        """One owner-scoped read returning ``{"data": meetings.data, "range": payload|None,
+        "table_ranges": list|None}`` — the keyed path for
+        ``GET /meetings/{id}/attributed-audio/ranges/{seq}``. While the header still carries
+        inline ``ranges`` (unmigrated legacy meeting), ``table_ranges`` holds the meeting's
+        whole ordered table row list — the caller recomputes the FULL union, the exact inputs
+        the manifest uses, at the O(ranges) cost the pre-table path paid per download. Once the
+        header is ranges-free (migrated or new meetings), ``table_ranges`` is ``None`` and
+        ``range`` — the ``(meeting_id, sequence)`` unique-index probe — IS the union's row at
+        that sequence. Header and payloads resolve in the same snapshot.
         """
         ...
 

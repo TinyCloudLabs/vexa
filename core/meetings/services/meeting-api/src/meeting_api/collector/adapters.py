@@ -1615,6 +1615,12 @@ class SqlAlchemyTranscriptStore:
             if meeting.status not in ("completed", "failed"):
                 return {"error": "conflict"}
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
+            # TC-583: range rows live in attributed_audio_ranges; the deletion plan carries the
+            # ASSEMBLED manifest (header + ranges) so storage deletion and the finalize
+            # comparison see the same attributed-audio.v1 shape the JSONB used to hold.
+            from ..recordings.ledger import assemble_attributed_manifest
+
+            manifest = await assemble_attributed_manifest(db, meeting_id, data)
             prior = data.get("artifact_deletion") or {}
             already_deleted = bool(
                 prior and prior.get("state", "completed") == "completed"
@@ -1634,7 +1640,7 @@ class SqlAlchemyTranscriptStore:
             return {
                 "meeting_id": meeting.id,
                 "recordings": deepcopy(list(data.get("recordings") or [])),
-                "attributed_audio_manifest": deepcopy(data.get("attributed_audio_manifest")),
+                "attributed_audio_manifest": manifest,
                 "cleanup_version": cleanup_version,
                 "already_deleted": already_deleted,
             }
@@ -1668,8 +1674,20 @@ class SqlAlchemyTranscriptStore:
             # mismatched value makes the next public delete discover and remove it.
             if data.get("recordings") == cleanup_plan.get("recordings"):
                 data.pop("recordings", None)
-            if data.get("attributed_audio_manifest") == cleanup_plan.get("attributed_audio_manifest"):
+            # TC-583: the stored manifest is header-only — assemble its table ranges before
+            # comparing to the (assembled) plan snapshot, and drop the table rows when the
+            # manifest key leaves meetings.data.
+            from ..recordings.ledger import assemble_attributed_manifest
+            from ..sessions.models import AttributedAudioRange
+
+            current_manifest = await assemble_attributed_manifest(db, meeting_id, data)
+            if current_manifest == cleanup_plan.get("attributed_audio_manifest"):
                 data.pop("attributed_audio_manifest", None)
+                await db.execute(
+                    delete(AttributedAudioRange).where(
+                        AttributedAudioRange.meeting_id == meeting_id
+                    )
+                )
             for key in ("processed", "notes", "share_grants", "transcript_viewers"):
                 data.pop(key, None)
             data["artifact_deletion"] = {

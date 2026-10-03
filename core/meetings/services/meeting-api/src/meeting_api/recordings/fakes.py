@@ -104,10 +104,13 @@ class InMemoryRecordingRepo:
         return result
 
     async def mutate_meeting_data(self, meeting_id: int, mutator):
+        # The fake keeps the attributed ledger inline in ``data``; the mutator still sees
+        # ``manifest["ranges"]`` as a RangeLedger (TC-583 contract) via the shared runner.
+        from .ledger import run_meeting_data_mutator
+
         self._meetings.setdefault(meeting_id, {"user_id": None, "recordings": []})
         meeting = self._meetings[meeting_id]
-        data = dict(meeting.get("data") or {})
-        next_data, result = mutator(data)
+        next_data, result = await run_meeting_data_mutator(meeting.get("data") or {}, mutator)
         meeting["data"] = dict(next_data)
         # Production stores recordings in this same JSONB document. Older focused fixtures keep a
         # convenient top-level mirror, so retain that mirror when a complete-data mutation changes
@@ -127,6 +130,18 @@ class InMemoryRecordingRepo:
             "artifact_deletion": dict(data["artifact_deletion"])
             if isinstance(data.get("artifact_deletion"), dict) else None,
         }
+
+    async def attributed_range_state_for_owner(self, user_id: int, meeting_id: int, sequence: int):
+        """The pre-table shape: no range table exists — ``table_ranges`` mirrors ``[]`` when
+        the header still carries inline ``ranges`` and ``None`` once it does not."""
+        meeting = self._meetings.get(meeting_id)
+        if not meeting or meeting.get("user_id") != user_id:
+            return None
+        data = meeting.get("data") or {}
+        manifest = data.get("attributed_audio_manifest")
+        has_inline = isinstance(manifest, dict) and isinstance(manifest.get("ranges"), list)
+        return {"data": dict(data), "range": None,
+                "table_ranges": [] if has_inline else None}
 
     async def owner_of(self, meeting_id: int) -> Optional[int]:
         return self._meetings.get(meeting_id, {}).get("user_id")

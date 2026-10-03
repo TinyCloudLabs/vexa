@@ -250,6 +250,7 @@ def build_production_app():
         system_webhook_sink=system_webhook_sink,
         session_factory=session_factory,
         storage=storage,
+        engine=engine,
     )
     return app
 
@@ -266,6 +267,7 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
+    engine=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
@@ -728,9 +730,17 @@ def _attach_background_loops(
                 "ensure_fts_index failed — transcript search falls back to a sequential scan "
                 "until the next boot retries it"
             )
-
     @asynccontextmanager
     async def lifespan(_app):
+        # TC-583: attributed ranges live in their own table; meeting-api can deploy against an
+        # admin-api whose ensure_schema predates it (fork meeting-api + upstream v012 admin-api
+        # on ptx-dev), so converge just this one table before the app serves traffic. A failed
+        # DDL propagates out of the lifespan and fails startup loudly — serving would 500 every
+        # attributed reserve/upload on a missing table. ``engine=None`` is the Lite/fake path.
+        if engine is not None:
+            from .recordings.adapters import ensure_attributed_audio_schema
+
+            await ensure_attributed_audio_schema(engine)
         tasks = [
             asyncio.create_task(_segment_consumer_loop(), name="segment-consumer"),
             asyncio.create_task(_db_writer_loop(), name="db-writer"),

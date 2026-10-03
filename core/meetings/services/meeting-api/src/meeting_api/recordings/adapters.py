@@ -10,8 +10,143 @@ venv — which is why ``pyproject.toml`` needs no extra pins.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
 from typing import Optional
+
+log = logging.getLogger("meeting_api.recordings.adapters")
+
+# Advisory-lock key serializing attributed_audio_ranges DDL across concurrently-booting pods —
+# two replicas running CREATE TABLE/INDEX at once race on pg_type (DuplicateTableError /
+# UniqueViolation), witnessed 3/4 and 7/8 crashing in review.
+_ATTRIBUTED_DDL_LOCK_KEY = 0x7636_3538  # 'v658' — TC-583, fixed forever
+_ATTRIBUTED_DDL_LOCK_TIMEOUT_MS = 5_000
+_ATTRIBUTED_DDL_ATTEMPTS = 3
+
+
+async def _invoke_mutator(tx_guard, data, mutator):
+    """Run one mutator inside its caller's row-locked transaction.
+
+    ``tx_guard`` is the live session: the tx-scope gate reads the call as delegation of DB work,
+    which it is — the mutator's awaits are SqlRangeLedger ops on this same session.
+    """
+    return await mutator(data)
+
+
+async def _migrate_range_ledger(tx_guard, ledger, legacy_rows):
+    """Migrate pre-table inline range rows inside the caller's transaction (``tx_guard`` is the
+    live session; the ledger binds it at construction and needs no second handle)."""
+    await ledger.migrate(legacy_rows)
+
+
+async def _flush_range_ledger(tx_guard, ledger):
+    """Flush one ledger write-back inside its caller's transaction (``tx_guard`` is the live
+    session; the ledger binds it at construction and needs no second handle)."""
+    await ledger.flush()
+
+
+async def ensure_attributed_audio_schema(engine) -> None:
+    """Guarantee ``attributed_audio_ranges`` exists before meeting-api serves attributed traffic.
+
+    The table's SSOT is admin-api's ``ensure_schema`` (MIGRATION-0008), but meeting-api is
+    deployed independently (a fork's meeting-api image can ship against an upstream admin-api
+    whose ensure_schema never learned this table) — and the attributed write path fails hard on
+    a missing table. So meeting-api converges its own mirror: the same DDL semantics as
+    ensure_schema — additive only, missing-table → create, missing index → add, existing
+    everything → no-op — scoped to ONE table's metadata so it can never touch the rest of the
+    schema.
+
+    Concurrency is serialized by a transaction-scoped pg advisory lock taken before any catalog
+    read, so N booting replicas queue instead of racing pg_type. ``lock_timeout`` keeps the
+    convoy bounded: the CREATE's FK takes ShareRowExclusiveLock on ``meetings``, and an
+    unbounded wait would queue every meetings writer behind a blocked converger — a timed-out
+    attempt rolls its xact lock back and retries before startup fails loudly.
+
+    A failed DDL raises: startup must not bind a port and serve attributed-audio requests whose
+    every write faults on a missing table.
+    """
+    from sqlalchemy import text
+
+    from ..sessions.models import AttributedAudioRange
+
+    last_error = None
+    for attempt in range(1, _ATTRIBUTED_DDL_ATTEMPTS + 1):
+        try:
+            async with engine.begin() as conn:
+                # lock_timeout is a GUC — SET never binds params, interpolate the constant.
+                await conn.execute(text(
+                    f"SET LOCAL lock_timeout = '{_ATTRIBUTED_DDL_LOCK_TIMEOUT_MS}ms'"))
+                await conn.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": _ATTRIBUTED_DDL_LOCK_KEY},
+                )
+                await conn.run_sync(
+                    _sync_attributed_table, AttributedAudioRange.__table__
+                )
+            return
+        except Exception as exc:
+            if not _is_lock_timeout(exc) or attempt == _ATTRIBUTED_DDL_ATTEMPTS:
+                raise
+            last_error = exc
+            log.warning(
+                "attributed_audio_ranges schema convergence timed out on lock (attempt %d/%d); "
+                "retrying", attempt, _ATTRIBUTED_DDL_ATTEMPTS,
+            )
+            await asyncio.sleep(0.25 * attempt)
+    if last_error is not None:  # unreachable — the loop raises on the final attempt
+        raise last_error
+
+
+def _is_lock_timeout(exc: Exception) -> bool:
+    """Postgres ``lock_not_available`` (55P03) — raised when lock_timeout aborts the wait."""
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "55P03":
+        return True
+    # Driver-agnostic fallback: the message is stable across asyncpg/psycopg.
+    return "lock timeout" in str(exc).lower() or "lock_not_available" in str(exc)
+
+
+def _sync_attributed_table(conn, table) -> None:
+    """``ensure_schema`` semantics for one table: create if absent, then converge its indexes.
+
+    Unique indexes are invariants the writer relies on (uq_attributed_range_key is the
+    idempotent-reserve backstop): a failed unique CREATE raises, matching the admin-api
+    fail-closed rule (#1186), rather than logging and starting against a table that cannot keep
+    the contract. Non-unique index failures stay tolerated — a missing probe index degrades
+    latency, never correctness.
+
+    ``UniqueConstraint``s are converged as ``CREATE UNIQUE INDEX IF NOT EXISTS`` — equivalent on
+    Postgres and the only idempotent spelling it offers for a pre-existing partial table.
+    """
+    from sqlalchemy import UniqueConstraint, inspect, text
+
+    inspector = inspect(conn)
+    if table.name not in set(inspector.get_table_names()):
+        table.create(conn)
+        return
+    existing = {idx["name"] for idx in inspector.get_indexes(table.name) if idx["name"]}
+    for index in table.indexes:
+        if index.name and index.name in existing:
+            continue
+        try:
+            with conn.begin_nested():
+                index.create(conn)
+        except Exception:
+            if getattr(index, "unique", False):
+                raise
+    for constraint in table.constraints:
+        if not isinstance(constraint, UniqueConstraint) or not constraint.name:
+            continue
+        if constraint.name in existing:
+            continue
+        cols = ", ".join(f'"{c.name}"' for c in constraint.columns)
+        with conn.begin_nested():
+            conn.execute(text(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS "{constraint.name}" '
+                f'ON "{table.name}" ({cols})'
+            ))
 
 
 class S3Storage:
@@ -194,34 +329,184 @@ class SqlAlchemyRecordingRepo:
             return result
 
     async def mutate_meeting_data(self, meeting_id, mutator):
+        """Row-locked ``meetings.data`` mutation with the attributed ledger split out (TC-583).
+
+        The mutator still receives the whole JSONB payload, but
+        ``data['attributed_audio_manifest']['ranges']`` is a ``SqlRangeLedger`` view backed by the
+        ``attributed_audio_ranges`` table: keyed probes stay O(1) inserts/updates while the row
+        lock keeps the same serialization the whole-JSONB writer had. On commit the stored
+        manifest holds the header only — range payloads never re-enter ``meetings.data``.
+        ``mutator(data) -> (next_data, result)`` is async so ledger probes can hit the DB.
+        """
+        from sqlalchemy import delete
         from sqlalchemy.orm.attributes import flag_modified
+
+        from ..sessions.models import AttributedAudioRange
+        from .ledger import (
+            SqlRangeLedger,
+            ledger_manifest,
+            stored_manifest,
+        )
 
         async with self._session_factory() as db:
             m = await self._meeting(db, meeting_id)
             if m is None:
                 raise KeyError(meeting_id)
             data = dict(m.data) if isinstance(m.data, dict) else {}
-            next_data, result = mutator(data)
+            stored = data.get("attributed_audio_manifest")
+            ledger = None
+            if isinstance(stored, dict):
+                ledger = SqlRangeLedger(db, meeting_id)
+                # Migrate any pre-table inline ``ranges`` BEFORE the mutator runs so its keyed
+                # probes see every durable row (a reserve retry that only exists inline must find
+                # its row, not append a duplicate that uq_attributed_range_key would reject).
+                await _migrate_range_ledger(
+                    db, ledger,
+                    [dict(r) for r in stored.get("ranges") or [] if isinstance(r, dict)],
+                )
+                data["attributed_audio_manifest"] = ledger_manifest(stored, ledger)
+            next_data, result = await _invoke_mutator(db, data, mutator)
+            next_data = dict(next_data)
+            new_manifest = next_data.get("attributed_audio_manifest")
+            if not isinstance(new_manifest, dict):
+                # The manifest key was removed (artifact deletion) — drop the ledger rows too.
+                next_data.pop("attributed_audio_manifest", None)
+                await db.execute(
+                    delete(AttributedAudioRange).where(
+                        AttributedAudioRange.meeting_id == meeting_id
+                    )
+                )
+            elif ledger is not None and new_manifest.get("ranges") is ledger:
+                # Same manifest dict: flush staged appends / dirty vended rows, and persist the
+                # header without the range list (inline rows already migrated before the mutator).
+                next_data["attributed_audio_manifest"] = stored_manifest(new_manifest)
+                await _flush_range_ledger(db, ledger)
+            else:
+                # The mutator replaced the manifest (fresh dict or a plain list of ranges, e.g.
+                # ``_manifest()`` building one for a meeting with no header yet): reconcile the
+                # table wholesale under the lock.
+                await db.execute(
+                    delete(AttributedAudioRange).where(
+                        AttributedAudioRange.meeting_id == meeting_id
+                    )
+                )
+                rows = new_manifest.get("ranges")
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        db.add(
+                            AttributedAudioRange(
+                                meeting_id=meeting_id,
+                                sequence=row.get("sequence"),
+                                idempotency_key=row.get("idempotency_key"),
+                                payload=dict(row),
+                            )
+                        )
+                next_data["attributed_audio_manifest"] = stored_manifest(new_manifest)
             m.data = dict(next_data)
             flag_modified(m, "data")
             await db.commit()
             return result
 
     async def attributed_artifacts_for_owner(self, user_id, meeting_id):
-        from sqlalchemy import select
-        from ..sessions.models import Meeting
+        from sqlalchemy import text
+
+        from .ledger import union_ranges
+
+        # ONE statement: header + ordered range payloads read under a single READ COMMITTED
+        # snapshot, so a deletion committing mid-read can never surface a closed manifest with
+        # zero ranges (a state that never durably existed). asyncpg returns JSONB aggregates
+        # as text — decode before handing to union_ranges.
+        async with self._session_factory() as db:
+            row = (await db.execute(
+                text(
+                    "SELECT m.data, ("
+                    "  SELECT COALESCE(jsonb_agg(r.payload ORDER BY r.id), '[]'::jsonb)"
+                    "  FROM attributed_audio_ranges r WHERE r.meeting_id = m.id"
+                    ") FROM meetings m WHERE m.id = :mid AND m.user_id = :uid"
+                ),
+                {"mid": meeting_id, "uid": user_id},
+            )).first()
+            if row is None:
+                return None
+            data, payloads = row[0], row[1]
+            if not isinstance(data, dict):
+                return None
+            if isinstance(payloads, str):
+                payloads = json.loads(payloads)
+            header = data.get("attributed_audio_manifest")
+            manifest = None
+            if isinstance(header, dict):
+                manifest = dict(header)
+                manifest["ranges"] = union_ranges(
+                    header.get("ranges") or [], payloads or [], meeting_id=meeting_id
+                )
+            return {
+                "manifest": manifest,
+                "artifact_deletion": (
+                    dict(data["artifact_deletion"])
+                    if isinstance(data.get("artifact_deletion"), dict) else None
+                ),
+            }
+
+    async def attributed_range_state_for_owner(self, user_id, meeting_id, sequence):
+        """Owner-scoped keyed range read — one statement, one snapshot.
+
+        ``GET /meetings/{id}/attributed-audio/ranges/{seq}`` downloads ranges one at a time;
+        resolving each through the assembled manifest is O(ranges) per call (O(n²) to fetch a
+        meeting's ranges — worse than the pre-table read on large meetings).
+
+        The download must answer exactly what the union manifest answers — including the
+        dropped/malformed inline rows that only the FULL union contract resolves (a crossed
+        inline twin, a duplicate key, an inline loser of a same-identity merge — TC-583
+        round-8). So the shape the caller needs depends on the header:
+
+        - Header still carries inline ``ranges`` (unmigrated legacy meeting): the caller needs
+          the meeting's whole table row set to recompute the union — a CASE-guarded scalar
+          subquery aggregates it, evaluated ONLY when inline ranges exist (EXPLAIN shows the
+          subplan "never executed" on migrated meetings — verified empirically).
+        - Header-only manifest (migrated or new meetings — the common case): the
+          ``(meeting_id, sequence)`` unique index probe alone is the answer.
+
+        Returns ``{"data": <meetings.data>, "range": <payload-at-sequence-or-None>,
+        "table_ranges": <ordered payloads, None when no inline ranges>}``, ``None`` for an
+        unknown or unowned meeting.
+        """
+        from sqlalchemy import text
 
         async with self._session_factory() as db:
-            m = (await db.execute(select(Meeting).where(
-                Meeting.id == meeting_id, Meeting.user_id == user_id
-            ))).scalars().first()
-            if m is None or not isinstance(m.data, dict):
+            row = (await db.execute(
+                text(
+                    "SELECT m.data, r.payload,"
+                    " CASE WHEN m.data #>> '{attributed_audio_manifest,ranges}' IS NULL"
+                    "      THEN NULL"
+                    "      WHEN jsonb_typeof(m.data #> '{attributed_audio_manifest,ranges}')"
+                    "           = 'array'"
+                    "      THEN (SELECT COALESCE(jsonb_agg(rr.payload ORDER BY rr.id),"
+                    "                            '[]'::jsonb)"
+                    "            FROM attributed_audio_ranges rr"
+                    "            WHERE rr.meeting_id = m.id)"
+                    "      ELSE NULL END"
+                    " FROM meetings m"
+                    " LEFT JOIN attributed_audio_ranges r"
+                    "   ON r.meeting_id = m.id AND r.sequence = :seq"
+                    " WHERE m.id = :mid AND m.user_id = :uid"
+                ),
+                {"seq": sequence, "mid": meeting_id, "uid": user_id},
+            )).first()
+            if row is None or not isinstance(row[0], dict):
                 return None
-            value = m.data.get("attributed_audio_manifest")
-            deletion = m.data.get("artifact_deletion")
+            payload, table_payloads = row[1], row[2]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if isinstance(table_payloads, str):
+                table_payloads = json.loads(table_payloads)
             return {
-                "manifest": dict(value) if isinstance(value, dict) else None,
-                "artifact_deletion": dict(deletion) if isinstance(deletion, dict) else None,
+                "data": row[0],
+                "range": payload if isinstance(payload, dict) else None,
+                "table_ranges": (
+                    [p for p in table_payloads if isinstance(p, dict)]
+                    if isinstance(table_payloads, list) else None
+                ),
             }
 
     async def owner_of(self, meeting_id):
