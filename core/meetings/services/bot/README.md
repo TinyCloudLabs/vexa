@@ -55,9 +55,19 @@ while participants remain, the bot is cut off from a live call. It does not wait
 window. It leaves, rejoins the same meeting in-process through the normal join flow, and resumes
 page-side capture on the new document. Channel ids continue above the pre-rejoin ones. The
 lifecycle stays `active`, and removal and aloneness are paused only while the bot is out of the
-call. A rejoin that is not admitted ends the run `failed` (stage `active`, `join_failure`, reason
-code `rejoin_<outcome>`). Each run may rejoin at most twice (`MAX_MEDIA_REJOINS`); after that the
-silence rules decide. The MediaRecorder is not restarted after a rejoin, because the master is one
+call. A rejoin that is not admitted ends the run `failed` at stage `active`, with the completion
+reason a first join would get (`awaiting_admission_rejected`, `awaiting_admission_timeout` or
+`join_failure`) and reason code `rejoin_<outcome>`. Each run may rejoin at most twice
+(`MAX_MEDIA_REJOINS`); after that the silence rules decide. No rejoin is attempted when capture
+cannot be resumed (`canResumeAfterRejoin`), because it would bring back neither transcript nor
+recording. A stop, SIGTERM or the time cap during a rejoin cancels the join at its next checkpoint
+(an `AbortSignal` through `@vexa/join`). Teardown waits up to 3 seconds for the join to stop, then
+withdraws any pending ask-to-join and closes the page instead of leaving. A `page.goto` still in
+flight after those 3 seconds can still race the pipeline stop. That case is bounded and rare. If
+Meet keeps showing participant tiles after the room has really emptied, while the media is dead,
+the bot cannot tell that from a live room. It rejoins, is not admitted, and reports
+`failed(active, awaiting_admission_timeout, rejoin_timeout)` instead of `left_alone`. A real
+"everyone left", where the tiles disappear, never triggers a rejoin. The MediaRecorder is not restarted after a rejoin, because the master is one
 byte-concatenated webm stream. The recording therefore ends at the media loss and completes through
 the sink's final marker. Silence on a live track is not a loss: an idle Meet audio slot delivers the
 same zeros. Run `npx tsx src/media-recovery.test.ts` for the offline proof.

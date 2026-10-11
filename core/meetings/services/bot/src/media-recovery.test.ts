@@ -214,22 +214,22 @@ const lifecycle = (): LifecycleSink & { events: LifecycleEvent[] } => {
 };
 const legal = (events: LifecycleEvent[]): boolean =>
   events.every((e, i) => i === 0 || e.status === events[i - 1].status || canTransition(events[i - 1].status, e.status));
-const RUN = { pipelineStopMs: 50, recordingDrainMs: 50, platformLeaveMs: 50 };
+const RUN = { pipelineStopMs: 50, recordingDrainMs: 50, platformLeaveMs: 50, rejoinCancelMs: 50 };
 
-interface DriverLog { joins: number; leaves: string[]; removalSubs: number; removalStops: number }
+interface DriverLog { joins: number; leaves: string[]; withdraws: string[]; removalSubs: number; removalStops: number }
 /** A join driver whose FIRST join admits (with lobby reports) and whose later joins (rejoins)
- *  resolve to `rejoin(n)` — a verdict, or a promise the test controls. */
-function driver(rejoin: (n: number) => JoinOutcome | Promise<JoinOutcome> = () => 'admitted') {
-  const log: DriverLog = { joins: 0, leaves: [], removalSubs: 0, removalStops: 0 };
+ *  resolve to `rejoin(n, signal)` — a verdict, or a promise the test controls. */
+function driver(rejoin: (n: number, signal?: AbortSignal) => JoinOutcome | Promise<JoinOutcome> = () => 'admitted') {
+  const log: DriverLog = { joins: 0, leaves: [], withdraws: [], removalSubs: 0, removalStops: 0 };
   const join: JoinDriver = {
-    async join(report) {
+    async join(report, options) {
       log.joins++;
       if (log.joins === 1) { await report('awaiting_admission'); await report('active'); return 'admitted'; }
-      return rejoin(log.joins - 1);
+      return rejoin(log.joins - 1, options?.signal);
     },
     onRemoval() { log.removalSubs++; return () => { log.removalStops++; }; },
     async leave(reason) { log.leaves.push(reason); },
-    async withdraw() { /* */ },
+    async withdraw(reason) { log.withdraws.push(reason); },
   };
   return { join, log };
 }
@@ -367,8 +367,10 @@ async function orchestratorTests(): Promise<void> {
   }
 
   console.log('orchestrator: rejoin outcomes');
-  // Rejoin not admitted (lobby timeout / denial) → failed at active, attributed to the rejoin.
-  for (const outcome of ['timeout', 'rejected'] as const) {
+  // Rejoin not admitted (lobby timeout / denial / error) → failed at active, labelled like a first
+  // join's verdict and attributed to the rejoin by its reason code.
+  const REJOIN_COMPLETION = { timeout: 'awaiting_admission_timeout', rejected: 'awaiting_admission_rejected', error: 'join_failure' } as const;
+  for (const outcome of ['timeout', 'rejected', 'error'] as const) {
     const lc = lifecycle();
     const { join, log } = driver(() => outcome);
     const media = controlledMedia();
@@ -378,20 +380,35 @@ async function orchestratorTests(): Promise<void> {
     media.fire();
     const res = await running;
     const terminal = lc.events.at(-1)!;
-    check(`rejoin ${outcome}: failed(join_failure) at stage active, exit 1`,
-      res.status === 'failed' && res.exitCode === 1 && terminal.failure_stage === 'active' && terminal.completion_reason === 'join_failure');
+    check(`rejoin ${outcome}: failed(${REJOIN_COMPLETION[outcome]}) at stage active, exit 1`,
+      res.status === 'failed' && res.exitCode === 1 && terminal.failure_stage === 'active'
+        && terminal.completion_reason === REJOIN_COMPLETION[outcome] && res.completionReason === REJOIN_COMPLETION[outcome],
+      String(terminal.completion_reason));
     check(`rejoin ${outcome}: reason names the rejoin`, terminal.reason === `capture failed (stage=active code=rejoin_${outcome})`, String(terminal.reason));
     check(`rejoin ${outcome}: exactly one terminal, legal sequence`,
       lc.events.filter((e) => e.status === 'failed' || e.status === 'completed').length === 1 && legal(lc.events));
-    check(`rejoin ${outcome}: left the call before and after`, log.leaves[0] === 'media_lost' && log.leaves.length === 2);
+    check(`rejoin ${outcome}: left the call, then withdrew (off the call at teardown)`,
+      log.leaves.join(',') === 'media_lost' && log.withdraws.length === 1, JSON.stringify(log));
   }
-  // A stop while the rejoin waits in the lobby ends the run as the user's stop, not a failure.
+  console.log('orchestrator: end signals during a rejoin');
+  /** A rejoin parked in the lobby until its signal aborts; records when it settled. */
+  const lobbyRejoin = (order: string[], seen: { signal?: AbortSignal }) => (_n: number, signal?: AbortSignal) =>
+    new Promise<JoinOutcome>((_resolve, reject) => {
+      seen.signal = signal;
+      signal?.addEventListener('abort', () => { order.push('join-settled'); reject(signal.reason); });
+    });
+  // 1. A user stop cancels the rejoin, waits for it to stop, then stops the pipeline and withdraws.
   {
     const lc = lifecycle();
-    const { join, log } = driver(() => new Promise<JoinOutcome>(() => { /* lobby */ }));
+    const order: string[] = [];
+    const seen: { signal?: AbortSignal } = {};
+    const { join, log } = driver(lobbyRejoin(order, seen));
     const media = controlledMedia();
     let fire: (a: Act) => void = () => {};
-    const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: { async start() {}, async stop() {} }, acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source });
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join, pipeline: { async start() {}, async stop() { order.push('pipeline-stop'); } },
+      acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source,
+    });
     const running = o.run(RUN);
     await settle();
     media.fire();
@@ -399,6 +416,121 @@ async function orchestratorTests(): Promise<void> {
     fire({ action: 'leave' });
     const res = await running;
     check('stop during a pending rejoin: completed(stopped)', res.status === 'completed' && res.completionReason === 'stopped' && log.joins === 2);
+    check('…the rejoin was cancelled', seen.signal?.aborted === true);
+    check('…and settled before the pipeline stopped', order.join(',') === 'join-settled,pipeline-stop', order.join(','));
+    check('…the bot withdrew instead of leaving again', log.leaves.join(',') === 'media_lost' && log.withdraws.join(',') === 'stopped', JSON.stringify(log));
+  }
+  // 2. The pipeline stop must not run against a page the rejoin is still navigating.
+  {
+    const lc = lifecycle();
+    let navigating = false;
+    const { join } = driver((_n, signal) => new Promise<JoinOutcome>((_resolve, reject) => {
+      navigating = true;
+      signal?.addEventListener('abort', () => setImmediate(() => { navigating = false; reject(signal.reason); }));
+    }));
+    const media = controlledMedia();
+    let fire: (a: Act) => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join,
+      pipeline: { async start() {}, async stop() { if (navigating) throw new Error('Execution context was destroyed'); } },
+      acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source,
+    });
+    const running = o.run(RUN);
+    await settle();
+    media.fire();
+    await settle();
+    fire({ action: 'leave' });
+    const res = await running;
+    check('stop mid-navigation: the pipeline stops on a settled page (completed, not a teardown failure)',
+      res.status === 'completed' && res.completionReason === 'stopped', JSON.stringify(res));
+  }
+  // 3. SIGTERM during a rejoin.
+  {
+    const lc = lifecycle();
+    const seen: { signal?: AbortSignal } = {};
+    const { join, log } = driver(lobbyRejoin([], seen));
+    const media = controlledMedia();
+    const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: { async start() {}, async stop() {} }, acts: noopActs(), aloneness: noopAloneness(), mediaHealth: media.source });
+    const running = o.run(RUN);
+    await settle();
+    media.fire();
+    await settle();
+    o.stop('stopped', true);
+    const res = await running;
+    check('SIGTERM during a rejoin: completed(stopped), one withdraw', res.completionReason === 'stopped' && seen.signal?.aborted === true && log.withdraws.length === 1, JSON.stringify(log));
+  }
+  // 4. The max-active cap during a rejoin.
+  {
+    const lc = lifecycle();
+    const seen: { signal?: AbortSignal } = {};
+    const { join, log } = driver(lobbyRejoin([], seen));
+    const media = controlledMedia();
+    const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: { async start() {}, async stop() {} }, acts: noopActs(), aloneness: noopAloneness(), mediaHealth: media.source });
+    const running = o.run({ ...RUN, maxActiveMs: 30 });
+    await settle();
+    media.fire();
+    const res = await running;
+    check('time cap during a rejoin: max_bot_time_exceeded, rejoin cancelled, one withdraw',
+      res.completionReason === 'max_bot_time_exceeded' && seen.signal?.aborted === true && log.withdraws.length === 1, JSON.stringify({ res, log }));
+  }
+  // 5. A join that ignores the signal cannot hold teardown hostage.
+  {
+    const lc = lifecycle();
+    const { join, log } = driver(() => new Promise<JoinOutcome>(() => { /* ignores the abort */ }));
+    const media = controlledMedia();
+    let fire: (a: Act) => void = () => {};
+    const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: { async start() {}, async stop() {} }, acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source });
+    const running = o.run(RUN);
+    await settle();
+    media.fire();
+    await settle();
+    const started = Date.now();
+    fire({ action: 'leave' });
+    const res = await Promise.race([running, new Promise<null>((r) => setTimeout(() => r(null), 1_000))]);
+    check('a rejoin that ignores the abort: teardown is bounded, completed(stopped), one withdraw',
+      res?.completionReason === 'stopped' && Date.now() - started < 1_000 && log.withdraws.length === 1, JSON.stringify({ res, log }));
+  }
+
+  console.log('orchestrator: no rejoin that cannot pay off');
+  // L5: capture cannot resume after a rejoin → no rejoin; the bot stays seated, monitors untouched.
+  {
+    const lc = lifecycle();
+    const { join, log } = driver();
+    const media = controlledMedia();
+    let fire: (a: Act) => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc, join, pipeline: { async start() {}, async stop() {}, canResumeAfterRejoin: () => false },
+      acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source,
+    });
+    const running = o.run(RUN);
+    await settle();
+    media.fire();
+    await settle();
+    check('capture cannot resume: no leave, no rejoin, removal untouched',
+      log.joins === 1 && log.leaves.length === 0 && log.removalStops === 0 && lc.events.at(-1)?.status === 'active', JSON.stringify(log));
+    fire({ action: 'leave' });
+    const res = await running;
+    check('…and the run still ends on its real end signal', res.completionReason === 'stopped');
+  }
+  // L6: a browser crash that surfaces as a rejected rejoin ends the run as the browser failure.
+  {
+    const lc = lifecycle();
+    let crash: (f: 'browser_crashed' | 'browser_closed') => void = () => {};
+    const base = driver(() => {
+      setTimeout(() => crash('browser_crashed'), 0);
+      return Promise.reject(new Error('Target crashed'));
+    });
+    const join: JoinDriver = { ...base.join, onFailure(cb) { crash = cb; return () => {}; } };
+    const media = controlledMedia();
+    const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: { async start() {}, async stop() {} }, acts: noopActs(), aloneness: noopAloneness(), mediaHealth: media.source });
+    const running = o.run(RUN);
+    await settle();
+    media.fire();
+    const res = await running;
+    const terminal = lc.events.at(-1)!;
+    check('browser crash during a rejoin: failed as browser_crashed, no completion reason',
+      res.status === 'failed' && String(terminal.reason).startsWith('browser_crashed:') && terminal.completion_reason === undefined,
+      JSON.stringify(terminal));
   }
   // Bounded: after MAX_MEDIA_REJOINS the bot stays seated and stops rejoining.
   {

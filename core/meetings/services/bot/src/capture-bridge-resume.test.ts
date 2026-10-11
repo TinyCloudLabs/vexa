@@ -148,6 +148,40 @@ try {
     check('a capture without a page resume is a quiet no-op', !threw && faults.length === 0);
     await live.stop();
   }
+  {
+    // L4: a stop that arrives while a resume is still attaching waits for it, so capture teardown
+    // never races the page-side start.
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const handle = Object.assign(async () => { order.push('capture-stop'); },
+      { async resumeAfterRejoin() { await gate; order.push('resume-done'); } });
+    const live = createLivePipeline({ startCapture: async () => handle, engine: { async start() {}, async stop() {} }, onFault: () => {} });
+    await live.start();
+    const resuming = live.resumeAfterRejoin!();
+    const stopping = live.stop();
+    await settle();
+    check('stop during an in-flight resume does not tear capture down yet', order.length === 0, order.join(','));
+    release();
+    await Promise.all([resuming, stopping]);
+    check('…it tears down after the resume settles', order.join(',') === 'resume-done,capture-stop', order.join(','));
+  }
+  {
+    // L5: whether a rejoin could resume capture at all.
+    const failing = createLivePipeline({
+      startCapture: async () => { throw new Error('page-side start failed'); },
+      engine: { async start() {}, async stop() {} }, onFault: () => {},
+    });
+    await failing.start();
+    check('capture that never started cannot resume after a rejoin', failing.canResumeAfterRejoin!() === false);
+    await failing.stop();
+    const handle = Object.assign(async () => {}, { async resumeAfterRejoin() {} });
+    const resumable = createLivePipeline({ startCapture: async () => handle, engine: { async start() {}, async stop() {} }, onFault: () => {} });
+    await resumable.start();
+    check('a capture with a page resume can resume', resumable.canResumeAfterRejoin!() === true);
+    await resumable.stop();
+    check('…and cannot after stop', resumable.canResumeAfterRejoin!() === false);
+  }
 } finally {
   for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete g[k]; else g[k] = v; }
 }

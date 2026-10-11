@@ -75,5 +75,16 @@ for (const event of ['crash', 'close'] as const) {
   check(`${event}: browser listeners removed on teardown`, page.listenerCount('crash') === 0 && page.listenerCount('close') === 0);
 }
 
+// TC-903: the orchestrator cancels an unwanted rejoin through this signal. It must reach the brick
+// — an already-aborted join rejects without ever navigating.
+{
+  let gotos = 0;
+  const page = Object.assign(new EventEmitter(), { isClosed: () => false, goto: async () => { gotos++; } });
+  const driver = createBrowserJoinDriver(page as unknown as Page, { platform: 'google_meet', meetingUrl: 'https://meet.google.com/abc-defg-hij', botName: 'B' } as Invocation);
+  const err = await driver.join(() => {}, { signal: AbortSignal.abort() }).then(() => null, (e: unknown) => e);
+  check('an aborted join signal reaches the brick: rejects', (err as Error | null)?.name === 'AbortError');
+  check('…without navigating', gotos === 0);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

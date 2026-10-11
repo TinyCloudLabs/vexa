@@ -69,7 +69,7 @@ export interface JoinDriver {
   /** Join + await admission. `report` fires on each intermediate lifecycle state
    *  (awaiting_admission / needs_help / active). Resolves with the verdict — a bare `JoinOutcome`
    *  or a `JoinResult` that also carries the failure's human reason text (#926). */
-  join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome | JoinResult>;
+  join(report: (s: BotStatus) => void | Promise<void>, options?: { signal?: AbortSignal }): Promise<JoinOutcome | JoinResult>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
   /** Unexpected loss of the meeting page; detach before deliberately closing it. */
@@ -98,6 +98,10 @@ export interface Pipeline {
    *  engine, transcript sink and durable producers keep running across it. OPTIONAL: a pipeline
    *  without it simply does not resume capture. MUST NOT throw. */
   resumeAfterRejoin?(): Promise<void>;
+  /** Whether a rejoin could resume capture right now (TC-903). A rejoin that cannot resume capture
+   *  brings back neither transcript nor recording, so the orchestrator does not attempt one.
+   *  OPTIONAL: absent means "assume yes". */
+  canResumeAfterRejoin?(): boolean;
 }
 
 /** transcript.v1 egress — the engine pushes speaker-attributed segments here; the real

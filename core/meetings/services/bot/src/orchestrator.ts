@@ -162,6 +162,8 @@ export interface RunOptions {
   signalPipelineStopMs?: number;
   /** Maximum time to wait for the platform leave operation. Tests may shorten it. */
   platformLeaveMs?: number;
+  /** Maximum time teardown waits for a cancelled media rejoin to settle. Tests may shorten it. */
+  rejoinCancelMs?: number;
 }
 
 /** The live HTTP lifecycle adapter has an 8s terminal-callback horizon. These teardown caps reserve
@@ -177,6 +179,10 @@ export const DEFAULT_PLATFORM_LEAVE_MS = 4_000;
  *  seated and the existing aloneness/silence rules decide, so a platform that keeps dropping media
  *  cannot turn the bot into a join loop. */
 export const MAX_MEDIA_REJOINS = 2;
+/** How long teardown waits for a cancelled rejoin to stop at its next checkpoint before it stops the
+ *  pipeline on the page (TC-903). Under SIGTERM: 3s + 2s pipeline + 4s recording + 4s withdraw = 13s,
+ *  inside the 20s watchdog. */
+export const DEFAULT_REJOIN_CANCEL_MS = 3_000;
 
 export function pipelineStopBudgetMs(fromSignal: boolean, override?: number): number {
   return override ?? (fromSignal ? DEFAULT_PIPELINE_STOP_MS : DEFAULT_TRANSCRIPT_DRAIN_MS);
@@ -588,14 +594,23 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     const isActiveOver = (): boolean => endReason !== undefined || browserFault !== undefined;
     let mediaRejoins = 0;
     let rejoinFailure: Exclude<JoinOutcome, 'admitted'> | undefined;
+    let recovery: Promise<void> | null = null;
+    // From the media_lost leave until capture is resumed and the monitors are re-armed: the bot is
+    // not in the call, so teardown withdraws (cancel any knock, close the page) instead of leaving.
+    let offCall = false;
+    let rejoinAbort: AbortController | null = null;
     let stopMediaWatch: () => void = () => {};
     const watchMedia = (armed: boolean): void => {
-      stopMediaWatch = deps.mediaHealth?.onMediaLost(() => { void recoverMedia(); }, { armed }) ?? (() => {});
+      stopMediaWatch = deps.mediaHealth?.onMediaLost(() => { recovery = recoverMedia().catch(() => {}); }, { armed }) ?? (() => {});
     };
     const recoverMedia = async (): Promise<void> => {
       if (isActiveOver()) return;
       if (mediaRejoins >= MAX_MEDIA_REJOINS) {
         console.error(`[bot] media-recovery: remote audio lost again after ${mediaRejoins} rejoin(s); staying seated, aloneness decides`);
+        return;
+      }
+      if (deps.pipeline.canResumeAfterRejoin?.() === false) {
+        console.error('[bot] media-recovery: remote audio lost but capture cannot resume after a rejoin; staying seated, aloneness decides');
         return;
       }
       mediaRejoins++;
@@ -604,20 +619,26 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       stopRemoval();
       stopAloneness();
       console.error(`[bot] media-recovery: remote audio lost with participants present; rejoining (attempt ${mediaRejoins}/${MAX_MEDIA_REJOINS})`);
+      offCall = true;
       await leavePlatform('media_lost');
       if (isActiveOver()) return;
       let outcome: JoinOutcome;
       try {
-        const rejoined = await Promise.race([
-          // The join's intermediate states (lobby, admitted) are not lifecycle transitions here.
-          Promise.resolve().then(() => deps.join.join(() => {})).then(normalizeJoin),
-          activeOver,
-        ]);
-        if (rejoined === null) return;
+        // The join's intermediate states (lobby, admitted) are not lifecycle transitions here. An
+        // end signal cancels it at the brick's next checkpoint, and teardown waits (bounded) for it
+        // to stop before touching the page.
+        const abort = new AbortController();
+        rejoinAbort = abort;
+        const joining = Promise.resolve().then(() => deps.join.join(() => {}, { signal: abort.signal })).then(normalizeJoin);
+        const rejoined = await Promise.race([joining, activeOver]);
+        if (rejoined === null) { abort.abort(); await joining.catch(() => undefined); return; }
         outcome = rejoined.outcome;
       } catch {
         outcome = 'error';
       }
+      // A browser crash/close that lost the race to the join's rejection gets one turn to land, so
+      // the run ends as the browser failure it is rather than a rejoin error.
+      if (outcome === 'error') await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (isActiveOver()) return;
       if (outcome !== 'admitted') {
         rejoinFailure = outcome;
@@ -632,6 +653,8 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       stopRemoval = deps.join.onRemoval(() => signalEnd?.('evicted'));
       stopAloneness = deps.aloneness.onAlone(() => signalEnd?.('left_alone'));
       watchMedia(true);
+      offCall = false;
+      rejoinAbort = null;
       console.error(`[bot] media-recovery: rejoined and resumed capture (attempt ${mediaRejoins}/${MAX_MEDIA_REJOINS})`);
     };
     watchMedia(false);
@@ -647,22 +670,40 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // Deliberate pipeline/browser teardown can close the page. Detach first so teardown noise
     // cannot rewrite the successful end already selected above.
     stopFailure();
+    // A rejoin still in flight is cancelled and given a bounded moment to stop at a checkpoint, so
+    // the pipeline stop below does not run against a page that is still navigating.
+    // (Reassigned inside recoverMedia; TypeScript's narrowing cannot see that.)
+    (rejoinAbort as AbortController | null)?.abort();
+    if (recovery) {
+      await settleWithin(recovery, opts.rejoinCancelMs ?? DEFAULT_REJOIN_CANCEL_MS,
+        '[bot] media-recovery: cancelled rejoin did not settle in time; continuing teardown');
+    }
     await stopPipeline();
     await closeRecording();
     if (browserFault) return browserFailureResult();
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
     // assembly + the `completed` callback flush. Best-effort and capped to preserve watchdog slack.
-    await leavePlatform(reason!);
+    // Off the call (mid-rejoin, or not re-admitted) there is nothing to leave: withdraw any pending
+    // ask-to-join and close the page, exactly as a pre-active abort does.
+    if (offCall) {
+      await settleWithin(deps.join.withdraw(reason!), opts.platformLeaveMs ?? DEFAULT_PLATFORM_LEAVE_MS,
+        '[bot] platform: withdraw exceeded budget; continuing to terminal lifecycle');
+    } else {
+      await leavePlatform(reason!);
+    }
 
     if (rejoinFailure) {
       // Cut off from a live meeting and not let back in: the bot did not finish its job.
+      // Labelled like a first join's verdict (denial / lobby timeout / error); the reason code and
+      // stage say it was the rejoin.
       const rejoinDetail = terminalDetail('active', `rejoin_${rejoinFailure}`);
+      const completion = OUTCOME_FAIL[rejoinFailure];
       console.error(`[bot] orchestrator: ${rejoinDetail}`);
       await emit('failed', {
-        failure_stage: 'active', completion_reason: 'join_failure', reason: rejoinDetail, exit_code: 1,
+        failure_stage: 'active', completion_reason: completion, reason: rejoinDetail, exit_code: 1,
       });
-      return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
+      return { exitCode: 1, status: 'failed', completionReason: completion };
     }
 
     if (teardownFailure) {

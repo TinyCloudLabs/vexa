@@ -586,6 +586,8 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
 
   let stopCapture: (() => Promise<void>) | null = null;
   let resumeCapture: (() => Promise<void>) | null = null;
+  // An in-flight resume. stop() waits for it, so capture teardown never races a page-side start.
+  let resuming: Promise<void> | null = null;
   let stopRecording: (() => Promise<void>) | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
@@ -654,13 +656,20 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
     async resumeAfterRejoin(): Promise<void> {
       const resume = resumeCapture;
       if (stopped || !resume) return;
-      try { await resume(); }
-      catch (e) { if (!stopped) captureFault('capture-start', e); }
+      const run = (async (): Promise<void> => {
+        try { await resume(); }
+        catch (e) { if (!stopped) captureFault('capture-start', e); }
+      })();
+      resuming = run;
+      try { await run; } finally { if (resuming === run) resuming = null; }
     },
+    canResumeAfterRejoin: () => !stopped && resumeCapture !== null,
     async stop(): Promise<void> {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       resumeCapture = null;
+      const pending = resuming;
+      if (pending) await pending;   // bounded by the orchestrator's pipeline-stop deadline
       const sc = stopCapture; stopCapture = null;
       if (sc) await sc().catch((e) => { captureFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;

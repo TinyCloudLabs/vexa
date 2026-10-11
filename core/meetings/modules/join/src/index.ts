@@ -53,6 +53,10 @@ export interface JoinOptions {
    *  (e.g. from @vexa/remote-browser); the brick skips guest name-entry. */
   authenticated?: boolean;
   waitingRoomTimeoutMs?: number;
+  /** Cooperative cancellation (TC-903): checked before navigation, before every join/ask-to-join
+   *  click and on every poll; an aborted join rejects with `signal.reason`. A click already sent
+   *  is not undone, so the embedder withdraws. */
+  signal?: AbortSignal;
   /** turn on the live debug view (VNC pixels on Linux, CDP control anywhere) */
   debug?: boolean;
   hooks?: Partial<Hooks>;
@@ -95,6 +99,7 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     authenticated: opts.authenticated,
     uiInteractionMode: opts.uiInteractionMode,
     automaticLeave: { waitingRoomTimeout: opts.waitingRoomTimeoutMs ?? 180_000 },
+    signal: opts.signal,
   };
 
   let debugInfo;
@@ -104,23 +109,28 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
   }
 
   let admitted: boolean;
+  opts.signal?.throwIfAborted();
   if (platform === "teams") {
     await joinMicrosoftTeams(page, opts.meetingUrl, botConfig.botName!, botConfig);
+    opts.signal?.throwIfAborted();
     admitted = await waitForTeamsMeetingAdmission(
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
   } else if (platform === "zoom") {
     await joinZoomMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+    opts.signal?.throwIfAborted();
     admitted = await waitForZoomMeetingAdmission(
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
   } else if (platform === "jitsi") {
     await joinJitsiMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+    opts.signal?.throwIfAborted();
     admitted = await waitForJitsiMeetingAdmission(
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
   } else if (platform === "google_meet") {
     await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+    opts.signal?.throwIfAborted();
     admitted = await waitForGoogleMeetingAdmission(
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
