@@ -14,7 +14,12 @@
 import { createMediaLossMonitor, DEFAULT_MEDIA_LOSS_GRACE_MS, type MediaSample } from './media-recovery.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource } from './aloneness.js';
 import { probeMeetRemoteMedia } from './capture-bridge.js';
-import { createOrchestrator, MAX_MEDIA_REJOINS, type MeetingResult } from './orchestrator.js';
+import {
+  createOrchestrator, MAX_MEDIA_REJOINS, rejoinCancelBudgetMs, DEFAULT_SIGNAL_REJOIN_CANCEL_MS, DEFAULT_REJOIN_CANCEL_MS,
+  DEFAULT_PIPELINE_STOP_MS, DEFAULT_RECORDING_DRAIN_MS, DEFAULT_PLATFORM_LEAVE_MS, type MeetingResult,
+} from './orchestrator.js';
+import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
+import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
 import { canTransition, type Act, type LifecycleEvent } from './contracts.js';
 import type { JoinDriver, JoinOutcome, LifecycleSink, MediaHealthSource, Pipeline } from './ports.js';
 import type { Invocation } from './config.js';
@@ -489,6 +494,35 @@ async function orchestratorTests(): Promise<void> {
     const res = await Promise.race([running, new Promise<null>((r) => setTimeout(() => r(null), 1_000))]);
     check('a rejoin that ignores the abort: teardown is bounded, completed(stopped), one withdraw',
       res?.completionReason === 'stopped' && Date.now() - started < 1_000 && log.withdraws.length === 1, JSON.stringify({ res, log }));
+  }
+
+  // 6. The signal path settles the rejoin on a shorter budget, so the whole SIGTERM teardown —
+  //    settle + pipeline + recording + withdraw + terminal callback — fits the watchdog.
+  {
+    check('signal rejoin settle defaults to 1s; ordinary ends keep 3s',
+      rejoinCancelBudgetMs(true) === DEFAULT_SIGNAL_REJOIN_CANCEL_MS && DEFAULT_SIGNAL_REJOIN_CANCEL_MS === 1_000
+        && rejoinCancelBudgetMs(false) === DEFAULT_REJOIN_CANCEL_MS && DEFAULT_REJOIN_CANCEL_MS === 3_000);
+    const worst = rejoinCancelBudgetMs(true) + DEFAULT_PIPELINE_STOP_MS + DEFAULT_RECORDING_DRAIN_MS
+      + DEFAULT_PLATFORM_LEAVE_MS + DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS;
+    check(`SIGTERM worst case during a rejoin (${worst}ms) fits the ${DEFAULT_SIGTERM_GRACE_MS}ms watchdog`, worst < DEFAULT_SIGTERM_GRACE_MS);
+    const stuckRun = async (fromSignal: boolean): Promise<{ res: MeetingResult; ms: number }> => {
+      const { join } = driver(() => new Promise<JoinOutcome>(() => { /* stuck in page.goto; ignores the abort */ }));
+      const media = controlledMedia();
+      let fire: (a: Act) => void = () => {};
+      const o = createOrchestrator(inv(), { lifecycle: lifecycle(), join, pipeline: { async start() {}, async stop() {} }, acts: noopActs((f) => { fire = f; }), aloneness: noopAloneness(), mediaHealth: media.source });
+      const running = o.run({ ...RUN, rejoinCancelMs: 600, signalRejoinCancelMs: 100 });
+      await settle();
+      media.fire();
+      await settle();
+      const started = Date.now();
+      if (fromSignal) o.stop('stopped', true); else fire({ action: 'leave' });
+      const res = await running;
+      return { res, ms: Date.now() - started };
+    };
+    const sig = await stuckRun(true);
+    const user = await stuckRun(false);
+    check('SIGTERM during a stuck rejoin uses the signal settle budget', sig.res.completionReason === 'stopped' && sig.ms < 400, `${sig.ms}ms`);
+    check('…a user stop keeps the longer settle budget', user.res.completionReason === 'stopped' && user.ms >= 550, `${user.ms}ms`);
   }
 
   console.log('orchestrator: no rejoin that cannot pay off');

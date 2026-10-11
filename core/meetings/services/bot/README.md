@@ -63,7 +63,9 @@ cannot be resumed (`canResumeAfterRejoin`), because it would bring back neither 
 recording. A stop, SIGTERM or the time cap during a rejoin cancels the join at its next checkpoint
 (an `AbortSignal` through `@vexa/join`). Teardown waits up to 3 seconds for the join to stop, then
 withdraws any pending ask-to-join and closes the page instead of leaving. A `page.goto` still in
-flight after those 3 seconds can still race the pipeline stop. That case is bounded and rare. If
+flight after those 3 seconds can still race the pipeline stop. When the end comes from a signal,
+that wait is 1 second, so the SIGTERM teardown (1 + 2 + 4 + 4 seconds, plus the 8-second terminal
+callback) fits the 20-second watchdog. That case is bounded and rare. If
 Meet keeps showing participant tiles after the room has really emptied, while the media is dead,
 the bot cannot tell that from a live room. It rejoins, is not admitted, and reports
 `failed(active, awaiting_admission_timeout, rejoin_timeout)` instead of `left_alone`. A real
@@ -94,7 +96,9 @@ in `src/contracts.ts` and validated against the sealed registry goldens (`contra
 
 ## Isolated evaluation
 
-Unit/integration: `pnpm test` (chained `tsx` runs — no build step). Levels:
+Unit/integration: `pnpm test` (chained `tsx` runs, with no build step of its own). The tests import
+the workspace packages from their `dist/`, so on a fresh checkout build them first with
+`pnpm --filter "@vexa/bot^..." build` (CI's `pnpm build` covers it). Levels:
 **L1** config ajv goldens · **L2** orchestrator `lifecycle.v1` state machine (fake ports) — incl. the
 #530 reachability gate (both-channels-down ⇒ no join, exit 3, `control_plane_unreachable`; either-channel
 up ⇒ proceed) · **L3** transport adapters (lifecycle-http `emitReachable` reachability verdict ·

@@ -164,6 +164,8 @@ export interface RunOptions {
   platformLeaveMs?: number;
   /** Maximum time teardown waits for a cancelled media rejoin to settle. Tests may shorten it. */
   rejoinCancelMs?: number;
+  /** Signal-only rejoin settle deadline (SIGTERM/force path). Tests may shorten it. */
+  signalRejoinCancelMs?: number;
 }
 
 /** The live HTTP lifecycle adapter has an 8s terminal-callback horizon. These teardown caps reserve
@@ -180,9 +182,17 @@ export const DEFAULT_PLATFORM_LEAVE_MS = 4_000;
  *  cannot turn the bot into a join loop. */
 export const MAX_MEDIA_REJOINS = 2;
 /** How long teardown waits for a cancelled rejoin to stop at its next checkpoint before it stops the
- *  pipeline on the page (TC-903). Under SIGTERM: 3s + 2s pipeline + 4s recording + 4s withdraw = 13s,
- *  inside the 20s watchdog. */
+ *  pipeline on the page (TC-903), on an ordinary (non-signal) end. */
 export const DEFAULT_REJOIN_CANCEL_MS = 3_000;
+/** The same wait when the end came from a signal. The signal teardown must fit the 20s watchdog:
+ *  1s rejoin settle + 2s pipeline + 4s recording + 4s withdraw/leave + 8s terminal callback = 19s. */
+export const DEFAULT_SIGNAL_REJOIN_CANCEL_MS = 1_000;
+
+export function rejoinCancelBudgetMs(fromSignal: boolean, override?: number, signalOverride?: number): number {
+  return fromSignal
+    ? (signalOverride ?? DEFAULT_SIGNAL_REJOIN_CANCEL_MS)
+    : (override ?? DEFAULT_REJOIN_CANCEL_MS);
+}
 
 export function pipelineStopBudgetMs(fromSignal: boolean, override?: number): number {
   return override ?? (fromSignal ? DEFAULT_PIPELINE_STOP_MS : DEFAULT_TRANSCRIPT_DRAIN_MS);
@@ -675,7 +685,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // (Reassigned inside recoverMedia; TypeScript's narrowing cannot see that.)
     (rejoinAbort as AbortController | null)?.abort();
     if (recovery) {
-      await settleWithin(recovery, opts.rejoinCancelMs ?? DEFAULT_REJOIN_CANCEL_MS,
+      await settleWithin(recovery, rejoinCancelBudgetMs(signalBoundedTeardown, opts.rejoinCancelMs, opts.signalRejoinCancelMs),
         '[bot] media-recovery: cancelled rejoin did not settle in time; continuing teardown');
     }
     await stopPipeline();
