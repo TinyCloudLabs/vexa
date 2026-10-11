@@ -426,6 +426,7 @@ export async function waitForGoogleMeetingAdmission(
       const effectiveTimeout = () => timeout + getEscalationExtensionMs();
 
       while (Date.now() - startTime < effectiveTimeout()) {
+        botConfig.signal?.throwIfAborted();
         // Host denial can leave stale waiting-room text in the DOM. Check the
         // terminal rejection state before treating the page as still waiting.
         await throwIfGoogleAdmissionRejected(page, "waiting-room polling");
@@ -476,6 +477,7 @@ export async function waitForGoogleMeetingAdmission(
       let unknownStateDuration2 = 0;
       const effectiveTimeout2 = () => timeout + getEscalationExtensionMs();
       while (Date.now() - startTime < effectiveTimeout2()) {
+        botConfig.signal?.throwIfAborted();
         // #444 — the `blocked` state is wired (callBlockedCallback), but NOT emitted yet.
         // hasRecaptchaChallenge() detects a VISIBLE, challenge-sized widget, which is the
         // narrow half of the signal; the blank block page half needs a run that actually
@@ -528,6 +530,7 @@ export async function waitForGoogleMeetingAdmission(
         const checkInterval = 2000;
         const startTime2 = Date.now();
         while (Date.now() - startTime2 < timeout) {
+          botConfig.signal?.throwIfAborted();
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
           const stillWaiting = await checkForWaitingRoomIndicators(page);
@@ -565,6 +568,8 @@ export async function waitForGoogleMeetingAdmission(
     throw new AdmissionError("join_failure", "Bot failed to join the Google Meet meeting — no meeting indicators found within timeout");
 
   } catch (error: any) {
+    // A cancelled join is the embedder's decision, not a platform verdict: surface the abort itself.
+    if (botConfig.signal?.aborted) throw botConfig.signal.reason;
     // Re-throw AdmissionError instances unchanged so callers can inspect outcome.
     if (error instanceof AdmissionError) throw error;
     throw new AdmissionError("join_failure",

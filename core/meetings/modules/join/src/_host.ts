@@ -17,6 +17,8 @@ export interface BotConfig {
   /** meeting passcode (zoom passcode screen / jitsi room password) */
   passcode?: string;
   authenticated?: boolean;
+  /** Cooperative cancellation of a join in progress (TC-903). See JoinOptions.signal. */
+  signal?: AbortSignal;
   uiInteractionMode?: "humanized" | "synthetic";
   automaticLeave?: {
     waitingRoomTimeout: number;

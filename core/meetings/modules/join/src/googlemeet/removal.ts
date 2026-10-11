@@ -29,10 +29,16 @@ export async function checkForGoogleRemoval(page: Page): Promise<boolean> {
 export function startGoogleRemovalMonitor(page: Page, onRemoval?: () => void | Promise<void>): () => void {
   log("Starting periodic Google Meet removal monitoring...");
   let removalDetected = false;
+  // Set by the cleanup fn. A tick already awaiting the page must not report after it: a caller that
+  // stops the monitor before a deliberate leave would otherwise read its own "You left the meeting"
+  // screen as a removal.
+  let stopped = false;
   
   const removalCheckInterval = setInterval(async () => {
+    if (stopped || removalDetected) return;
     try {
       const isRemoved = await checkForGoogleRemoval(page);
+      if (stopped) return;
       if (isRemoved && !removalDetected) {
         removalDetected = true; // Prevent duplicate detection
         log("🚨 Google Meet removal detected from Node.js side. Initiating graceful shutdown...");
@@ -60,6 +66,7 @@ export function startGoogleRemovalMonitor(page: Page, onRemoval?: () => void | P
             }
           });
         } catch {}
+        if (stopped) return;
         
         // Signal removal to caller
         try { await onRemoval?.(); } catch {}
@@ -71,6 +78,7 @@ export function startGoogleRemovalMonitor(page: Page, onRemoval?: () => void | P
 
   // Return cleanup function
   return () => {
+    stopped = true;
     clearInterval(removalCheckInterval);
   };
 }

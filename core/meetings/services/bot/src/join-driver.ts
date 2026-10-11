@@ -123,7 +123,7 @@ export function createBrowserJoinDriver(
         page.off('close', closed);
       };
     },
-    async join(report): Promise<JoinResult> {
+    async join(report, options): Promise<JoinResult> {
       const timer = createJoinTimer(now);
       const signals = (extra: JoinSignals = {}): JoinSignals => {
         const s = timer.signals({ ...(lobbyBudgetMs ? { lobbyBudgetMs } : {}), ...extra });
@@ -139,6 +139,9 @@ export function createBrowserJoinDriver(
           passcode: inv.passcode,                      // zoom passcode screen / jitsi room password
           authenticated: inv.authenticated,            // join as a signed-in user (persistent context)
           waitingRoomTimeoutMs: inv.automaticLeave?.waitingRoomTimeout,
+          // A rejoin the orchestrator no longer wants is cancelled at the brick's next checkpoint;
+          // the abort re-raises below as a non-AdmissionError throw (TC-903).
+          signal: options?.signal,
           hooks: {
             onState: (s: JoinState) => {
               // Stamp the lobby arrival BEFORE reporting: `report` is fire-and-forget and may be

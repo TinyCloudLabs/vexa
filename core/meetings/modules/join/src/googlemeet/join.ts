@@ -218,10 +218,12 @@ export async function waitForAnySelector(
   page: Page,
   selectors: string[],
   timeoutMs: number,
-  label: string
+  label: string,
+  signal?: AbortSignal
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   do {
+    signal?.throwIfAborted();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log(`Located ${label} via selector: ${hit.selector}`);
@@ -256,7 +258,8 @@ export async function waitForLobbyCta(
   page: Page,
   selectors: string[],
   timeoutMs: number,
-  label: string
+  label: string,
+  signal?: AbortSignal
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
@@ -265,6 +268,7 @@ export async function waitForLobbyCta(
   // no text-labelled button", never "the scan never got to look".
   let lastLabels: string[] | null = null;
   do {
+    signal?.throwIfAborted();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log(`Located ${label} via selector: ${hit.selector}`);
@@ -316,8 +320,14 @@ export async function joinGoogleMeeting(
   botName: string,
   botConfig: BotConfig
 ): Promise<void> {
+  // An aborted join stops at the next checkpoint: before navigation, between the waits, and
+  // immediately before each join/ask-to-join click. A click already sent is not undone; the
+  // embedder withdraws (TC-903).
+  const signal = botConfig.signal;
   const navUrl = withPinnedMeetLocale(meetingUrl, resolveBotUiLocale());
+  signal?.throwIfAborted();
   await page.goto(navUrl, { waitUntil: "domcontentloaded" });
+  signal?.throwIfAborted();
   await page.bringToFront();
 
   // Take screenshot after navigation
@@ -331,6 +341,7 @@ export async function joinGoogleMeeting(
 
   // Brief wait for page elements to settle (networkidle already ensures page loaded)
   await page.waitForTimeout(1000);
+  signal?.throwIfAborted();
 
   // Record the resolved UI locale on the SUCCESS path too (#856): the locale used
   // to be invisible until a failure. observedPageContext reads navigator.language
@@ -395,6 +406,7 @@ export async function joinGoogleMeeting(
     // Wait for the lobby to fully load (SPA needs time after domcontentloaded)
     log("Waiting for lobby to load...");
     await page.waitForTimeout(5000);
+    signal?.throwIfAborted();
 
     // Diagnostic screenshot to see what the lobby shows
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-lobby.png', fullPage: true });
@@ -426,7 +438,8 @@ export async function joinGoogleMeeting(
       page,
       googleAuthJoinCtaSelectors,
       30000,
-      "authenticated join CTA"
+      "authenticated join CTA",
+      signal
     );
 
     // Signed-out guard: a guest lobby (name input rendered) means the persisted
@@ -442,6 +455,7 @@ export async function joinGoogleMeeting(
       );
     }
 
+    signal?.throwIfAborted();
     await clickHandle(ctaHandle, "authenticated_join");
     log(`Bot clicked the authenticated join CTA (via ${ctaSelector}).`);
 
@@ -455,12 +469,14 @@ export async function joinGoogleMeeting(
       page,
       googleNameInputSelectors,
       120000,
-      "name input"
+      "name input",
+      signal
     );
     log("Name input field found.");
 
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-name-field-found.png', fullPage: true });
 
+    signal?.throwIfAborted();
     await fillField(nameHandle!, nameFieldSelector, botName, "name");
 
     // Mute mic and camera if available
@@ -482,8 +498,10 @@ export async function joinGoogleMeeting(
       page,
       googleJoinButtonSelectors,
       60000,
-      "join button"
+      "join button",
+      signal
     );
+    signal?.throwIfAborted();
     await clickHandle(joinHandle!, "ask_to_join");
     log(`${botName} joined the Google Meet Meeting.`);
 

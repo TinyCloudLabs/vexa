@@ -38,10 +38,11 @@ import {
 import { getJoinBrowserArgs } from '@vexa/join';
 import type { RecordingMasterFormat } from '@vexa/recording';
 import { isMixedLanePlatform, isPerTrackLanePlatform, type Invocation } from './config.js';
-import type { BotPipeline } from './pipeline.js';
+import type { BotPipeline, CaptureHandle } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
 import type { RemoteAudioActivityTap } from './aloneness.js';
+import type { MediaSample } from './media-recovery.js';
 import { createTtsPlayback } from './tts-playback.js';
 import { createHttpAttributedAudioRecorder } from './attributed-audio.js';
 import type { AttributedAudioFrame } from '@vexa/gmeet-pipeline';
@@ -733,7 +734,7 @@ export async function startCaptureBridge(
   onChat?: (sender: string, text: string) => void,
   /** Active-phase silence signal. It remains unavailable until page capture reports ready. */
   activity?: RemoteAudioActivityTap,
-): Promise<() => Promise<void>> {
+): Promise<CaptureHandle> {
   const mixed = isMixedLanePlatform(inv.platform);
   const perTrack = isPerTrackLanePlatform(inv.platform);   // Zoom: per-track through the per-channel lane
   const useMix = mixed && !perTrack;                        // Teams/Jitsi: the pyannote mixed lane
@@ -770,9 +771,14 @@ export async function startCaptureBridge(
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
   // Float32Array and stamp the capture time if the page didn't supply one (production stamps
   // Date.now() on the Node side — index.ts:1598–1605).
+  // Highest per-channel id delivered so far. A page re-created after a rejoin numbers its streams
+  // from zero again; its channels start above this so a new stream can never continue a turn (or an
+  // attributed range) that belonged to whoever held that number before the rejoin (TC-903).
+  let channelHigh = -1;
   const onPerSpeakerAudio = async (speakerIndex: number, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
+    if (!useMix && speakerIndex > channelHigh) channelHigh = speakerIndex;
     observeRemoteAudio(pcm);
     tee(speakerIndex, pcm, ts);                                 // O-TEL-1: tap BEFORE the pipeline
     // Teams/Jitsi (useMix): one combined stream → the pyannote mixed lane. Zoom + gmeet: per-channel —
@@ -791,6 +797,7 @@ export async function startCaptureBridge(
   const onNamedAudio = async (channel: number, glowName: string | undefined, samples: number[], tsMs?: number): Promise<void> => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
+    if (channel > channelHigh) channelHigh = channel;
     observeRemoteAudio(pcm);
     tee(channel, pcm, ts, glowName);                            // O-TEL-1: tap BEFORE the pipeline
     if (attributed) {
@@ -880,19 +887,24 @@ export async function startCaptureBridge(
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
   }).catch(() => { /* optional */ });
 
-  if (attributed) {
-    // This wrapper lives at the producer boundary.  It admits both call count and PCM bytes before
-    // Node/Playwright receives an array, releases each reservation when the binding settles, and
-    // turns the first refusal into one durable incomplete range before stopping capture.
+  // This wrapper lives at the producer boundary.  It admits both call count and PCM bytes before
+  // Node/Playwright receives an array, releases each reservation when the binding settles, and
+  // turns the first refusal into one durable incomplete range before stopping capture. Page state:
+  // installed again on a page re-created by a rejoin.
+  const installAttributedAdmission = async (): Promise<void> => {
+    if (!attributed) return;
     await page.evaluate(installPageAttributedAudioAdmission, {
       maxBytes: PAGE_ATTRIBUTED_AUDIO_MAX_BYTES, maxCalls: PAGE_ATTRIBUTED_AUDIO_MAX_CALLS,
     });
-  }
+  };
+  await installAttributedAdmission();
 
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
+  // `channelBase` offsets the gmeet lane's channel ids (0 on the first page; above every channel
+  // already delivered on a page re-created by a rejoin).
+  const startPageCapture = (channelBase: number): Promise<void> => page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms, channelBase }) => {
     const w = (globalThis as any) as Record<string, any>;
     // One logBot line per distinct rejection signature; the real stage/code crosses instead of a
     // fixed 'upload_request_failed' guess.
@@ -1385,8 +1397,9 @@ export async function startCaptureBridge(
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
           const glow = lit.length === 1 ? lit[0] : undefined;
-          if (glow) Promise.resolve(w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now())).catch(feedWarn);
-          else Promise.resolve(w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now())).catch(feedWarn);
+          const channel = channelBase + index;
+          if (glow) Promise.resolve(w.__vexaNamedAudioData(channel, glow, Array.from(pcm), Date.now())).catch(feedWarn);
+          else Promise.resolve(w.__vexaPerSpeakerAudioData(channel, Array.from(pcm), Date.now())).catch(feedWarn);
         },
       });
       await w.__vexaGmeetCapture.start();
@@ -1397,7 +1410,7 @@ export async function startCaptureBridge(
       mainAudioGraceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_GRACE_MS || 15000),
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
-      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006) }).catch((e) => {
+      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006), channelBase }).catch((e) => {
     console.error(attributed
       ? '[bot] capture bridge: attributed page-side start failed'
       : `[bot] capture bridge: page-side start failed: ${String(e)}`);
@@ -1405,6 +1418,7 @@ export async function startCaptureBridge(
     // cannot later close an empty-success manifest after its page initialization failed.
     if (attributed) throw new Error('attributed-audio capture start failed');
   });
+  await startPageCapture(0);
 
   // Captions are OFF by default now: the bot does not touch the meeting's UI to get a name source
   // it was measured not to need (see TEAMS_ENABLE_CAPTIONS). Opt back in with
@@ -1415,7 +1429,7 @@ export async function startCaptureBridge(
   }
 
   // Stop fn: tear the page-side capture down on teardown (best-effort; the page may be closing).
-  return async () => {
+  const stop = async (): Promise<void> => {
     if (countersTimer) clearInterval(countersTimer);
     activity?.unavailable();
     let pageFailure: unknown;
@@ -1462,6 +1476,18 @@ export async function startCaptureBridge(
     // a closed manifest that omits an admitted range.
     await attributed?.stop();
   };
+  // Google Meet lane only (TC-903): after a rejoin re-navigated the page, re-run the page side of
+  // this bridge on the new document. Everything Node-side — the bindings (exposeFunction survives
+  // navigation), the engine, the activity tap, the attributed recorder — carries on unchanged.
+  if (mixed) return stop;
+  return Object.assign(stop, {
+    async resumeAfterRejoin(): Promise<void> {
+      // The silence window restarts at the rejoin: whatever was "last heard" is from another page.
+      activity?.ready();
+      await installAttributedAdmission();
+      await startPageCapture(channelHigh + 1);
+    },
+  });
 }
 
 /**
@@ -1485,6 +1511,55 @@ export async function restartMixedCapture(page: Page): Promise<boolean> {
     w.logBot?.('[mixed] capture restart requested (deaf-capture guard)');
     return true;
   }).catch(() => false);
+}
+
+/** How long one Google Meet media reading may take before it counts as "cannot tell". */
+export const MEET_MEDIA_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * One Google Meet remote-media reading for the media-loss monitor (TC-903).
+ *
+ * `liveAudioTracks` uses the recording tap's own liveness rule: a media element whose stream still
+ * holds a LIVE audio track (record-chunker detaches exactly when this reaches zero). A track that
+ * merely delivers silence stays live and counts. `remoteParticipants` counts Meet's participant
+ * tiles, excluding the bot's own tile via Meet's structural `data-self-name` marker; when no self
+ * tile is identifiable one tile is assumed to be the bot's, so an undetected self tile can only
+ * under-count (no recovery, today's behaviour) and never manufacture a participant.
+ *
+ * Resolves `null` when the page cannot answer in time — no evidence, never a verdict.
+ */
+export async function probeMeetRemoteMedia(page: Page, timeoutMs = MEET_MEDIA_PROBE_TIMEOUT_MS): Promise<MediaSample | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      page.evaluate(() => {
+        const doc = (globalThis as any).document;
+        let liveAudioTracks = 0;
+        for (const el of Array.from(doc.querySelectorAll('audio, video')) as any[]) {
+          const stream = el.srcObject;
+          if (!stream || typeof stream.getAudioTracks !== 'function') continue;
+          if (stream.getAudioTracks().some((t: any) => t?.readyState === 'live')) liveAudioTracks++;
+        }
+        const selfTile = doc.querySelector('[data-self-name]')?.closest?.('[data-participant-id]');
+        const selfId: string | null = selfTile?.getAttribute('data-participant-id') ?? null;
+        let selfSeen = false;
+        const remote = new Set<string>();
+        for (const el of Array.from(doc.querySelectorAll('[data-participant-id]')) as any[]) {
+          const id: string | null = el.getAttribute('data-participant-id');
+          if (!id) continue;
+          if (id === selfId || el.hasAttribute('data-self-name') || el.querySelector('[data-self-name]')) { selfSeen = true; continue; }
+          remote.add(id);
+        }
+        const remoteParticipants = selfSeen ? remote.size : Math.max(0, remote.size - 1);
+        return { liveAudioTracks, remoteParticipants };
+      }),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
