@@ -94,6 +94,10 @@ export interface JoinDriver {
 export interface Pipeline {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** Re-attach the page-side capture after a rejoin re-navigated the meeting page (TC-903). The
+   *  engine, transcript sink and durable producers keep running across it. OPTIONAL: a pipeline
+   *  without it simply does not resume capture. MUST NOT throw. */
+  resumeAfterRejoin?(): Promise<void>;
 }
 
 /** transcript.v1 egress — the engine pushes speaker-attributed segments here; the real
@@ -146,6 +150,14 @@ export interface ActsSource {
 /** Active-phase aloneness verdict source. Missing capture fails closed inside the adapter. */
 export interface AlonenessSource {
   onAlone(callback: () => void): () => void;
+}
+
+/** Active-phase remote-media health (TC-903). Fires AT MOST ONCE per subscription, when every
+ *  remote audio track has been gone for a bounded grace window while remote participants are still
+ *  in the call — the bot is cut off from a live meeting, which is neither silence nor an empty room.
+ *  `armed: false` waits until live remote audio has been seen once before it can fire. */
+export interface MediaHealthSource {
+  onMediaLost(callback: () => void, options?: { armed?: boolean }): () => void;
 }
 
 /** recording.v1 sink. Async close attempts to drain delivery; the orchestrator bounds that wait so

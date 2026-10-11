@@ -48,6 +48,20 @@ Browser failure is observed independently of audio silence. A Chromium page cras
 completion enum rather than misclassifying an active-call crash as silence or a join failure.
 The normal leave path detaches the browser monitor before deliberately closing the page.
 
+Remote-media loss on Google Meet is also kept separate from silence (TC-903). Every 2 seconds the
+bot reads the page: how many media elements still hold a live audio track, and how many remote
+participant tiles remain (its own tile excluded). If every remote track has ended for 25 seconds
+while participants remain, the bot is cut off from a live call. It does not wait out the silence
+window. It leaves, rejoins the same meeting in-process through the normal join flow, and resumes
+page-side capture on the new document. Channel ids continue above the pre-rejoin ones. The
+lifecycle stays `active`, and removal and aloneness are paused only while the bot is out of the
+call. A rejoin that is not admitted ends the run `failed` (stage `active`, `join_failure`, reason
+code `rejoin_<outcome>`). Each run may rejoin at most twice (`MAX_MEDIA_REJOINS`); after that the
+silence rules decide. The MediaRecorder is not restarted after a rejoin, because the master is one
+byte-concatenated webm stream. The recording therefore ends at the media loss and completes through
+the sink's final marker. Silence on a live track is not a loss: an idle Meet audio slot delivers the
+same zeros. Run `npx tsx src/media-recovery.test.ts` for the offline proof.
+
 Every 30 seconds, `[bot] resources` logs container memory current/peak/limit (where available),
 OOM-kill counters, and Node RSS. The terminal event retains this evidence in `bot_resources`.
 `sampled_peak_memory_bytes` is a lower bound from periodic samples; `peak_memory_bytes` comes

@@ -543,9 +543,13 @@ export function serr(_e: unknown): string {
   return 'code=operation_failed';
 }
 
+/** A started page-side capture: its teardown, plus (where the lane supports it) how to re-attach
+ *  the page side after a rejoin re-navigated the meeting page without tearing down Node-side state. */
+export type CaptureHandle = (() => Promise<void>) & { resumeAfterRejoin?: () => Promise<void> };
+
 export interface LivePipelineDeps {
   /** Attach the page-side capture; returns its teardown. Best-effort — a throw DEGRADES, never evicts. */
-  startCapture: () => Promise<() => Promise<void>>;
+  startCapture: () => Promise<CaptureHandle>;
   /** Attach the requested page-side recording; returns its teardown. */
   startRecording?: () => Promise<() => Promise<void>>;
   /** The transcription engine (the BotPipeline). Its start() failure is non-fatal + retried. */
@@ -581,6 +585,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   const delayMs = Math.max(0, deps.retry?.delayMs ?? 2000);
 
   let stopCapture: (() => Promise<void>) | null = null;
+  let resumeCapture: (() => Promise<void>) | null = null;
   let stopRecording: (() => Promise<void>) | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
@@ -618,7 +623,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       try {
         const stop = await startCapture();
         if (stopped) await stop().catch(() => { /* stop won while capture was attaching */ });
-        else stopCapture = stop;
+        else { stopCapture = stop; resumeCapture = stop.resumeAfterRejoin ?? null; }
       }
       catch (e) { if (!stopped) captureFault('capture-start', e); }
       if (stopped) return;
@@ -642,9 +647,20 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       await tryEngineStart(1);
       // NOTHING rethrows ⇒ the orchestrator never sees a pipeline.start() throw ⇒ no self-evict.
     },
+    // A rejoin re-navigates the page, which discards the page-side capture AND the MediaRecorder.
+    // Only capture comes back: the recording master is one byte-concatenated webm stream, and a
+    // second recorder's fresh EBML header in its middle would corrupt it. The recording therefore
+    // ends at the media loss and is completed by the sink's final marker at close.
+    async resumeAfterRejoin(): Promise<void> {
+      const resume = resumeCapture;
+      if (stopped || !resume) return;
+      try { await resume(); }
+      catch (e) { if (!stopped) captureFault('capture-start', e); }
+    },
     async stop(): Promise<void> {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      resumeCapture = null;
       const sc = stopCapture; stopCapture = null;
       if (sc) await sc().catch((e) => { captureFault('capture-stop', e); });
       const sr = stopRecording; stopRecording = null;

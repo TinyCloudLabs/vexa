@@ -36,7 +36,8 @@ import { captureSignalEnabled, createCaptureSignalRecorder, DEFAULT_ENABLED_MAX_
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { createResourceMonitor } from './resources.js';
-import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
+import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, probeMeetRemoteMedia, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
+import { createMediaLossMonitor } from './media-recovery.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
 import type {
@@ -45,6 +46,7 @@ import type {
   LifecycleSink,
   TranscriptSink,
   ActsSource,
+  MediaHealthSource,
   RecordingSink,
 } from './ports.js';
 
@@ -196,6 +198,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
+  let mediaHealth: MediaHealthSource | undefined;
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
@@ -297,6 +300,14 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
       },
     });
+    // TC-903: Google Meet can drop the bot's WebRTC media while keeping its seat. Watch for every
+    // remote audio track ending with participants still present, so the orchestrator rejoins
+    // instead of the silence window ending a live meeting. Meet only: the other lanes' media sits
+    // behind the RTCPeerConnection hook and is covered by the deaf-capture guard.
+    if (inv.platform === 'google_meet') {
+      mediaHealth = createMediaLossMonitor({ probe: () => probeMeetRemoteMedia(sess.page) });
+      console.log('[bot] media-recovery: remote-media loss monitor enabled');
+    }
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
     const speak = createSpeakController(session.page, inv);
     acts = teeActs(liveActs, voiceHandler(speak));
@@ -336,6 +347,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     pipeline,
     acts,
     aloneness,
+    mediaHealth,
     recording: recording as RecordingSink | undefined,
     reachability,
     degraded: () => sttFaults.report(),
