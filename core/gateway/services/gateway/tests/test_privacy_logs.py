@@ -219,3 +219,65 @@ thread.join()
     assert all(record["event"] == "python_log" for record in records)
     allowed = {"ts", "level", "service", "event", "logger", "trace_id", "fields"}
     assert all(set(record) <= allowed for record in records)
+
+
+def test_real_uvicorn_gateway_lazy_target_sanitizes_access_and_bootstrap_logs():
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    script = r"""
+import logging, sys, threading, time, urllib.error, urllib.request
+sys.path.insert(0, sys.argv[1])
+from fastapi import FastAPI
+import gateway.adapters as adapters
+def build_production_app():
+    try:
+        raise RuntimeError("BOOTSTRAP_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=BOOTSTRAP_TOKEN")
+    except RuntimeError:
+        logging.getLogger("bootstrap.child").warning("BOOTSTRAP_NAME_CANARY", exc_info=True)
+    return FastAPI()
+adapters.build_production_app = build_production_app
+import uvicorn
+server = uvicorn.Server(uvicorn.Config(
+    "gateway.adapters:app", host="127.0.0.1", port=int(sys.argv[2]),
+    access_log=True, lifespan="off",
+))
+thread = threading.Thread(target=server.run, daemon=True)
+thread.start()
+deadline = time.monotonic() + 8
+while not server.started and time.monotonic() < deadline:
+    time.sleep(.01)
+assert server.started
+try:
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{sys.argv[2]}/transcripts/google_meet/native-meeting-canary?ticket=query-ticket-canary",
+        timeout=3,
+    )
+except urllib.error.HTTPError as error:
+    assert error.code == 404
+server.should_exit = True
+thread.join(timeout=5)
+assert not thread.is_alive()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source), str(port)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    for canary in (
+        "native-meeting-canary", "query-ticket-canary", "127.0.0.1",
+        "BOOTSTRAP_URL_CANARY", "BOOTSTRAP_NAME_CANARY", "BOOTSTRAP_TOKEN",
+        "Traceback", "RuntimeError",
+    ):
+        assert canary not in output
+    records = _json_lines(output)
+    assert records
+    assert all(record["service"] == "gateway" for record in records)
+    assert not any(record.get("logger") == "uvicorn.access" for record in records)

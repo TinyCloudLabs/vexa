@@ -193,6 +193,8 @@ def safe_logging_config() -> dict:
         },
     }
 
+LOG_CONFIG = safe_logging_config()
+
 
 def install_process_logging_hooks() -> None:
     logging.captureWarnings(True)
@@ -209,6 +211,12 @@ def install_process_logging_hooks() -> None:
 
     sys.excepthook = handle_exception
     threading.excepthook = handle_thread_exception
+
+
+def configure_process_logging() -> None:
+    logging.config.dictConfig(LOG_CONFIG)
+    install_process_logging_hooks()
+    logging.getLogger("uvicorn.access").disabled = True
 
 TRACE_HEADER = "x-trace-id"
 

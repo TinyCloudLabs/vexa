@@ -353,3 +353,41 @@ def test_webhook_callback_logs_outcome_without_host_or_identifier(goldens, capsy
     ):
         assert canary not in output
     assert hashlib.sha256(str(row["id"]).encode()).hexdigest()[:16] in output
+
+
+def test_rollback_cli_main_sanitizes_dropped_meeting_id():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from meeting_api.recordings import rollback
+from meeting_api.recordings.ledger import report_dropped_union_rows
+meeting_id = 987654321
+async def fake_run(_url):
+    report_dropped_union_rows(
+        [{"idempotency_key":"superseded","sequence":1}],
+        [{"idempotency_key":"superseded","sequence":1}],
+        meeting_id=meeting_id, context="rollback-canary",
+    )
+    return {"dropped": 1}
+rollback._run = fake_run
+sys.argv = ["rollback", "postgresql://synthetic"]
+rollback.main()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    assert "987654321" not in output
+    hashed = hashlib.sha256(b"987654321").hexdigest()[:16]
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    warning_records = [record for record in records if "meeting_id" in record]
+    assert len(warning_records) == 2
+    assert all(record["meeting_id"] == hashed for record in warning_records)
+    assert [record["fields"]["count"] for record in warning_records] == [1, 1]

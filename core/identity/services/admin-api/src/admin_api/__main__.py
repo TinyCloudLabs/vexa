@@ -154,11 +154,17 @@ def build_production_app():
 # ``__main__.app`` at boot.
 def __getattr__(name: str):
     if name == "app":
+        from .obs import configure_privacy_logging
+
+        configure_privacy_logging()
         return build_production_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main() -> None:
+    from .obs import LOG_CONFIG, configure_privacy_logging
+
+    configure_privacy_logging()
     import uvicorn
 
     uvicorn.run(
@@ -166,6 +172,8 @@ def main() -> None:
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8001")),
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        log_config=LOG_CONFIG,
+        access_log=False,
     )
 
 

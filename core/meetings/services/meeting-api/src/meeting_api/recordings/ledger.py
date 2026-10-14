@@ -232,15 +232,16 @@ def report_dropped_union_rows(dropped, merged, *, meeting_id, context: str) -> N
         else:
             dropped_lost += 1
         log.warning(
-            "%s: %s range row omitted for meeting %s",
+            "%s: %s range row omitted",
             context,
             "superseded same-identity" if is_superseded else "dropped",
-            meeting_id,
+            extra={"meeting_id": meeting_id, "fields": {"count": 1}},
         )
     log.warning(
-        "%s: %d range row(s) not in the union for meeting %s "
+        "%s: %d range row(s) not in the union "
         "(%d superseded by a same-identity merge, %d dropped)",
-        context, len(dropped), meeting_id, superseded, dropped_lost,
+        context, len(dropped), superseded, dropped_lost,
+        extra={"meeting_id": meeting_id, "fields": {"count": len(dropped)}},
     )
 
 

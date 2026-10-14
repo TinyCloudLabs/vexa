@@ -249,5 +249,8 @@ def build_production_app(
 # built then, with the real adapters, from env (ADMIN_API_URL / MEETING_API_URL / REDIS_URL).
 def __getattr__(name: str):
     if name == "app":
+        from .obs import configure_process_logging
+
+        configure_process_logging()
         return build_production_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

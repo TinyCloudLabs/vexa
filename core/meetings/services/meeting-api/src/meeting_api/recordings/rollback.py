@@ -140,7 +140,9 @@ async def _run(database_url: Optional[str] = None) -> dict:
 
 def main() -> None:
     """CLI entry: ``python -m meeting_api.recordings.rollback`` (DATABASE_URL from env)."""
-    logging.basicConfig(level=logging.INFO)
+    from ..obs import configure_privacy_logging
+
+    configure_privacy_logging()
     url = sys.argv[1] if len(sys.argv) > 1 else os.getenv("DATABASE_URL")
     print(json.dumps(asyncio.run(_run(url)), sort_keys=True))
 

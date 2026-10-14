@@ -9,18 +9,17 @@ from __future__ import annotations
 
 import os
 
-from .obs import safe_logging_config
+from .obs import LOG_CONFIG, install_process_logging_hooks
 
-LOG_CONFIG = safe_logging_config()
+
 
 
 def main() -> None:
     import logging.config
 
     logging.config.dictConfig(LOG_CONFIG)
-    from .obs import install_process_logging_hooks
-
     install_process_logging_hooks()
+    logging.getLogger("uvicorn.access").disabled = True
     import uvicorn
 
     uvicorn.run(
