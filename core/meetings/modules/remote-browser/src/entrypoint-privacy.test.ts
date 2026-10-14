@@ -120,3 +120,18 @@ test('inventory canary: remote-browser.login-cli', () => {
   ], browserPackage);
   assert.match(rawWrite, /"service":"remote-browser","event":"log_suppressed","level":"error"/);
 });
+
+for (const failure of ['timer', 'rejection']) {
+  test(`fatal handler scrubs ${failure}`, () => {
+    const privacyModule = new URL(`file://${path.join(browserPackage, 'src/privacy-logging.ts')}`).href;
+    const trigger = failure === 'timer'
+      ? `setTimeout(() => { throw new Error('https://meet.google.com/xxx-xxxx-xxx?ticket=TC965_ENTRY_TOKEN_CANARY'); }, 0);`
+      : `setTimeout(() => { Promise.reject(new Error('https://meet.google.com/xxx-xxxx-xxx?ticket=TC965_ENTRY_TOKEN_CANARY')); }, 0);`;
+    const output = runNode([
+      '--import', 'tsx', '--input-type=module', '-e',
+      `await import(${JSON.stringify(privacyModule)}); ${trigger}`,
+    ], browserPackage, {}, 1);
+    assert.match(output, /^\{"service":"remote-browser","event":"fatal"\}\n$/);
+    assert.doesNotMatch(output, /stack|Error|https:|ticket/);
+  });
+}

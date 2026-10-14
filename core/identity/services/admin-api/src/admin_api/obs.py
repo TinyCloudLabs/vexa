@@ -76,11 +76,20 @@ def install_process_logging_hooks() -> None:
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
         )
 
+    def handle_unraisable(args) -> None:
+        logger.critical(
+            "unraisable process exception",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
     sys.excepthook = handle_exception
     threading.excepthook = handle_thread_exception
+    sys.unraisablehook = handle_unraisable
 
 
 def configure_privacy_logging() -> None:
     logging.config.dictConfig(LOG_CONFIG)
+    for name in ("push_response", "charset_normalizer", "aiohttp.access", "urllib3", "sqlalchemy.engine.Engine"):
+        logging.getLogger(name).disabled = True
     install_process_logging_hooks()
     logging.getLogger("uvicorn.access").disabled = True

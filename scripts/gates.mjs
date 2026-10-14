@@ -382,10 +382,11 @@ function gateNode() {
     try { return !!JSON.parse(readFileSync(join(d, "package.json"), "utf8")).scripts?.build; }
     catch { return false; }
   });
-  if (!pkgs.length) { console.log("  ✓ gate:node — no buildable packages yet (green-on-empty)"); return true; }
-  try { execSync("npx turbo run build test --output-logs=errors-only", { cwd: ROOT, stdio: "pipe" }); }
-  catch (e) { return fail([`turbo build/test:\n${errText(e).slice(-2000)}`]); }
-  console.log(`  ✓ gate:node — ${pkgs.length} package(s) · build + test green`);
+  try {
+    if (pkgs.length) execSync("npx turbo run build test --output-logs=errors-only", { cwd: ROOT, stdio: "pipe" });
+    execFileSync(process.execPath, ["--test", "scripts/log-privacy-entrypoints.test.mjs"], { cwd: ROOT, stdio: "pipe" });
+  } catch (e) { return fail([`turbo build/test or privacy entrypoint inventory:\n${errText(e).slice(-2000)}`]); }
+  console.log(`  ✓ gate:node — ${pkgs.length} package(s) · build + test green; entrypoint inventory green`);
   return true;
 }
 

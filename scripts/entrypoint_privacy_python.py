@@ -102,3 +102,53 @@ assert_filtered()
     assert result.returncode == 0, f"{row['id']} failed: {output}"
     for canary in CANARIES:
         assert canary not in output, f"{row['id']} leaked {canary}: {output}"
+
+
+def run_process_hook_canaries(source_root: str, module: str, configure_name: str) -> None:
+    source = ROOT / source_root
+    script = r'''
+import gc, importlib, sys, threading, warnings
+sys.path.insert(0, sys.argv[1])
+module_name, configure_name, event = sys.argv[2:]
+obs = importlib.import_module(module_name)
+getattr(obs, configure_name)()
+canary = f"TC965_{event.upper()}_CANARY https://meet.google.com/xxx-xxxx-xxx?ticket=TC965_HOOK_TOKEN"
+if event == "warning":
+    warnings.warn(canary, RuntimeWarning)
+elif event == "thread":
+    def fail():
+        raise RuntimeError(canary)
+    thread = threading.Thread(target=fail)
+    thread.start()
+    thread.join()
+elif event == "unraisable":
+    class BadDestructor:
+        def __del__(self):
+            raise RuntimeError(canary)
+    bad = BadDestructor()
+    del bad
+    gc.collect()
+elif event == "uncaught":
+    raise RuntimeError(canary)
+else:
+    raise AssertionError(event)
+'''
+    for event in ("uncaught", "thread", "warning", "unraisable"):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(source), module, configure_name, event],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        output = result.stdout + result.stderr
+        expected_status = 1 if event == "uncaught" else 0
+        assert result.returncode == expected_status, f"{module} {event}: {output}"
+        for value in (f"TC965_{event.upper()}_CANARY", "xxx-xxxx-xxx", "TC965_HOOK_TOKEN", "Traceback", "RuntimeError"):
+            assert value not in output, f"{module} {event} leaked {value}: {output}"
+        records = [line for line in output.splitlines() if line.startswith("{")]
+        assert records, f"{module} {event} emitted no sanitized record"
+        for line in records:
+            import json
+            payload = json.loads(line)
+            assert set(payload) <= {"ts", "level", "event", "service", "logger", "trace_id", "audience"}

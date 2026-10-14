@@ -7,7 +7,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from entrypoint_privacy_python import entrypoint_rows, run_python_entrypoint_canary  # noqa: E402
+from entrypoint_privacy_python import entrypoint_rows, run_process_hook_canaries, run_python_entrypoint_canary  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -17,3 +17,11 @@ from entrypoint_privacy_python import entrypoint_rows, run_python_entrypoint_can
 )
 def test_python_entrypoint_startup_canary_is_filtered(row):
     run_python_entrypoint_canary(row)
+
+
+def test_process_hooks_scrub_all_python_failure_channels():
+    run_process_hook_canaries(
+        "core/gateway/services/gateway/src",
+        "gateway.obs",
+        "configure_process_logging",
+    )

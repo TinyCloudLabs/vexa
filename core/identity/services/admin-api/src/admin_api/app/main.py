@@ -18,12 +18,14 @@ exercises:
   is refused (422) — never silently dropped (#922).
 """
 import hmac
+import logging
 import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_serializer, model_validator
 from sqlalchemy import func
@@ -415,6 +417,11 @@ def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Vexa Admin API (v0.12)")
+
+    @app.exception_handler(Exception)
+    async def _privacy_safe_unhandled_exception(_request: Request, _exc: Exception):
+        logging.getLogger("admin_api").error("unhandled request exception")
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
     # is a separate concern — keeping /health a pure liveness check makes it green without a

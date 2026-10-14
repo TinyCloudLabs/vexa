@@ -43,3 +43,30 @@ assert captured["kwargs"]["access_log"] is False
     ):
         assert canary not in output
     assert '"event":"log_event"' in output
+
+
+def test_admin_database_exception_handler_returns_generic_error_and_drops_sql_values(caplog):
+    from fastapi.testclient import TestClient
+    from sqlalchemy.exc import StatementError
+
+    from admin_api.app.main import create_app
+
+    app = create_app()
+
+    @app.get("/test/database-error")
+    async def database_error():
+        raise StatementError(
+            "TC965_SQL_MESSAGE_CANARY",
+            "SELECT :value",
+            {"value": "TC965_SQL_PARAM_CANARY"},
+            RuntimeError("TC965_SQL_ORIGINAL_CANARY"),
+        )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/test/database-error")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    assert "TC965_SQL_MESSAGE_CANARY" not in caplog.text
+    assert "TC965_SQL_PARAM_CANARY" not in caplog.text
+    assert "TC965_SQL_ORIGINAL_CANARY" not in caplog.text
+    assert "unhandled request exception" in caplog.text

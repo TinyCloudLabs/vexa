@@ -28,7 +28,7 @@ DEAD_TABLES = {"recordings", "media_files"}
 
 @pytest.fixture()
 def engine(pg_url):
-    eng = create_engine(pg_url)
+    eng = create_engine(pg_url, hide_parameters=True)
     # Clean slate per test — drop everything, re-converge.
     Base.metadata.drop_all(eng)
     ensure_schema_sync(eng, Base)

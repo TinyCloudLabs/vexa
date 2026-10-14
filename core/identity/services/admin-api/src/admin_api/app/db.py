@@ -29,11 +29,10 @@ def configure(
     is preserved unconditionally.
     """
     global _engine, _session_factory
-    kwargs = {"connect_args": {"statement_cache_size": 0}}
-    if pool_size is not None:
-        kwargs["pool_size"] = pool_size
-    if max_overflow is not None:
-        kwargs["max_overflow"] = max_overflow
+    kwargs = {
+        "connect_args": {"statement_cache_size": 0},
+        "hide_parameters": True,
+    }
     _engine = create_async_engine(database_url, **kwargs)
     _session_factory = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commit=False)
 
