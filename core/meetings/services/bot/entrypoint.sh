@@ -12,7 +12,7 @@ set -u
 
 export DISPLAY="${DISPLAY:-:99}"
 
-echo "[entrypoint] Starting Xvfb on ${DISPLAY}..."
+echo "[entrypoint] Starting Xvfb..."
 Xvfb "${DISPLAY}" -screen 0 1920x1080x24 >/tmp/xvfb.log 2>&1 &
 # Give Xvfb a moment to create the socket before anything attaches.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -41,7 +41,7 @@ pactl set-source-mute virtual_mic 1 2>/dev/null || true
 # BOT_APP_DIR/BOT_WORKER_ENTRY are overridable so the entrypoint's signal handling is
 # unit-testable outside the image (entrypoint.test.ts drives a stub worker through it).
 cd "${BOT_APP_DIR:-/app/core/meetings/services/bot}" || exit 1
-echo "[entrypoint] Starting @vexa/bot worker (node dist/index.js, DISPLAY=${DISPLAY})..."
+echo "[entrypoint] Starting @vexa/bot worker (node dist/index.js)..."
 
 # SIGNAL FORWARDING (the exit-137 fix): this script is PID 1, and a PID-1 bash neither dies on
 # SIGTERM nor passes it to a foreground child — so `docker stop` (and the runtime's graceful
