@@ -1,5 +1,6 @@
 {
   "name": "tc965-entrypoint-mutation",
+  "private": true,
   "bin": {
     "tc965-diagnostic": "diagnostic-cli.mjs"
   },
