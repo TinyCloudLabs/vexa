@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -21,6 +20,16 @@ const emitted = JSON.stringify({
   transcript: canaries[1],
   url: `https://meet.google.com/${canaries[2]}?ticket=${canaries[3]}`,
 });
+
+function test(name: string, run: () => void): void {
+  try {
+    run();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    console.error(`FAIL ${name}: ${error instanceof Error ? error.message : 'unknown failure'}`);
+    process.exitCode = 1;
+  }
+}
 
 function runNode(args: string[], cwd: string, env: NodeJS.ProcessEnv = {}, expectedStatus = 0): string {
   const result = spawnSync(process.execPath, args, { cwd, env, encoding: 'utf8', timeout: 20_000 });
