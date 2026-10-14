@@ -98,7 +98,7 @@ def create_app(
                 audience="system",
                 level="warning",
                 span="lifecycle.callback",
-                fields={"reason": "schema_violation", "detail": e.message},
+                fields={"reason": "schema_violation", "error_type": type(e).__name__},
             )
             return JSONResponse(
                 status_code=422,

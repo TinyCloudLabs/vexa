@@ -30,7 +30,7 @@ export async function prepareForRecording(page: Page, botConfig: BotConfig): Pro
     try {
       return Boolean(await page.evaluate(googleLeaveBrowserClick, googleLeaveButtonMatchers));
     } catch (err: any) {
-      log(`[performLeaveAction] browser leave click failed: ${err?.message}`);
+      log(`[performLeaveAction] browser leave click failed`);
       return false;
     }
   });

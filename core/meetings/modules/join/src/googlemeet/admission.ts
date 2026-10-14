@@ -145,7 +145,7 @@ export async function classifyGoogleRejection(
     captchaSuppressionSince.delete(page as unknown as object);
     return { rejected: false, reason: null, selector: null };
   } catch (error: any) {
-    log(`Error checking for Google Meet rejection: ${error.message}`);
+    log(`Error checking for Google Meet rejection (${error?.name ?? "Error"})`);
     return { rejected: false, reason: null, selector: null };
   }
 }
@@ -187,19 +187,14 @@ export async function countRealParticipantTiles(page: Page): Promise<number> {
 export async function dumpAdmissionState(page: Page, tag: string): Promise<void> {
   if (!process.env.DEBUG_ADMISSION) return;
   try {
-    const url = page.url();
-    const wr = await checkForWaitingRoomIndicators(page).catch(() => null);
-    const pid = await page.locator("[data-participant-id]").evaluateAll(
-      els => els.map(e => ({ id: e.getAttribute("data-participant-id"), label: e.getAttribute("aria-label") || (e.textContent || "").trim().slice(0, 30) })),
-    ).catch(() => []);
-    const self = await page.locator("[data-self-name]").evaluateAll(
-      els => els.map(e => e.getAttribute("data-self-name") || ""),
-    ).catch(() => []);
+    const waitingRoom = await checkForWaitingRoomIndicators(page).catch(() => null);
+    const participantCount = await page.locator("[data-participant-id]").count().catch(() => 0);
+    const selfCount = await page.locator("[data-self-name]").count().catch(() => 0);
     const recaptchaFrames = page.frames().filter(f => (f.url() || "").includes("/recaptcha/")).length;
     const realTiles = await countRealParticipantTiles(page);
-    log(`🔎 [ADMIT-DUMP ${tag}] url=${url} waitingRoom=${wr} realTiles=${realTiles} participantTiles=${pid.length} ${JSON.stringify(pid)} selfName=${self.length}${self.length ? " " + JSON.stringify(self) : ""} recaptchaFrames=${recaptchaFrames}`);
-  } catch (e: any) {
-    log(`🔎 [ADMIT-DUMP ${tag}] dump error: ${e?.message}`);
+    log(`🔎 [ADMIT-DUMP ${tag}] waitingRoom=${waitingRoom} realTiles=${realTiles} participantTiles=${participantCount} selfNameCount=${selfCount} recaptchaFrames=${recaptchaFrames}`);
+  } catch (e: unknown) {
+    log(`🔎 [ADMIT-DUMP ${tag}] dump error (${e instanceof Error ? e.name : "UnknownError"})`);
   }
 }
 
@@ -373,7 +368,7 @@ export async function waitForGoogleMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully (immediate admission)");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing.`);
       }
       
       log("Successfully admitted to the Google Meet meeting - no waiting room required");
@@ -410,7 +405,7 @@ export async function waitForGoogleMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing with admission wait...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing with admission wait.`);
       }
       
       stillInWaitingRoom = true;
@@ -505,7 +500,7 @@ export async function waitForGoogleMeetingAdmission(
             await callAwaitingAdmissionCallback(botConfig);
             log("Awaiting admission callback sent successfully (during polling)");
           } catch (callbackError: any) {
-            log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing...`);
+              log(`Warning: Failed to send awaiting admission callback. Continuing.`);
           }
 
           stillInWaitingRoom = true;

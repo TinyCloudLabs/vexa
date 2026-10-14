@@ -177,7 +177,7 @@ export function speakerStreamConfigFromEnv(
     const valid = Number.isFinite(value) && value > 0 &&
       (property !== 'confirmThreshold' || Number.isInteger(value));
     if (!valid) {
-      warn(`${key}=${JSON.stringify(raw)} is invalid; using the built-in speaker-stream default`);
+      warn(`${key} is invalid (value_length=${raw.length}); using the built-in speaker-stream default`);
       continue;
     }
     config[property] = value;

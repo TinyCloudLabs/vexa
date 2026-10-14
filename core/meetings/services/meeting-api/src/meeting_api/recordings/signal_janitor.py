@@ -118,7 +118,7 @@ async def sweep_signal_tapes(
                 log_event(
                     "signal_tape_evict_failed", audience="operator", level="warning",
                     span="recordings.signal.janitor",
-                    fields={"key": key, "error": str(e)},
+                    fields={"error_type": type(e).__name__},
                 )
         if failed:
             # A partially-deleted tape is already unusable, but do NOT count bytes we may not have

@@ -46,7 +46,7 @@ export async function checkForTeamsRejection(page: Page): Promise<boolean> {
     }
     return false;
   } catch (error: any) {
-    log(`Error checking for Teams rejection: ${error.message}`);
+    log(`Error checking for Teams rejection`);
     return false;
   }
 }
@@ -161,7 +161,7 @@ export async function waitForTeamsMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing with admission wait...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing with admission wait...`);
       }
 
       stillInWaitingRoom = true;
@@ -321,7 +321,7 @@ export async function waitForTeamsMeetingAdmission(
             await callAwaitingAdmissionCallback(botConfig);
             log("Awaiting admission callback sent successfully");
           } catch (callbackError: any) {
-            log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}`);
+            log(`Warning: Failed to send awaiting admission callback`);
           }
 
           // Wait for admission in the lobby

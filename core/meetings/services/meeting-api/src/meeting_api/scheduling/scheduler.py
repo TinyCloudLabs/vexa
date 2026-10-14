@@ -168,14 +168,14 @@ class Scheduler:
                 self._executing.pop(job_id, None)
                 self._jobs[json.dumps(job)] = self.clock.now() + delay
                 logger.warning(
-                    "job %s attempt %d/%d failed (%s), retry in %ss",
-                    job_id, attempt, max_attempts, e, delay,
+                    "job %s attempt %d/%d failed, retry in %ss",
+                    job_id, attempt, max_attempts, delay,
                 )
                 return
             job["status"] = "failed"
             job["error"] = str(e)
             job["failed_at"] = self.clock.now()
-            logger.error("job %s permanently failed after %d attempts: %s", job_id, max_attempts, e)
+            logger.error("job %s permanently failed after %d attempts", job_id, max_attempts)
 
         self._executing.pop(job_id, None)
         self._history[job_id] = json.dumps(job)

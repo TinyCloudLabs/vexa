@@ -395,7 +395,7 @@ async def _terminalize_as_stopped(
         )
     except Exception as e:  # noqa: BLE001 — reconcile backstops; never mask the stop verdict
         log_event("bot_spawn_stop_terminalize_failed", audience="system", level="error",
-                  span="bots.create", meeting_id=str(meeting_id), fields={"error": str(e)})
+                  span="bots.create", meeting_id=str(meeting_id), fields={"error_type": type(e).__name__})
 
 
 async def request_bot(
@@ -839,12 +839,12 @@ async def request_bot(
             log_event(
                 "bot_spawn_fail_row_error", audience="system", level="error",
                 span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                fields={"error": str(fail_err)},
+                fields={"error_type": type(fail_err).__name__},
             )
         log_event(
             "bot_spawn_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-            fields={"reason": reason},
+            fields={"error_type": type(e).__name__},
         )
         raise
 
@@ -866,12 +866,12 @@ async def request_bot(
             log_event(
                 "bot_spawn_orphan_teardown_failed", audience="system", level="error",
                 span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                fields={"workload_id": workload_id, "error": str(teardown_err)},
+                fields={"workload_id": workload_id, "error_type": type(teardown_err).__name__},
             )
         log_event(
             "bot_spawn_post_spawn_db_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-            fields={"workload_id": workload_id, "error": str(e)},
+            fields={"workload_id": workload_id, "error_type": type(e).__name__},
         )
         raise SpawnFailed(
             f"post-spawn DB write failed; workload {workload_id} torn down"
@@ -906,7 +906,7 @@ async def request_bot(
         except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the spawn
             log_event("bot_spawn_raced_stop_teardown_failed", audience="system", level="error",
                       span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                      fields={"workload_id": workload_id, "error": str(teardown_err)})
+                      fields={"workload_id": workload_id, "error_type": type(teardown_err).__name__})
         if raced_stop:
             # The run is over before it began, and the row must SAY SO now rather than sit
             # non-terminal until a reaper guesses. Truthfully: `failed` (the FSM's only legal
@@ -920,7 +920,7 @@ async def request_bot(
     # USER-facing: a bot was requested for this user.
     log_event(
         "bot_join_requested", audience="user", span="bots.create",
-        user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+        user_id=user_id, meeting_id=str(meeting_id),
         fields={
             "platform": platform, "status": row.get("status", "requested"),
             "continued": reused_row is not None, "session_count": len(sessions),

@@ -385,8 +385,11 @@ def preflight(env: Optional[Mapping[str, str]] = None) -> dict:
     rows = capability_health(env, force_probe=True)
     for name, row in sorted(rows.items()):
         if row["state"] == MISCONFIGURED:
-            log.warning("config.v1 capability %s: MISCONFIGURED — %s", name,
-                        (row.get("probe") or {}).get("reason", "some-but-not-all keys set"))
+            probe = row.get("probe") or {}
+            log.warning(
+                "config.v1 capability %s: MISCONFIGURED (probe_kind=%s status=%s)",
+                name, probe.get("kind", "unknown"), probe.get("status", "unknown"),
+            )
         else:
             log.info("config.v1 capability %s: %s", name, row["state"])
     return {"service": decl.get("service"), "capabilities": rows}

@@ -152,7 +152,7 @@ def _log_publish_failure(meeting_id: int, e: Exception) -> None:
         from ..obs import log_event
 
         log_event("segment_publish_failed", audience="system", level="warning",
-                  span="collector.ingest", fields={"meeting_id": meeting_id, "error": str(e)})
+                  span="collector.ingest", fields={"meeting_id": meeting_id, "error_type": type(e).__name__})
     except Exception:  # noqa: BLE001
         pass
 

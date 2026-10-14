@@ -37,12 +37,11 @@ export function startJitsiRemovalMonitor(
     try { return new URL(page.url()).origin; } catch { return null; }
   })();
 
-  const triggerRemoval = async (reason: string) => {
+  const triggerRemoval = async (_reason: string) => {
     if (stopped) return;
     stopped = true;
     const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
-    log(`[Jitsi] REMOVAL TRIGGERED (${elapsed}s after join): ${reason}`);
-    log(`[Jitsi] Current URL at removal: ${page.url()}`);
+    log(`[Jitsi] REMOVAL TRIGGERED (${elapsed}s after join)`);
     onRemoval && await onRemoval();
   };
 

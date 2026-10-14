@@ -35,14 +35,11 @@ export function startZoomRemovalMonitor(
   const joinedAtMs = Date.now();
   const GRACE_PERIOD_MS = 20_000; // 20s grace — Zoom audio init can take 10-15s with slow networks
 
-  const triggerRemoval = async (reason: string) => {
+  const triggerRemoval = async (_reason: string) => {
     if (stopped) return;
     stopped = true;
     const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
-    log(`[Zoom Web] REMOVAL TRIGGERED (${elapsed}s after join): ${reason}`);
-    log(`[Zoom Web] Current URL at removal: ${page.url()}`);
-    const title = await page.title().catch(() => '<unknown>');
-    log(`[Zoom Web] Current title at removal: "${title}"`);
+    log(`[Zoom Web] REMOVAL TRIGGERED (${elapsed}s after join)`);
     onRemoval && await onRemoval();
   };
 
@@ -54,30 +51,27 @@ export function startZoomRemovalMonitor(
     if (!url || url.startsWith('about:')) return;
     const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
 
-    // Grace period: Zoom performs internal redirects during audio init handshake
-    // right after join. Ignore navigations during this window to avoid false ejection.
     if (Date.now() - joinedAtMs < GRACE_PERIOD_MS) {
-      log(`[Zoom Web] Ignoring navigation during grace period (${elapsed}s after join): ${url}`);
+      log(`[Zoom Web] Ignoring navigation during grace period (${elapsed}s after join)`);
       return;
     }
 
     // Always ignore known audio-init redirect URLs regardless of grace period.
     // These patterns appear during Zoom's audio handshake which can extend beyond the grace window.
     if (isZoomAudioInitUrl(url)) {
-      log(`[Zoom Web] Ignoring audio-init redirect URL (${elapsed}s after join): ${url}`);
+      log(`[Zoom Web] Ignoring audio-init redirect URL (${elapsed}s after join)`);
       return;
     }
 
     // Any navigation away from the zoom.us domain means the meeting ended
     // (covers company SSO redirects, homepages, sign-in pages, etc.)
     if (!/zoom\.(us|com|eu|com\.cn|com\.br|com\.au|de|fr|jp|ca|co\.uk)\b/.test(url)) {
-      triggerRemoval(`Navigation away from Zoom domain: ${url}`);
+      triggerRemoval('navigation-away');
     } else if (url.includes('/signin') || url.includes('/login')) {
-      // Explicit sign-in redirect — meeting definitely ended
-      triggerRemoval(`Navigation to Zoom sign-in: ${url}`);
+      triggerRemoval('sign-in-redirect');
     } else if (url.includes('/wc/') && !url.includes('/meeting')) {
       // Non-meeting /wc/ URL — but only if it's not a known init pattern
-      log(`[Zoom Web] Suspicious non-meeting /wc/ URL (${elapsed}s after join): ${url} — deferring to polling`);
+      log(`[Zoom Web] Suspicious non-meeting /wc/ URL (${elapsed}s after join) — deferring to polling`);
       // Don't trigger immediately — let the polling loop confirm via Leave button absence
     }
   };
@@ -124,11 +118,11 @@ export function startZoomRemovalMonitor(
       const leaveVisible = await page.locator(zoomLeaveButtonSelector).first()
         .isVisible({ timeout: 300 }).catch(() => false);
       if (!leaveVisible) {
-        consecutiveLeaveButtonMisses++;
         const url = page.url();
         const title = await page.title().catch(() => '');
+        consecutiveLeaveButtonMisses++;
         const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
-        log(`[Zoom Web] Leave button miss #${consecutiveLeaveButtonMisses} (${elapsed}s after join) — URL: ${url}, title: "${title}"`);
+        log(`[Zoom Web] Leave button miss #${consecutiveLeaveButtonMisses} (${elapsed}s after join)`);
 
         // During grace period or on audio-init URLs, don't act on Leave button absence.
         // Zoom's UI hasn't fully loaded yet — Leave button simply doesn't exist.

@@ -435,7 +435,7 @@ def _mount_lifecycle(
             log_event(
                 "lifecycle_event_rejected", audience="system", level="warning",
                 span="lifecycle.callback",
-                fields={"reason": "schema_violation", "detail": e.message},
+                fields={"reason": "schema_violation", "error_type": type(e).__name__},
             )
             return (
                 422,
@@ -470,7 +470,7 @@ def _mount_lifecycle(
                 except Exception as e:  # noqa: BLE001 — rehydration is best-effort
                     persisted = None
                     log_event("lifecycle_rehydrate_failed", audience="system", level="warning",
-                              span="lifecycle.callback", fields={"error": str(e)})
+                              span="lifecycle.callback", fields={"error_type": type(e).__name__})
                 if persisted:
                     sink.store.rehydrate(
                         connection_id,
@@ -497,7 +497,7 @@ def _mount_lifecycle(
                     )
                 except Exception as refresh_error:  # noqa: BLE001 — preserve truthful 409 below
                     log_event("lifecycle_refresh_failed", audience="system", level="warning",
-                              span="lifecycle.callback", fields={"error": str(refresh_error)})
+                              span="lifecycle.callback", fields={"error_type": type(refresh_error).__name__})
             if persisted:
                 sink.store.rehydrate(
                     connection_id,
@@ -552,7 +552,7 @@ def _mount_lifecycle(
                 )
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
-                          span="lifecycle.callback", fields={"error": str(e)})
+                          span="lifecycle.callback", fields={"error_type": type(e).__name__})
         # COMPLETION FINALIZATION — the moment the FSM lands on a terminal status, flush the
         # meeting's remaining live redis segments to the durable store (threshold 0: the mutable
         # tail included, no more updates are coming) and persist the processed doc into
@@ -607,7 +607,7 @@ def _mount_lifecycle(
                     pass
                 log_event("transcript_finalize_failed", audience="system", level="warning",
                           span="lifecycle.callback",
-                          fields={"meeting_id": terminal_meeting_id, "error": str(e)})
+                          fields={"meeting_id": terminal_meeting_id, "error_type": type(e).__name__})
         if terminal_advanced and isinstance(meeting_row, dict):
             data = dict(meeting_row.get("data") or {})
             provenance = build_service_provenance({**meeting_row, "data": data})
@@ -637,7 +637,7 @@ def _mount_lifecycle(
                         audience="system",
                         level="warning",
                         span="lifecycle.callback",
-                        fields={"meeting_id": meeting_row.get("id"), "error": str(e)},
+                        fields={"meeting_id": meeting_row.get("id"), "error_type": type(e).__name__},
                     )
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
@@ -790,7 +790,7 @@ def _mount_lifecycle(
                                 "event_type": env.get("event_type"),
                                 "target_host": _webhook_target_host(url),
                                 "status_code": result.status_code,
-                                "error": result.error,
+                                "error": result.error is not None,
                             },
                         )
                         # #841: ALSO record the outcome in the per-user delivery ledger — the
@@ -817,10 +817,10 @@ def _mount_lifecycle(
                             except Exception as le:  # noqa: BLE001 — ledger is best-effort
                                 log_event("webhook_ledger_failed", audience="system",
                                           level="warning", span="lifecycle.callback",
-                                          fields={"error": str(le)})
+                                          fields={"error_type": type(le).__name__})
                     except Exception as e:  # noqa: BLE001 — delivery is best-effort
                         log_event("webhook_deliver_failed", audience="system", level="warning",
-                                  span="lifecycle.callback", fields={"error": str(e)})
+                                  span="lifecycle.callback", fields={"error_type": type(e).__name__})
         # Publish each persisted FSM advance to bm:meeting:{id}:status in the canonical 0.10.6 WS
         # contract shape (the source of truth; api-gateway forwards the redis payload verbatim):
         #   {type:"meeting.status", meeting:{id,platform,native_id}, payload:{status}, user_id, ts}
@@ -848,7 +848,7 @@ def _mount_lifecycle(
                     await redis.publish(f"bm:meeting:{meeting_id}:status", _json.dumps(frame))
                 except Exception as e:  # noqa: BLE001 — publish is best-effort
                     log_event("ws_status_publish_failed", audience="system", level="warning",
-                              span="lifecycle.callback", fields={"error": str(e)})
+                              span="lifecycle.callback", fields={"error_type": type(e).__name__})
                 # ALSO publish the FLAT frame to the USER-scoped channel u:{user_id}:meetings so the
                 # terminal's list surface gets every bot-FSM transition over WS (superset of bm:; it
                 # also carries the pre-FSM idle/scheduled states). KEEP bm: above for the open-meeting
@@ -869,7 +869,7 @@ def _mount_lifecycle(
                     except Exception as e:  # noqa: BLE001 — publish is best-effort
                         log_event("user_meeting_status_publish_failed", audience="system",
                                   level="warning", span="lifecycle.callback",
-                                  fields={"error": str(e)})
+                                  fields={"error_type": type(e).__name__})
         # COPILOT REAP (Bug 3): the moment a meeting lands TERMINAL, emit the `session_end` marker onto
         # the meeting copilot transcript feed — the EXACT stream the meeting copilot worker
         # (agent worker/meeting.py, via VEXA_TRANSCRIPT_STREAM) blocks on. The worker reaps immediately
@@ -903,17 +903,17 @@ def _mount_lifecycle(
                     )
                     log_event(
                         "meeting_copilot_reap_signalled", audience="system", span="lifecycle.callback",
-                        meeting_id=rec.connection_id,
-                        fields={"meeting_row_id": meeting_row_id, "native": native,
+                        meeting_id=meeting_row_id,
+                        fields={"meeting_row_id": meeting_row_id,
                                 "meeting_status": rec.status.value},
                     )
                 except Exception as e:  # noqa: BLE001 — the worker's idle timeout is the backstop
                     log_event("meeting_copilot_reap_failed", audience="system", level="warning",
                               span="lifecycle.callback",
-                              fields={"meeting_row_id": meeting_row_id, "error": str(e)})
+                              fields={"meeting_row_id": meeting_row_id, "error_type": type(e).__name__})
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
-            meeting_id=rec.connection_id,
+            meeting_id=meeting_row.get("id") if isinstance(meeting_row, dict) else None,
             fields={"meeting_status": rec.status.value if rec.status else None},
         )
         return (
@@ -1003,7 +1003,7 @@ def _mount_lifecycle(
             )
         except Exception as e:  # noqa: BLE001 — the runtime ACK must never fail on the terminal backstop
             log_event("runtime_callback_terminal_error", audience="system", level="warning",
-                      span="runtime.callback", fields={"error": str(e)})
+                      span="runtime.callback", fields={"error_type": type(e).__name__})
         return JSONResponse(status_code=200, content={"status": "accepted"})
 
 

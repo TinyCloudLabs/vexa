@@ -107,7 +107,7 @@ export async function joinZoomMeeting(
 
   const rawUrl = meetingUrl;
   const webClientUrl = buildZoomWebClientUrl(rawUrl);
-  log(`[Zoom Web] Navigating to web client: ${webClientUrl}`);
+  log('[Zoom Web] Navigating to web client (URL redacted)');
 
   // Retry loop: if host hasn't started the meeting yet, page title = "Error - Zoom"
   // and body contains "This meeting link is invalid". Poll until the pre-join page appears.

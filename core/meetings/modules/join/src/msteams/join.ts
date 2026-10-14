@@ -44,7 +44,7 @@ async function warmUpTeamsMediaDevices(page: Page): Promise<void> {
     });
     log(`[Teams Join] ${result}`);
   } catch (err: any) {
-    log(`[Teams Join] Media warm-up evaluate failed: ${err?.message || err}`);
+    log(`[Teams Join] Media warm-up evaluate failed`);
   }
 }
 
@@ -97,7 +97,7 @@ async function waitForTeamsPreJoinReadiness(
         await page.locator(continueWithoutMediaSelector).first().click({ timeout: 5000 });
         log('✅ Dismissed "Continue without audio or video" modal');
       } catch (err: any) {
-        log(`ℹ️ Could not click "Continue without audio or video": ${err?.message || err}`);
+        log(`Could not click the Teams continue control`);
       }
       await page.waitForTimeout(500);
       continue;
@@ -154,7 +154,7 @@ async function waitForTeamsPreJoinReadiness(
   const finalUrl = page.url();
   const offMeeting = classifyNonMeetingUrl(finalUrl, requestedHost);
   if (offMeeting) throw offMeeting;
-  log(`⚠️ Timed out waiting for Teams pre-join readiness after ${timeoutMs}ms (url=${redactUrl(finalUrl)})`);
+  log(`Timed out waiting for Teams pre-join readiness after ${timeoutMs}ms`);
   return false;
 }
 
@@ -165,10 +165,8 @@ export async function joinMicrosoftTeams(
   botConfig: BotConfig
 ): Promise<void> {
   // Step 1: Navigate to Teams meeting.
-  // Logged REDACTED (origin + path): a Teams short link carries the meeting passcode in its
-  // `?p=` query, and bot logs are read by humans and shipped off-box. Same rule the redirect
-  // errors already follow — the query is dropped whole rather than filtered key by key.
-  log(`Step 1: Navigating to Teams meeting: ${redactUrl(meetingUrl)}`);
+  // Meeting URLs contain native meeting codes and signed join parameters.
+  log('Step 1: Navigating to Teams meeting (URL redacted)');
   await page.goto(meetingUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(500);
 
@@ -276,7 +274,7 @@ export async function joinMicrosoftTeams(
       });
     });
   } catch (error: any) {
-    log(`ℹ️ Could not enforce Computer audio: ${error.message}. Continuing...`);
+    log(`Could not enforce Computer audio. Continuing...`);
   }
 
   log("Step 6: Clicking 'Join now' to enter the meeting...");

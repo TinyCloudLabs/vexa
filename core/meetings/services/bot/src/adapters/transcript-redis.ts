@@ -171,7 +171,7 @@ export function redisClientFrom(redisUrl: string): LiveRedisTranscriptClient {
   const client = createClient({ url: redisUrl });
   // node-redis emits 'error' events; without a listener an unreachable server throws unhandled.
   client.on('error', (err: unknown) => {
-    console.error(`[bot] redis (transcript) error: ${(err as Error)?.message ?? String(err)}`);
+    console.error('[bot] redis (transcript) error');
   });
   // Idempotent lazy connect (shared with the acts subscriber): concurrent first-use callers share
   // ONE connect(), so the "Socket already opened" first-use race can't recur. See redis-lazy-connect.ts.

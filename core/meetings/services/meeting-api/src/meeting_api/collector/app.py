@@ -101,7 +101,7 @@ async def _publish_user_meeting_status(
         await redis.publish(f"u:{user_id}:meetings", _json.dumps(frame))
     except Exception as e:  # noqa: BLE001 — publish is best-effort
         log_event("user_meeting_status_publish_failed", audience="system", level="warning",
-                  span="meetings.intent.publish", fields={"error": str(e)})
+                  span="meetings.intent.publish", fields={"error_type": type(e).__name__})
 
 
 def _resolve_user_id(x_user_id: Optional[str]) -> int:
@@ -222,7 +222,7 @@ def build_router(
                 level="warning",
                 span="transcripts.get",
                 user_id=user_id,
-                meeting_id=f"{platform}/{native_meeting_id}",
+                meeting_id=None,
             )
             raise HTTPException(
                 status_code=404,
@@ -234,7 +234,7 @@ def build_router(
             audience="user",
             span="transcripts.get",
             user_id=user_id,
-            meeting_id=f"{platform}/{native_meeting_id}",
+            meeting_id=None,
             fields={"segments": len(doc.get("segments", []))},
         )
         return JSONResponse(content=doc)
@@ -879,7 +879,7 @@ def build_router(
             log_event(
                 "participants_not_found", audience="system", level="warning",
                 span="meetings.participants", user_id=user_id,
-                meeting_id=f"{platform}/{native_meeting_id}",
+                meeting_id=None,
             )
             raise HTTPException(
                 status_code=404,
@@ -907,7 +907,7 @@ def build_router(
         sources = sorted({p["source"] for p in participants})
         log_event(
             "participants_served", audience="user", span="meetings.participants",
-            user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+            user_id=user_id, meeting_id=None,
             fields={"count": len(participants), "sources": ",".join(sources)},
         )
         return JSONResponse(content={
@@ -946,7 +946,7 @@ def build_router(
             )
         log_event(
             "meeting_workspace_bound", audience="user", span="meetings.workspace.bind",
-            user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+            user_id=user_id, meeting_id=None,
             fields={"workspace_id": workspace_id},
         )
         return JSONResponse(content={"workspace_id": bound})
@@ -1074,12 +1074,12 @@ def build_router(
             log_event(
                 "transcript_share_mint_failed", audience="system", level="warning",
                 span="meetings.transcript.share", user_id=user_id,
-                meeting_id=f"{platform}/{native_meeting_id}",
+                meeting_id=None,
                 fields={"mode": mode, "reason": "no meeting addressed by this (platform, native) pair"},
             )
             raise HTTPException(status_code=404, detail=f"Meeting not found for {platform}/{native_meeting_id}")
         log_event("transcript_share_minted", audience="user", span="meetings.transcript.share",
-                  user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+                  user_id=user_id, meeting_id=None,
                   fields={"mode": mode, "by": "pair"})
         return JSONResponse(content=minted)
 
@@ -1145,7 +1145,7 @@ def build_router(
             )
         log_event(
             "meeting_doc_connected", audience="user", span="meetings.docs.connect",
-            user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+            user_id=user_id, meeting_id=None,
             fields={"path": path, "docs": len(docs)},
         )
         return JSONResponse(content={"docs": docs})
@@ -1179,7 +1179,7 @@ def build_router(
             )
         log_event(
             "meeting_doc_disconnected", audience="user", span="meetings.docs.disconnect",
-            user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+            user_id=user_id, meeting_id=None,
             fields={"path": resolved, "docs": len(docs)},
         )
         return JSONResponse(content={"docs": docs})
@@ -1233,7 +1233,7 @@ def build_router(
             )
         log_event(
             "meeting_intent_set", audience="user", span="meetings.intent.set",
-            user_id=user_id, meeting_id=f"{platform}/{native_meeting_id}",
+            user_id=user_id, meeting_id=None,
             fields={"intent": intent, "scheduled_at": result.get("scheduled_at"),
                     "changed": result.get("changed")},
         )

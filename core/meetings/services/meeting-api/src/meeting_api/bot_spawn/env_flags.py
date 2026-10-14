@@ -43,9 +43,9 @@ def env_flag(name: str, default: bool = True, raw: Optional[str] = None) -> bool
     if v in _FALSE:
         return False
     log.warning(
-        "%s=%r is not a recognized boolean (%s / %s) — keeping the default %s. "
+        "%s value is not a recognized boolean (value_length=%d) — keeping the default %s. "
         "An unrecognized value is not an explicit opt-out.",
-        name, value, "/".join(_TRUE), "/".join(_FALSE), default,
+        name, len(value), default,
     )
     return default
 

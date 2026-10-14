@@ -61,7 +61,7 @@ function consoleLifecycleSink(): LifecycleSink {
  *  the orchestrator drives to a clean terminal `failed`(join_failure) instead of the root crashing. */
 function noBrowserJoinDriver(reason: string): JoinDriver {
   return {
-    async join() { console.error(`[bot] no browser session: ${reason}`); return { outcome: 'error', reason: `no browser session: ${reason}` }; },
+    async join() { console.error('[bot] no browser session'); return { outcome: 'error', reason: `no browser session: ${reason}` }; },
     onRemoval() { return () => { /* */ }; },
     async leave() { /* */ },
     async withdraw() { /* no browser — nothing to withdraw */ },
@@ -112,8 +112,8 @@ function teeActs(source: ActsSource, voice: (act: Act) => void | Promise<void>):
   return {
     subscribe(handler) {
       return source.subscribe((act) => {
-        void Promise.resolve(handler(act)).catch((e) => console.error(`[bot] acts: orchestrator handler rejected: ${String(e)}`));
-        void Promise.resolve(voice(act)).catch((e) => console.error(`[bot] acts: voice handler rejected: ${String(e)}`));
+        void Promise.resolve(handler(act)).catch(() => console.error('[bot] acts: orchestrator handler rejected'));
+        void Promise.resolve(voice(act)).catch(() => console.error('[bot] acts: voice handler rejected'));
       });
     },
   };
@@ -158,8 +158,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       // No valid connection_id to attribute the failure to → emit a best-effort terminal
       // event and exit non-zero. We have no validated callbackUrl yet, so this goes to the
       // console sink. (The live HTTP sink would POST validation_error once a URL is known.)
-      console.error(`[bot] FATAL ${e.message}`);
-      consoleLifecycleSink().emit({ connection_id: env.VEXA_CONNECTION_ID ?? '', status: 'failed', failure_stage: 'requested', completion_reason: 'validation_error', reason: e.message, exit_code: 1 }).catch(() => {});
+      console.error('[bot] FATAL validation_error');
+      consoleLifecycleSink().emit({ connection_id: env.VEXA_CONNECTION_ID ?? '', status: 'failed', failure_stage: 'requested', completion_reason: 'validation_error', reason: 'validation_error', exit_code: 1 }).catch(() => {});
       return 1;
     }
     throw e;
@@ -245,7 +245,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       config: speakerStreamConfig,
       // Every STT fault is counted and carried out on the terminal lifecycle event (see
       // sttFaults). Logging it here as well keeps the raw line for anyone tailing the container.
-      onError: (e) => { sttFaults.record(e); console.error(`[bot] pipeline fault: ${String(e)}`); },
+      onError: (e) => { sttFaults.record(e); console.error('[bot] pipeline fault'); },
       // The lane's own observations — today, WHICH TURN SPINE it is running on and why that
       // changed. A transcript carries no trace of that, so without this line a stored fixture
       // cannot say whether it is scoring the transport anchor or the fallback that replaced it.
@@ -266,7 +266,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     restartCapture = () => {
       void restartMixedCapture(sess.page)
         .then((requested) => console.log(`[bot] capture restart ${requested ? 'requested' : 'not applicable (no mixed rescan)'}`))
-        .catch((e) => console.error(`[bot] capture restart failed: ${String(e)}`));
+        .catch(() => console.error('[bot] capture restart failed'));
     };
     // In-meeting chat (jitsi lane) → a transcript.v1 `chat` segment: the sender is the
     // speaker, the wall clock is the timing (epoch seconds, like the audio lanes), and
@@ -285,12 +285,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         source: 'chat',
         absolute_start_time: new Date(nowMs).toISOString(),
         absolute_end_time: new Date(nowMs).toISOString(),
-      }).catch((e) => console.error(`[bot] chat publish rejected: ${String(e)}`));
+      }).catch(() => console.error('[bot] chat publish rejected'));
     };
     // #593: a post-admission subsystem failure must NEVER self-evict. createLivePipeline wraps the
     // page-side capture + recording attach + the engine start so pipeline.start() ALWAYS RESOLVES;
-    // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
-    // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
+    // each failure surfaces with a stable error code instead of provider error text.
     pipeline = createLivePipeline({
       startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
@@ -312,8 +311,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     const speak = createSpeakController(session.page, inv);
     acts = teeActs(liveActs, voiceHandler(speak));
   } catch (e) {
-    console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
-    join = noBrowserJoinDriver(String(e));
+    console.error('[bot] browser launch/capture wiring failed — falling back to clean terminal failed');
+    join = noBrowserJoinDriver('browser setup failed');
     pipeline = noBrowserPipeline();
     acts = liveActs;
   }
@@ -410,5 +409,5 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
 
 // Worker entrypoint: boot, work, emit, die (P7).
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((code) => process.exit(code)).catch((e) => { console.error(e); process.exit(1); });
+  main().then((code) => process.exit(code)).catch(() => { console.error('[bot] fatal worker failure'); process.exit(1); });
 }

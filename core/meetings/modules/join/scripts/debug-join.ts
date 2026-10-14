@@ -90,9 +90,8 @@ if (!isMeetUrl && !isTeamsUrl && !isZoomUrl) {
   const view = await startDebugView();
   console.log("\n────────────────────────────────────────────");
   console.log(" DEBUG VIEW");
-  if (view.novncUrl) console.log("  human (pixels):  " + view.novncUrl);
-  else               console.log("  human (pixels):  headed window on this desktop");
-  console.log("  agent (control): playwright connectOverCDP(\"" + view.cdpUrl + "\")");
+  console.log(view.novncUrl ? "  human (pixels): available" : "  human (pixels): headed window on this desktop");
+  console.log("  agent (control): available");
   console.log("────────────────────────────────────────────\n");
 
   // Teams admission throws on rejection/timeout (monolith behavior) — catch so
@@ -105,11 +104,11 @@ if (!isMeetUrl && !isTeamsUrl && !isZoomUrl) {
       authenticated: !!AUTH_PROFILE,
       debug: true,
       hooks: {
-        onState: (s, d) => console.log(`\n>>> [JOIN-STATE] ${s}${d ? " — " + JSON.stringify(d) : ""}\n`),
+        onState: (s, d) => console.log(`\n>>> [JOIN-STATE] ${s} has_detail=${!!d}\n`),
       },
     });
   } catch (err: any) {
-    console.error(`\n=== JOIN ERROR: ${err?.message || err} ===`);
+    console.error("\n=== JOIN ERROR: join failed ===");
     result = { admitted: false, state: "error" };
   }
 

@@ -479,7 +479,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     let reportChain: Promise<void> = Promise.resolve();
     const report = (s: BotStatus): Promise<void> => {
       reportChain = reportChain.then(() => emit(s)).catch((e) => {
-        console.error(`[bot] lifecycle report '${s}' rejected: ${String(e)}`);
+        console.error(`[bot] lifecycle report '${s}' rejected`);
       });
       return reportChain;
     };
@@ -730,7 +730,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       await emit('completed', { completion_reason: reason, exit_code: 0 });
       console.error('[bot] orchestrator: completed emitted + flushed');
     } catch (e) {
-      console.error(`[bot] orchestrator: completed emit THREW: ${String(e)}`);
+      console.error('[bot] orchestrator: completed emit failed');
       throw e;
     }
     return { exitCode: 0, status: 'completed', completionReason: reason };

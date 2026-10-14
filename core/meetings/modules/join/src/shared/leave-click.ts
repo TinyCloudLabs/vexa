@@ -45,7 +45,7 @@ export async function leaveBrowserClick(
     } catch (e: any) {
       // The selector-validity gate CSS-parses every declared browser-context
       // entry, so this only fires on drift — loudly, never silently.
-      blog(`[leave] selector failed in browser context: ${scope} — ${e?.message}`);
+      blog(`[leave] selector failed in browser context: ${scope}`);
       continue;
     }
     const needle = matcher.text === undefined ? null : normalize(matcher.text);

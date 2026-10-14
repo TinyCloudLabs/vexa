@@ -23,7 +23,7 @@ export async function prepareForRecording(page: Page, botConfig: BotConfig): Pro
     try {
       return Boolean(await page.evaluate(leaveBrowserClick, teamsLeaveButtonMatchers));
     } catch (err: any) {
-      log(`[performLeaveAction] browser leave click failed: ${err?.message}`);
+      log(`[performLeaveAction] browser leave click failed`);
       return false;
     }
   });
@@ -113,7 +113,7 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
         return true;
       }
     } catch (hangupError: any) {
-      log(`[leaveMicrosoftTeams] Could not click ${teamsPrimaryHangupButtonSelector} with Playwright: ${hangupError.message}`);
+      log(`[leaveMicrosoftTeams] Could not click the primary hangup button with Playwright`);
     }
 
     // Fallback to browser-side click method for other selectors
@@ -139,7 +139,7 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
     // Ensure we return a boolean, not undefined
     return result === true;
   } catch (error: any) {
-    log(`[leaveMicrosoftTeams] Error calling performLeaveAction in browser: ${error.message}`);
+    log(`[leaveMicrosoftTeams] Error calling performLeaveAction in browser`);
     return false;
   }
 }

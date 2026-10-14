@@ -166,6 +166,7 @@ async def test_request_bot_eager_creates_session_and_spawns(monkeypatch):
 
 
 def test_iso_utc_marks_naive_utc_with_z():
+
     # Meeting time columns are naive but hold UTC. Serializing must emit a Z marker so a browser
     # parses it as UTC and renders local — a bare isoformat is read as LOCAL (the 6h-skew bug).
     from datetime import datetime, timezone
@@ -175,6 +176,30 @@ def test_iso_utc_marks_naive_utc_with_z():
     assert _iso_utc(datetime(2026, 7, 20, 1, 0, 0)) == "2026-07-20T01:00:00Z"
     assert _iso_utc(datetime(2026, 7, 20, 1, 0, 0, tzinfo=timezone.utc)) == "2026-07-20T01:00:00Z"
     assert _iso_utc(None) is None
+async def test_bot_spawn_info_log_redacts_user_content(monkeypatch, capsys):
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+    await request_bot(
+        InMemoryMeetingRepo(),
+        FakeRuntimeClient(),
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="xxx-xxxx-xxx",
+        bot_name="TC965_PARTICIPANT_CANARY",
+        meeting_url="https://meet.google.com/xxx-xxxx-xxx",
+        task="TC965_TRANSCRIPT_CANARY",
+        redis_url="redis://redis:6379/0",
+        meeting_api_url="http://meeting-api:8080",
+        token_secret=SECRET,
+    )
+    output = capsys.readouterr().out
+    assert '"event":"bot_join_requested"' in output
+    assert "TC965_PARTICIPANT_CANARY" not in output
+    assert "TC965_TRANSCRIPT_CANARY" not in output
+    assert "meet.google.com/xxx-xxxx-xxx" not in output
+    assert '"meeting_id":"1"' in output
+    assert SECRET not in output
+    assert "tok-test" not in output
 
 
 async def test_request_bot_dedup_raises(monkeypatch):

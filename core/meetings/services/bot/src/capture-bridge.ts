@@ -149,7 +149,7 @@ export function makeSpeakerHintSink(
       let t = tMs ?? Date.now();
       const skew = Math.abs(t - Date.now());
       if (skew > HINT_MAX_SKEW_MS) {
-        warn(`[bot] hint-clock-skew: hint tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (name=${name})`);
+        warn(`[bot] hint-clock-skew: timestamp outside the epoch audio clock; re-stamping`);
         t = Date.now();
       }
       if (telemetry?.captureHint) {
@@ -250,7 +250,7 @@ export function makeObservationSink(
       let t = tMs ?? Date.now();
       const skew = Math.abs(t - Date.now());
       if (skew > HINT_MAX_SKEW_MS) {
-        warn(`[bot] observation-clock-skew: tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (source=${source})`);
+        warn(`[bot] observation-clock-skew: timestamp outside the epoch audio clock; re-stamping`);
         t = Date.now();
       }
       const payload: Record<string, unknown> = obs && typeof obs === 'object'
@@ -310,7 +310,7 @@ export function makeCsrcSink(
       let t = tMs ?? Date.now();
       const skew = Math.abs(t - Date.now());
       if (skew > HINT_MAX_SKEW_MS) {
-        warn(`[bot] csrc-clock-skew: transition tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (csrc=${csrc})`);
+        warn(`[bot] csrc-clock-skew: timestamp outside the epoch audio clock; re-stamping`);
         t = Date.now();
       }
       const record: CsrcRecord = {
@@ -384,7 +384,7 @@ export function makeTeamsCaptionSink(
       let t = tMs ?? Date.now();
       const skew = Math.abs(t - Date.now());
       if (skew > HINT_MAX_SKEW_MS) {
-        warn(`[bot] caption-clock-skew: caption tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (name=${name})`);
+        warn(`[bot] caption-clock-skew: caption timestamp is not near the epoch audio clock; re-stamping`);
         t = Date.now();
       }
       const record: TeamsCaptionRecord = { type: 'caption', t, platform: 'teams', name, text, stable: stable !== false, lane: 'mixed' };
@@ -394,7 +394,7 @@ export function makeTeamsCaptionSink(
       }
       // Only a SETTLED caption is evidence: a mid-refinement entry can still change its author.
       if (record.stable && name) { try { consumeName?.(name, t); } catch { /* never break capture */ } }
-      log(`[bot] teams-caption ${record.stable ? 'stable' : 'partial'} ${name}: ${text.slice(0, 80)}`);
+      log(`[bot] teams-caption ${record.stable ? 'stable' : 'partial'} text_chars=${text.length} has_name=${Boolean(name)}`);
     },
   };
 }
@@ -507,7 +507,7 @@ export async function enableTeamsLiveCaptions(page: Page, log: (m: string) => vo
       await page.keyboard.press('Escape').catch(() => { /* best-effort */ });
       return { outcome: 'failed', reason: 'menu-item-not-found', detail: opened.available.slice(0, 300) };
     }
-    log(`[bot] teams-captions: clicked "${opened.clicked}" (${opened.path})`);
+    log(`[bot] teams-captions: menu action completed (${opened.path})`);
     await page.waitForTimeout(1000);
 
     if (opened.path === 'submenu') {
@@ -523,7 +523,7 @@ export async function enableTeamsLiveCaptions(page: Page, log: (m: string) => vo
         }
         return null;
       });
-      log(sub ? `[bot] teams-captions: clicked submenu "${sub}"` : '[bot] teams-captions: live-captions item not in the submenu');
+      log(sub ? '[bot] teams-captions: submenu action completed' : '[bot] teams-captions: submenu item unavailable');
       await page.waitForTimeout(1500);
     }
 
@@ -567,7 +567,7 @@ export async function runTeamsCaptionEnable(
       log(`[bot] teams-captions: enable ${last.outcome} on attempt ${i}/${attempts}`);
       return last;
     }
-    log(`[bot] teams-captions: enable attempt ${i}/${attempts} failed (${last.reason}) — ${last.detail ?? ''}`);
+    log(`[bot] teams-captions: enable attempt failed (attempt=${i}/${attempts})`);
     if (i < attempts) await page.waitForTimeout(waitBetweenMs).catch(() => { /* page may be closing */ });
   }
   const observation: TeamsCaptionsEnableFailedObservation = {
@@ -582,7 +582,7 @@ export async function runTeamsCaptionEnable(
   // Same line shape as the page-side caption observations, so the CC lane reads as one stream —
   // and into the fixture beside them, so a tape says whether captions were off because the tenant
   // blocks them or because our menu path rotted.
-  log(`[TeamsCaptions] observation ${JSON.stringify(observation)}`);
+  log(`[TeamsCaptions] observation outcome=failed attempts=${observation.attempts}`);
   try { onObservation?.('teams-captions', observation, observation.tMs); } catch { /* never breaks the join */ }
   log('[bot] teams-captions: could not switch captions on — continuing on the voice-level-outline '
     + 'watcher alone (the join and the transcript are unaffected)');
@@ -687,10 +687,10 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // calls window.logBot?.(...) ("stream N connected", "capture started with N stream(s)", …); without
   // exposing it those vanish and the capture is invisible. context.exposeFunction persists across the
   // navigation to the meeting URL. Also forward page console errors/capture markers so faults surface.
-  await context.exposeFunction('logBot', (m: string) => console.log(`[page] ${m}`)).catch(() => { /* already registered */ });
+  await context.exposeFunction('logBot', (m: string) => console.log(`[page] capture diagnostic received (message_chars=${m.length})`)).catch(() => { /* already registered */ });
   page.on('console', (msg) => {
     const t = msg.text();
-    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
+    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] message_chars=${t.length}`);
   });
 
   return {
@@ -707,7 +707,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
         try {
           syncBrowserDataToS3(s3Config, dataDir);
         } catch (e) {
-          console.error(`[bot] session write-back failed (durable copy stays at last restore): ${String(e)}`);
+          console.error('[bot] session write-back failed (durable copy stays at last restore)');
         }
       }
       removeProfileDir(dataDir);   // per-bot dir — leaking one per bot fills the disk in vexa-lite
@@ -763,7 +763,7 @@ export async function startCaptureBridge(
       const message = String(error);
       if (attributedFeedWarned.has(message)) return;
       attributedFeedWarned.add(message);
-      console.warn(`[bot] attributed-audio feed rejected: ${message}`);
+      console.warn('[bot] attributed-audio feed rejected');
     }
   };
 
@@ -821,7 +821,7 @@ export async function startCaptureBridge(
       });
     } catch (error) {
       const message = String(error);
-      if (!attributedFeedWarned.has(message)) { attributedFeedWarned.add(message); console.warn(`[bot] attributed-audio feed rejected: ${message}`); }
+      if (!attributedFeedWarned.has(message)) { attributedFeedWarned.add(message); console.warn('[bot] attributed-audio feed rejected'); }
     }
   };
   // mixed lane "who is lit" hint (Zoom/Teams active-speaker → the namer's time window).
@@ -884,7 +884,7 @@ export async function startCaptureBridge(
   });
   // jitsi chat → the embedder's sink (a transcript.v1 `chat` segment at the composition root).
   await page.exposeFunction('__vexaChatMessage', (sender: string, text: string): void => {
-    try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
+    try { onChat?.(sender, text); } catch { console.error('[bot] chat sink rejected'); }
   }).catch(() => { /* optional */ });
 
   // This wrapper lives at the producer boundary.  It admits both call count and PCM bytes before
@@ -1410,10 +1410,8 @@ export async function startCaptureBridge(
       mainAudioGraceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_GRACE_MS || 15000),
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
-      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006), channelBase }).catch((e) => {
-    console.error(attributed
-      ? '[bot] capture bridge: attributed page-side start failed'
-      : `[bot] capture bridge: page-side start failed: ${String(e)}`);
+      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006), channelBase }).catch(() => {
+    console.error('[bot] capture bridge: page-side start failed');
     // The regular capture lane may degrade in place, but an enabled durable attributed producer
     // cannot later close an empty-success manifest after its page initialization failed.
     if (attributed) throw new Error('attributed-audio capture start failed');
@@ -1681,10 +1679,10 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
   return {
     async speak(text: string, voice?: string): Promise<void> {
       if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return; }
-      console.log(`[bot] speak: "${text.slice(0, 60)}"`);
+      console.log(`[bot] speak: text_chars=${text.length}`);
       await setMic(true);                                     // (a) unmute the meeting-UI mic button
       // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
-      await tts.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
+      await tts.speak(text, voice).catch(() => console.error('[bot] speak: tts failed'));
       await setMic(false);                                    // (c) re-mute after the tail
     },
     async stop(): Promise<void> {

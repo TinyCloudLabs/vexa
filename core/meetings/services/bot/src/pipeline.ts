@@ -189,7 +189,7 @@ function laneSink(
       .then(() => publish(toBotSegment(seg)))
       .catch((e) => {
         try {
-          (onError ?? ((err) => console.error(`[bot] pipeline: transcript publish rejected: ${String(err)}`)))(e);
+          (onError ?? (() => console.error('[bot] pipeline: transcript publish rejected')))(e);
         } catch { /* reporting a publish fault must not prevent the drain from settling */ }
       })
       .finally(() => pending.delete(delivery));
@@ -217,7 +217,7 @@ function laneSink(
             new Error(`transcript publish drain exceeded ${drainMs}ms with ${pending.size} delivery(s) still pending`),
             { source: 'transcript' },
           );
-          console.error(`[bot] pipeline: ${fault.message}`);
+          console.error('[bot] pipeline: fault');
           try { onError?.(fault); } catch { /* fault reporting must not wedge teardown */ }
         }
       } finally {
@@ -327,7 +327,7 @@ function createTeamsBotPipeline(
   selfName?: string,
 ): BotPipeline {
   const hintCounters: HintCounters = { received: 0, matched: 0, missed: 0 };
-  const reportError = onError ?? ((error: unknown) => console.error(`[bot] pipeline(teams-csrc): ${String(error)}`));
+  const reportError = onError ?? (() => console.error('[bot] pipeline(teams-csrc): error'));
 
   const transcriber = createTranscriber({
     transcribe: (pcm, prompt) => transcribe(pcm, prompt),
@@ -385,7 +385,7 @@ function createMixedBotPipeline(
   const publish = (speaker: string, segs: ChunkSegment[], completed: boolean): void => {
     for (const c of segs) {
       void sink.publish(chunkToBotSegment(speaker, c, completed)).catch((e) => {
-        (onError ?? ((err) => console.error(`[bot] pipeline(mixed): publish rejected: ${String(err)}`)))(e);
+        (onError ?? (() => console.error('[bot] pipeline(mixed): publish rejected')))(e);
       });
     }
   };
@@ -406,7 +406,7 @@ function createMixedBotPipeline(
     pendingIds = next;
     if (retracted.length > 0 && sink.retract) {
       void sink.retract(retracted).catch((e) => {
-        (onError ?? ((err) => console.error(`[bot] pipeline(mixed): retract rejected: ${String(err)}`)))(e);
+        (onError ?? (() => console.error('[bot] pipeline(mixed): retract rejected')))(e);
       });
     }
   };

@@ -188,9 +188,9 @@ export function wrapTranscriptWithSnapshot<
       try {
         mkdirSync(dirname(path), { recursive: true });
         if (rows.length > 0) await appendFile(path, rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
-        log(`${rows.length} row(s) → ${path}`);
+        log(`${rows.length} row(s) written`);
       } catch (e) {
-        log(`write failed: ${String(e)}`);
+        log('write failed');
       }
       return rows.length;
     },
@@ -397,7 +397,7 @@ export function wrapTranscribeWithTap<T extends TranscribeFn>(
   let faults = 0;
   const write = (rec: Record<string, unknown>): void => {
     appendFile(path, JSON.stringify(rec) + '\n', 'utf8')
-      .catch((e) => { if (faults++ < 5) log(`write failed: ${String(e)}`); });
+      .catch(() => { if (faults++ < 5) log('write failed'); });
   };
   const tapped = (async (pcm: Float32Array, prompt?: string) => {
     const t0 = Date.now();
@@ -457,7 +457,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     if (opts.writer) {
       writer = opts.writer;
       // Chain the header into the flush sequence so it always precedes frame lines.
-      flushing = writer.append(headerLine).catch((e) => log(`header write failed: ${String(e)}`));
+      flushing = writer.append(headerLine).catch(() => log('header write failed'));
     } else {
       mkdirSync(dir, { recursive: true });
       // Header lands synchronously so even a zero-frame session leaves an attributable file.
@@ -466,7 +466,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     }
   } catch (e) {
     // A broken writer disables recording for the session — capture is never affected.
-    log(`disabled (writer init failed): ${String(e)}`);
+    log('disabled (writer init failed)');
     writer = null;
   }
 
@@ -515,7 +515,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     // Serialize flushes so lines never interleave out of order.
     flushing = flushing
       .then(() => w.append(chunk))
-      .catch((e) => { if (faults++ < 5) log(`flush failed (frames dropped): ${String(e)}`); });
+      .catch(() => { if (faults++ < 5) log('flush failed (frames dropped)'); });
     return flushing;
   };
 
@@ -553,7 +553,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
           try { mkdirSync(dirname(filePath), { recursive: true }); } catch { /* best-effort */ }
           await appendFile(filePath, line, 'utf8');
         })
-        .catch((e) => { if (faults++ < 5) log(`${part} write failed: ${String(e)}`); });
+        .catch(() => { if (faults++ < 5) log(`${part} write failed`); });
     });
     return {
       count: () => count,
@@ -655,10 +655,10 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
         await captionSidecar.drain();
         await csrcSidecar.drain();
         await observationSidecar.drain();
-        log(`session written: ${path} (${seq} frames, ${hints} hints, ${captionSidecar.count()} captions, `
+        log(`session written (${seq} frames, ${hints} hints, ${captionSidecar.count()} captions, `
           + `${csrcSidecar.count()} csrc, ${observationSidecar.count()} observations)`);
       } catch (e) {
-        log(`close failed: ${String(e)}`);
+        log('close failed');
       }
     },
   };

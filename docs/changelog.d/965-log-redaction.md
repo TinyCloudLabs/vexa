@@ -1,0 +1,1 @@
+- **Redacted meeting diagnostics (TC-965).** INFO logs now use counts, lengths, durations and internal row IDs instead of participant names, transcript/caption text, meeting URLs/native codes, or raw exception messages. `DEBUG_ADMISSION` remains opt-in and is not set in the deployed ptx compose; its diagnostics are count-only.

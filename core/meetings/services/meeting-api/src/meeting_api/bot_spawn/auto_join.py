@@ -253,7 +253,7 @@ async def auto_join_tick(
         })
         log_event(event, audience="user", level="warning", span="meetings.auto_join",
                   user_id=row["user_id"], meeting_id=str(row["id"]),
-                  fields={"error": message, "next_retry": next_retry})
+                  fields={"error_code": "auto_join_failed", "next_retry": next_retry})
         if publish_status is not None:
             data = row.get("data") if isinstance(row.get("data"), dict) else {}
             await publish_status(
@@ -367,6 +367,6 @@ async def auto_join_tick(
             })
         log_event("auto_join_spawned", audience="user", span="meetings.auto_join",
                   user_id=user_id, meeting_id=str(row["id"]),
-                  fields={"platform": row["platform"], "native": row["native_meeting_id"]})
+                  fields={"platform": row["platform"]})
 
     return counters

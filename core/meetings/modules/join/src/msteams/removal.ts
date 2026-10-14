@@ -20,7 +20,7 @@ export async function checkForTeamsRemoval(page: Page): Promise<boolean> {
     }
     return false;
   } catch (error: any) {
-    log(`Error checking for Teams removal: ${error.message}`);
+    log(`Error checking for Teams removal`);
     return false;
   }
 }
@@ -62,7 +62,7 @@ export function startTeamsRemovalMonitor(page: Page, onRemoval?: () => void | Pr
         try { await onRemoval?.(); } catch {}
       }
     } catch (error: any) {
-      log(`Error during removal check: ${error.message}`);
+      log(`Error during removal check`);
     }
   }, 1500);
 

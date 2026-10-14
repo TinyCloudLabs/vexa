@@ -172,7 +172,7 @@ export async function waitForJitsiMeetingAdmission(
     try {
       await callAwaitingAdmissionCallback(botConfig);
     } catch (e: any) {
-      log(`[Jitsi] Warning: awaiting_admission callback failed: ${e.message}`);
+      log(`[Jitsi] Warning: awaiting_admission callback failed`);
     }
   }
 

@@ -27,7 +27,7 @@ function setTtsMute(muted: boolean, log: (m: string) => void): void {
     execSync(`pactl set-sink-mute tts_sink ${v}`, { stdio: 'pipe' });
     execSync(`pactl set-source-mute virtual_mic ${v}`, { stdio: 'pipe' });
   } catch (err) {
-    log(`[tts] pactl ${muted ? 'mute' : 'unmute'} failed: ${(err as Error).message}`);
+    log(`[tts] pactl ${muted ? 'mute' : 'unmute'} failed`);
   }
 }
 
@@ -58,7 +58,7 @@ export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): T
     const postData = JSON.stringify({ model: 'tts-1', input: text, voice, response_format: 'pcm' });
     let url: URL;
     try { url = new URL(`${base.replace(/\/$/, '')}/v1/audio/speech`); }
-    catch { log(`[tts] bad TTS_SERVICE_URL: ${base}`); return; }
+    catch { log('[tts] bad service URL'); return; }
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Content-Length': String(Buffer.byteLength(postData)),
@@ -75,20 +75,20 @@ export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): T
         headers,
       }, (res) => {
         if (res.statusCode !== 200) {
-          let body = ''; res.on('data', (c) => (body += c));
-          res.on('end', () => { log(`[tts] service ${res.statusCode}: ${body.slice(0, 120)}`); resolve(); });
+          res.on('end', () => { log(`[tts] service returned status ${res.statusCode}`); resolve(); });
+          res.resume(); // Drain error bodies without logging provider text or holding the request open.
           return;
         }
         setTtsMute(false, log);                       // open the mic only during playback
         const p = spawn('paplay', PAPLAY_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
         proc = p;
-        p.stderr?.on('data', (d: Buffer) => log(`[tts] paplay: ${d.toString().trim()}`));
+        p.stderr?.on('data', () => log('[tts] playback process reported an error'));
         const done = () => { if (proc === p) proc = null; setTtsMute(true, log); resolve(); };
         p.on('exit', done);
-        p.on('error', (e) => { log(`[tts] paplay error: ${String(e)}`); done(); });
+        p.on('error', () => { log('[tts] playback process failed'); done(); });
         res.pipe(p.stdin!);                           // stream PCM straight to the mic sink
       });
-      req.on('error', (e) => { log(`[tts] request error: ${String(e)}`); resolve(); });
+      req.on('error', () => { log('[tts] request failed'); resolve(); });
       req.write(postData); req.end();
     });
   };

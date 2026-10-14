@@ -20,7 +20,7 @@ export async function checkForGoogleRemoval(page: Page): Promise<boolean> {
     }
     return false;
   } catch (error: any) {
-    log(`Error checking for Google Meet removal: ${error.message}`);
+    log(`Error checking for Google Meet removal`);
     return false;
   }
 }
@@ -72,7 +72,7 @@ export function startGoogleRemovalMonitor(page: Page, onRemoval?: () => void | P
         try { await onRemoval?.(); } catch {}
       }
     } catch (error: any) {
-      log(`Error during Google Meet removal check: ${error.message}`);
+      log(`Error during Google Meet removal check`);
     }
   }, 1500);
 

@@ -142,7 +142,7 @@ export async function joinJitsiMeeting(
   attachMembersOnlyWatch(page);
 
   const navUrl = buildJitsiMeetingUrl(meetingUrl, { botName });
-  log(`[Jitsi] Navigating to: ${navUrl}`);
+  log("[Jitsi] Navigating to meeting URL (redacted)");
   await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2000);
 
@@ -177,7 +177,7 @@ export async function joinJitsiMeeting(
       await nameField.fill("");
       await page.keyboard.type(botName, { delay: 30 });
     }
-    log(`[Jitsi] Name entered: "${botName}"`);
+    log("[Jitsi] Name entered");
 
     // Click "Join meeting" DOM-direct first (immune to overlay hit-test stalls),
     // with a Playwright click as the fallback.
