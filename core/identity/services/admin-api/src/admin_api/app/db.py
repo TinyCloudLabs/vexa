@@ -33,6 +33,10 @@ def configure(
         "connect_args": {"statement_cache_size": 0},
         "hide_parameters": True,
     }
+    if pool_size is not None:
+        kwargs["pool_size"] = pool_size
+    if max_overflow is not None:
+        kwargs["max_overflow"] = max_overflow
     _engine = create_async_engine(database_url, **kwargs)
     _session_factory = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commit=False)
 
