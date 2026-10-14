@@ -192,9 +192,8 @@ def create_app(
     ``adapters.build_production_*`` (composition is P3; the seams are here).
     """
     app = FastAPI(title="Vexa Meeting API (v0.12)", version="0.12.0")
-    from .obs import configure_privacy_logging, log_event
+    from .obs import log_event
 
-    configure_privacy_logging()
     @app.exception_handler(Exception)
     async def _unhandled_exception(request: Request, exc: Exception):
         log_event(

@@ -24,8 +24,10 @@ import contextvars
 import hashlib
 import json
 import logging
+import logging.config
 import re
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -183,13 +185,30 @@ def safe_logging_config() -> dict:
         "filters": {"privacy": {"()": filter_path}},
         "formatters": {"safe": {"()": formatter_path}},
         "handlers": {"default": handler},
-        "root": {"handlers": ["default"], "level": "INFO", "filters": ["privacy"]},
+        "root": {"handlers": ["default"], "level": "INFO"},
         "loggers": {
             "uvicorn": dict(logger),
             "uvicorn.error": dict(logger),
             "uvicorn.access": dict(logger),
         },
     }
+
+
+def install_process_logging_hooks() -> None:
+    logging.captureWarnings(True)
+    logger = logging.getLogger("gateway.process")
+
+    def handle_exception(exc_type, exc_value, traceback) -> None:
+        logger.critical("unhandled process exception", exc_info=(exc_type, exc_value, traceback))
+
+    def handle_thread_exception(args) -> None:
+        logger.critical(
+            "unhandled thread exception",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = handle_exception
+    threading.excepthook = handle_thread_exception
 
 TRACE_HEADER = "x-trace-id"
 

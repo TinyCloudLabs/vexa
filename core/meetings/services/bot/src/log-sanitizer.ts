@@ -8,12 +8,14 @@ const EVENTS: Record<string, true> = {
   'join.lobby_locale': true, 'join.selector_miss': true, 'join.name_entry': true,
   'admission.waiting': true, 'admission.admitted': true, 'admission.rejected': true,
   'leave.completed': true, 'leave.failed': true, 'removal.detected': true, 'removal.monitor_stopped': true,
+  'process.fatal': true,
 };
 const ENUMS: Record<string, true> = {
   payment_required: true, unauthorized: true, rate_limited: true, unavailable: true,
   timeout: true, bad_request: true, unknown: true, google_meet: true, teams: true, zoom: true,
   jitsi: true, 'captured-signal': true, stt: true, captions: true, csrc: true,
   observations: true, botlog: true, transcript: true,
+  uncaught_exception: true, unhandled_rejection: true,
 };
 const NUMBERS: Record<string, true> = {
   attempt: true, attempts: true, attempts_max: true, max_retries: true, retry_delay_ms: true,

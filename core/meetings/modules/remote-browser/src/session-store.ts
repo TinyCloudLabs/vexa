@@ -149,7 +149,7 @@ export function s3Sync(localDir: string, s3Path: string, config: S3Config, direc
     execFileSync(
       'aws',
       ['s3', 'sync', src, dst, '--endpoint-url', config.s3Endpoint, ...excludes.flatMap(e => ['--exclude', e])],
-      { env: getS3Env(config), stdio: 'pipe', timeout: 300000 }
+      { env: getS3Env(config), stdio: 'ignore', timeout: 300000 }
     );
   } catch {
     throw new SessionSyncError(

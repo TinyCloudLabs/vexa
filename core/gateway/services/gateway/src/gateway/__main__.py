@@ -15,6 +15,12 @@ LOG_CONFIG = safe_logging_config()
 
 
 def main() -> None:
+    import logging.config
+
+    logging.config.dictConfig(LOG_CONFIG)
+    from .obs import install_process_logging_hooks
+
+    install_process_logging_hooks()
     import uvicorn
 
     uvicorn.run(

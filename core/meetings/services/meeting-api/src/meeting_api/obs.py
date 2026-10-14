@@ -9,8 +9,10 @@ import contextvars
 import hashlib
 import json
 import logging
+import logging.config
 import re
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -162,7 +164,7 @@ class PrivacyFilter(logging.Filter):
         return True
 
 
-logging.getLogger().addFilter(PrivacyFilter())
+
 
 
 class JSONFormatter(logging.Formatter):
@@ -186,16 +188,26 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(payload, separators=(",", ":"))
 
 
-def configure_privacy_logging() -> None:
-    privacy_filter = PrivacyFilter()
-    root = logging.getLogger()
-    root.addFilter(privacy_filter)
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logger = logging.getLogger(name)
-        logger.addFilter(privacy_filter)
-        for handler in logger.handlers:
-            handler.addFilter(privacy_filter)
+def install_process_logging_hooks() -> None:
+    logging.captureWarnings(True)
+    logger = logging.getLogger("meeting_api.process")
 
+    def handle_exception(exc_type, exc_value, traceback) -> None:
+        logger.critical("unhandled process exception", exc_info=(exc_type, exc_value, traceback))
+
+    def handle_thread_exception(args) -> None:
+        logger.critical(
+            "unhandled thread exception",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = handle_exception
+    threading.excepthook = handle_thread_exception
+
+
+def configure_privacy_logging() -> None:
+    logging.config.dictConfig(LOG_CONFIG)
+    install_process_logging_hooks()
 
 LOG_CONFIG = {
     "version": 1,

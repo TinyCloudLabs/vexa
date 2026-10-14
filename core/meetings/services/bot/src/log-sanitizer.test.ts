@@ -315,3 +315,24 @@ assert.match(removalAdmissionOutput, /"event":"admission\.rejected"/);
 assert.match(removalAdmissionOutput, /"event":"removal\.detected"/);
 assert.match(removalAdmissionOutput, /"removed":true/);
 console.log('PASS process log sanitizer: real stdout/stderr sinks retain counts/status and redact canaries');
+const fatalHandlers = fileURLToPath(new URL('./install-process-fatal-handlers.ts', import.meta.url));
+for (const kind of ['uncaught_exception', 'unhandled_rejection'] as const) {
+  const trigger = kind === 'uncaught_exception'
+    ? "setTimeout(() => { throw new Error('FATAL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=FATAL_TOKEN'); }, 0);"
+    : "Promise.reject(new Error('FATAL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=FATAL_TOKEN'));";
+  const fatalScript = `import ${JSON.stringify(fatalHandlers)};\n${trigger}`;
+  const fatalResult = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', fatalScript], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    encoding: 'utf8',
+  });
+  assert.equal(fatalResult.status, 1, `${kind} must terminate with status 1: ${fatalResult.stderr}`);
+  const fatalOutput = fatalResult.stdout + fatalResult.stderr;
+  for (const canary of ['FATAL_CANARY', 'FATAL_TOKEN', 'xxx-xxxx-xxx', 'Error', 'at ']) {
+    assert.equal(fatalOutput.includes(canary), false, `${kind} output leaked ${canary}`);
+  }
+  const fatalRecords = fatalOutput.split('\n').filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(fatalRecords.length, 1);
+  assert.deepEqual(fatalRecords[0], {
+    level: 'fatal', event: 'process.fatal', kind, error_code: 'operation_failed',
+  });
+}

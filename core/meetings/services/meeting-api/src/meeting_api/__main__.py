@@ -773,6 +773,9 @@ def _attach_background_loops(
 # lifespan, once the event loop is running.
 def __getattr__(name: str):
     if name == "app":
+        from .obs import configure_privacy_logging
+
+        configure_privacy_logging()
         return build_production_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -812,13 +815,17 @@ def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
 
 
 def main() -> None:
+    import logging.config
+
+    from .obs import LOG_CONFIG, install_process_logging_hooks
+
+    logging.config.dictConfig(LOG_CONFIG)
+    install_process_logging_hooks()
     import uvicorn
 
-    from .obs import LOG_CONFIG, configure_privacy_logging
-
-    configure_privacy_logging()
+    app = build_production_app()
     uvicorn.run(
-        build_production_app(),
+        app,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         log_level=os.getenv("LOG_LEVEL", "info").lower(),

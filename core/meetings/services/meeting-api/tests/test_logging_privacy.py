@@ -148,6 +148,58 @@ def test_process_json_logging_config_filters_root_and_uvicorn_handlers():
         "privacy" in LOG_CONFIG["handlers"][name]["filters"]
         for name in LOG_CONFIG["root"]["handlers"]
     )
+def test_real_main_sanitizes_bootstrap_warning_and_process_exception_hooks():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = r"""
+import logging, sys, threading, warnings, uvicorn
+sys.path.insert(0, sys.argv[1])
+from meeting_api import __main__ as entry
+from meeting_api.obs import LOG_CONFIG
+sentinel = object()
+def build():
+    try:
+        raise RuntimeError("BOOTSTRAP_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=BOOTSTRAP_TOKEN")
+    except RuntimeError:
+        logging.getLogger("bootstrap.child").warning("BOOTSTRAP_NAME_CANARY", exc_info=True)
+    return sentinel
+entry.build_production_app = build
+def fake_run(app, **kwargs):
+    assert app is sentinel
+    assert kwargs["log_config"] is LOG_CONFIG
+    assert kwargs["access_log"] is False
+uvicorn.run = fake_run
+entry.main()
+warnings.warn("WARNING_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=WARNING_TOKEN")
+sys.excepthook(RuntimeError, RuntimeError("SYS_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=SYS_TOKEN"), None)
+def fail_in_thread():
+    raise RuntimeError("THREAD_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=THREAD_TOKEN")
+thread = threading.Thread(target=fail_in_thread)
+thread.start()
+thread.join()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    for canary in (
+        "BOOTSTRAP_URL_CANARY", "BOOTSTRAP_NAME_CANARY", "BOOTSTRAP_TOKEN",
+        "WARNING_URL_CANARY", "WARNING_TOKEN", "SYS_EXCEPTION_CANARY",
+        "SYS_TOKEN", "THREAD_EXCEPTION_CANARY", "THREAD_TOKEN",
+        "xxx-xxxx-xxx", "Traceback", "RuntimeError",
+    ):
+        assert canary not in output
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert len(records) >= 4
+    assert all(record["service"] == "meeting-api" for record in records)
+    assert all(record["event"] == "log_event" for record in records)
+
+
 
 
 def test_log_event_enforces_info_floor():

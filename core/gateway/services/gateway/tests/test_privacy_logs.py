@@ -172,3 +172,50 @@ def test_actual_uvicorn_access_and_arbitrary_logs_are_sanitized():
                for entry in entries)
     assert any(entry.get("trace_id") == "feedfacecafebeef0123456789abcdef"
                for entry in entries)
+def test_real_gateway_main_configures_handlers_before_uvicorn_and_hooks():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = r"""
+import logging, sys, threading, warnings, uvicorn
+sys.path.insert(0, sys.argv[1])
+from gateway import __main__ as entry
+def fake_run(app, **kwargs):
+    assert app == "gateway.adapters:app"
+    assert kwargs["log_config"] is entry.LOG_CONFIG
+    assert kwargs["access_log"] is False
+    try:
+        raise RuntimeError("BOOTSTRAP_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=BOOTSTRAP_TOKEN")
+    except RuntimeError:
+        logging.getLogger("bootstrap.child").warning("BOOTSTRAP_NAME_CANARY", exc_info=True)
+uvicorn.run = fake_run
+entry.main()
+warnings.warn("WARNING_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=WARNING_TOKEN")
+sys.excepthook(RuntimeError, RuntimeError("SYS_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=SYS_TOKEN"), None)
+def fail_in_thread():
+    raise RuntimeError("THREAD_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=THREAD_TOKEN")
+thread = threading.Thread(target=fail_in_thread)
+thread.start()
+thread.join()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    for canary in (
+        "BOOTSTRAP_URL_CANARY", "BOOTSTRAP_NAME_CANARY", "BOOTSTRAP_TOKEN",
+        "WARNING_URL_CANARY", "WARNING_TOKEN", "SYS_EXCEPTION_CANARY",
+        "SYS_TOKEN", "THREAD_EXCEPTION_CANARY", "THREAD_TOKEN",
+        "xxx-xxxx-xxx", "Traceback", "RuntimeError",
+    ):
+        assert canary not in output
+    records = _json_lines(output)
+    assert len(records) >= 4
+    assert all(record["service"] == "gateway" for record in records)
+    assert all(record["event"] == "python_log" for record in records)
+    allowed = {"ts", "level", "service", "event", "logger", "trace_id", "fields"}
+    assert all(set(record) <= allowed for record in records)

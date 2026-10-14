@@ -23,6 +23,7 @@
  * lazy redis connect.
  */
 import './install-process-log-sanitizer.js';
+import './install-process-fatal-handlers.js';
 import { createClient } from 'redis';
 import { liveSttEnabled, loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
