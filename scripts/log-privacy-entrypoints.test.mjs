@@ -200,7 +200,7 @@ test('discovery requires every executable launch target to be covered or explici
 });
 
 test('Astra mutation fixture is detected as an uncovered runnable entrypoint', () => {
-  const fixtureRoot = path.join(root, 'scripts/fixtures/log-privacy-entrypoint-mutation');
+  const fixtureRoot = path.join(root, 'scripts/probe');
   const candidates = discoverEntrypoints(fixtureRoot);
   assert.deepEqual(
     candidates.map(({ key }) => key),
@@ -210,7 +210,7 @@ test('Astra mutation fixture is detected as an uncovered runnable entrypoint', (
     ],
   );
   assert.deepEqual(uncoveredEntrypoints(candidates, { entries: [], exclusions: [] }), candidates);
-  const result = spawnSync(process.execPath, ['src/diagnostic-cli.mjs'], {
+  const result = spawnSync(process.execPath, ['diagnostic-cli.mjs'], {
     cwd: fixtureRoot,
     encoding: 'utf8',
   });

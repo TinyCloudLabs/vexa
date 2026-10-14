@@ -1,0 +1,9 @@
+{
+  "name": "tc965-entrypoint-mutation",
+  "bin": {
+    "tc965-diagnostic": "diagnostic-cli.mjs"
+  },
+  "scripts": {
+    "start:diagnostic": "node diagnostic-cli.mjs"
+  }
+}

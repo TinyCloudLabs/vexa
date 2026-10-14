@@ -438,8 +438,8 @@
     },
     {
       "patterns": [
-        "package:scripts/fixtures/log-privacy-entrypoint-mutation/package.json#bin:tc965-diagnostic",
-        "package:scripts/fixtures/log-privacy-entrypoint-mutation/package.json#script:start:diagnostic"
+        "package:scripts/probe/package.json#bin:tc965-diagnostic",
+        "package:scripts/probe/package.json#script:start:diagnostic"
       ],
       "reason": "Intentional unsafe negative-control fixture; the CI test removes this exclusion and proves discovery rejects it."
     }
