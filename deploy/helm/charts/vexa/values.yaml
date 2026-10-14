@@ -436,9 +436,12 @@ redis:
 
 minio:
   enabled: true
+  # TC-572: quay.io/minio/* now returns 401, so MinIO is pinned by digest to the
+  # TinyCloudLabs GHCR mirror. The version is frozen; TC-1118 tracks the maintained source.
   image:
-    repository: quay.io/minio/minio
-    tag: latest
+    repository: ghcr.io/tinycloudlabs/mirror/minio
+    tag: RELEASE.2025-09-07T16-13-09Z
+    digest: sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6
   accessKey: vexa-access-key
   secretKey: vexa-secret-key
   bucket: vexa
@@ -457,11 +460,12 @@ minio:
   # The bucket-init Job's client image. It used to be hardcoded `minio/mc:latest`
   # in templates/job-minio-init.yaml, so no deployment could pin it and an
   # enterprise delivery gate that requires digest-pinned images refused the whole
-  # chart on it. It is a value now; pin it with `repository@sha256:...` in your
-  # own values (or via the enterprise node baseline) when you need reproducibility.
+  # chart on it. It is a value now, digest-pinned (TC-572); override `digest`
+  # in your own values (or via the enterprise node baseline) for a different pin.
   mcImage:
-    repository: quay.io/minio/mc
-    tag: latest
+    repository: ghcr.io/tinycloudlabs/mirror/minio-mc
+    tag: RELEASE.2025-08-13T08-35-41Z
+    digest: sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380
   # ...and the Job declared no resources at all, so a namespace LimitRange would
   # silently assign it whatever default it likes — the 64Mi-squeeze class.
   initResources:

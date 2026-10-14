@@ -58,7 +58,7 @@ spec:
       {{- end }}
       containers:
         - name: minio
-          image: "{{ .Values.minio.image.repository }}:{{ .Values.minio.image.tag }}"
+          image: "{{ .Values.minio.image.repository }}:{{ .Values.minio.image.tag }}{{ with .Values.minio.image.digest }}@{{ . }}{{ end }}"
           imagePullPolicy: IfNotPresent
           command:
             - minio
