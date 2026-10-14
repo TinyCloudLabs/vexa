@@ -505,7 +505,7 @@ async function withServer(
   const upload = streamingTapeUploader(inv(), 'not a url', 1000);
   let msg = '';
   await upload('captured-signal', path, 2).catch((e) => { msg = String(e); });
-  check('a bad upload URL rejects cleanly', msg.includes('bad recordingUploadUrl'), msg);
+  check('a bad upload URL rejects with the fixed error code', msg.includes('invalid_upload_url'), msg);
 }
 
 for (const d of dirs) rmSync(d, { recursive: true, force: true });

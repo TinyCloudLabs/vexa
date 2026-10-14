@@ -129,8 +129,8 @@ async def sweep_signal_tapes(
         evicted_bytes += tape["bytes"]
         log_event(
             "signal_tape_evicted", audience="operator", span="recordings.signal.janitor",
-            fields={"prefix": tape["prefix"], "bytes": tape["bytes"],
-                    "parts": len(tape["keys"]), "age_s": round(now - tape["newest"], 1)},
+            fields={"bytes": tape["bytes"], "parts": len(tape["keys"]),
+                    "age_s": round(now - tape["newest"], 1)},
         )
 
     if total > budget_bytes:

@@ -518,7 +518,7 @@ async def request_bot(
             log_event(
                 "bot_spawn_stt_backend_unhealthy", audience="user", level="warning",
                 span="bots.create", user_id=user_id,
-                fields={"reason": verdict.get("reason"), "status": verdict.get("status")},
+                fields={"reason": "configuration", "status": verdict.get("status")},
             )
             raise TranscriptionNotConfigured(
                 f"the configured transcription backend is not working: {verdict.get('reason')} — "
@@ -920,7 +920,7 @@ async def request_bot(
     # USER-facing: a bot was requested for this user.
     log_event(
         "bot_join_requested", audience="user", span="bots.create",
-        user_id=user_id, meeting_id=str(meeting_id),
+        user_id=user_id, meeting_id=str(row.get("id")),
         fields={
             "platform": platform, "status": row.get("status", "requested"),
             "continued": reused_row is not None, "session_count": len(sessions),

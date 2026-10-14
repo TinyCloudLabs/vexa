@@ -192,7 +192,18 @@ def create_app(
     ``adapters.build_production_*`` (composition is P3; the seams are here).
     """
     app = FastAPI(title="Vexa Meeting API (v0.12)", version="0.12.0")
-    # The edge: read/mint X-Trace-Id and bind it for the request (logevent.v1 trace_id).
+    from .obs import configure_privacy_logging, log_event
+
+    configure_privacy_logging()
+    @app.exception_handler(Exception)
+    async def _unhandled_exception(request: Request, exc: Exception):
+        log_event(
+            "request_failed", audience="system", level="error",
+            fields={"status_code": 500, "error_type": type(exc).__name__},
+        )
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+    # The edge: read/mint X-Trace-Id for request handling; raw header values are never logged.
     app.add_middleware(TraceMiddleware)
 
     # --- shared liveness probe (gate:health): the unified process is up. No auth. The ADDITIVE
@@ -605,9 +616,11 @@ def _mount_lifecycle(
                         meeting_row = updated_row
                 except Exception:  # noqa: BLE001 — original finalization failure is the signal
                     pass
-                log_event("transcript_finalize_failed", audience="system", level="warning",
-                          span="lifecycle.callback",
-                          fields={"meeting_id": terminal_meeting_id, "error_type": type(e).__name__})
+                log_event(
+                    "transcript_finalize_failed", audience="system", level="warning",
+                    span="lifecycle.callback", meeting_id=str(terminal_meeting_id),
+                    fields={"error_type": type(e).__name__},
+                )
         if terminal_advanced and isinstance(meeting_row, dict):
             data = dict(meeting_row.get("data") or {})
             provenance = build_service_provenance({**meeting_row, "data": data})
@@ -637,7 +650,8 @@ def _mount_lifecycle(
                         audience="system",
                         level="warning",
                         span="lifecycle.callback",
-                        fields={"meeting_id": meeting_row.get("id"), "error_type": type(e).__name__},
+                        meeting_id=str(meeting_row.get("id")),
+                        fields={"error_type": type(e).__name__},
                     )
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
@@ -777,20 +791,18 @@ def _mount_lifecycle(
                         # to be discarded, so a webhook the subscriber never received (unsubscribed
                         # event type, SSRF-blocked target, 4xx endpoint) was indistinguishable from
                         # one that arrived: "my webhooks stopped" was undiagnosable in production.
-                        # The target is reported as host only — a webhook URL can carry a secret in
-                        # its path or query, and logs are not a place to put one.
+                        # URLs and delivery exception bodies remain outside process logs.
                         log_event(
                             "webhook_delivery",
                             audience="system",
                             level="info" if result.status == "delivered" else "warning",
                             span="lifecycle.callback",
-                            meeting_id=meeting_row.get("id"),
+                            meeting_id=str(meeting_row.get("id")),
                             fields={
                                 "outcome": result.status,
                                 "event_type": env.get("event_type"),
-                                "target_host": _webhook_target_host(url),
                                 "status_code": result.status_code,
-                                "error": result.error is not None,
+                                "has_target": bool(url),
                             },
                         )
                         # #841: ALSO record the outcome in the per-user delivery ledger — the
@@ -903,18 +915,19 @@ def _mount_lifecycle(
                     )
                     log_event(
                         "meeting_copilot_reap_signalled", audience="system", span="lifecycle.callback",
-                        meeting_id=meeting_row_id,
-                        fields={"meeting_row_id": meeting_row_id,
-                                "meeting_status": rec.status.value},
+                        meeting_id=str(meeting_row_id),
+                        fields={"status": rec.status.value},
                     )
                 except Exception as e:  # noqa: BLE001 — the worker's idle timeout is the backstop
-                    log_event("meeting_copilot_reap_failed", audience="system", level="warning",
-                              span="lifecycle.callback",
-                              fields={"meeting_row_id": meeting_row_id, "error_type": type(e).__name__})
+                    log_event(
+                        "meeting_copilot_reap_failed", audience="system", level="warning",
+                        span="lifecycle.callback", meeting_id=str(meeting_row_id),
+                        fields={"error_type": type(e).__name__},
+                    )
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
-            meeting_id=meeting_row.get("id") if isinstance(meeting_row, dict) else None,
-            fields={"meeting_status": rec.status.value if rec.status else None},
+            meeting_id=str(meeting_row.get("id")) if isinstance(meeting_row, dict) else None,
+            fields={"status": rec.status.value if rec.status else None},
         )
         return (
             200,

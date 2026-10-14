@@ -325,8 +325,9 @@ def test_delivered_outcome_is_logged(goldens, capsys):
     assert rec["fields"]["outcome"] == "delivered"
     assert rec["fields"]["event_type"] == "meeting.status_change"
     assert rec["fields"]["status_code"] == 200
-    # The target is reported as HOST ONLY — a webhook URL can carry a secret in its path/query.
-    assert rec["fields"]["target_host"] == "hook.example"
+    # Logs retain only the target-presence boolean, never a webhook host or URL.
+    assert rec["fields"]["has_target"] is True
+    assert "target_host" not in rec["fields"]
     assert "SECRET-IN-URL" not in _json_dumps(rec)
 
 

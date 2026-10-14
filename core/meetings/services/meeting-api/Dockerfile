@@ -25,9 +25,8 @@ COPY core/meetings/services/meeting-api/pyproject.toml core/meetings/services/me
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project
 
-# Production-only runtime deps NOT in the (lean) test pyproject (redis/httpx are already pinned):
-# the ASGI server + the async Postgres stack (collector/bot_spawn/recordings SQLAlchemy adapters)
-# + boto3 (the recordings S3/MinIO storage adapter).
+# Production-only runtime deps beyond the test project: Uvicorn's standard extras, the async Postgres
+# stack (collector/bot_spawn/recordings SQLAlchemy adapters) + boto3 (recordings S3/MinIO storage).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "uvicorn[standard]==0.34.0" "sqlalchemy[asyncio]==2.0.36" "asyncpg==0.30.0" "boto3==1.35.0"
 

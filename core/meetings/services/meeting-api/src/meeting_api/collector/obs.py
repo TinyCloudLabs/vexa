@@ -18,10 +18,7 @@ the real cross-process services get via ``X-Trace-Id``.
 from __future__ import annotations
 
 import contextvars
-import json
-import sys
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -63,26 +60,15 @@ def make_log_event(service: str) -> Callable[..., dict]:
         fields: Optional[dict] = None,
         stream=None,
     ) -> dict:
-        """Emit one ``logevent.v1`` JSON line to stdout and return the envelope (for tests)."""
-        envelope: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "level": level,
-            "service": service,
-            "trace_id": _trace_id.get() or new_trace_id(),
-            "audience": audience,
-            "event": event,
-        }
-        if span is not None:
-            envelope["span"] = span
-        uid = user_id if user_id is not None else _user_id.get()
-        if uid is not None:
-            envelope["user_id"] = uid
-        if meeting_id is not None:
-            envelope["meeting_id"] = meeting_id
-        if fields:
-            envelope["fields"] = fields
-        print(json.dumps(envelope, separators=(",", ":")), file=stream or sys.stdout, flush=True)
-        return envelope
+        """Route collector events through the meeting-api process-boundary sanitizer."""
+        from ..obs import log_event as sanitized_log_event
+
+        return sanitized_log_event(
+            event, audience=audience, level=level, span=span,
+            user_id=user_id if user_id is not None else _user_id.get(),
+            meeting_id=meeting_id, fields=fields, stream=stream,
+            trace_id=_trace_id.get(),
+        )
 
     return log_event
 
@@ -96,7 +82,9 @@ def make_trace_middleware(log_event: Callable[..., dict]) -> type:
 
         async def dispatch(self, request, call_next):
             incoming = request.headers.get(TRACE_HEADER)
-            trace_id = incoming or new_trace_id()
+            from ..obs import valid_trace_id
+
+            trace_id = valid_trace_id(incoming)
             token = _trace_id.set(trace_id)
             try:
                 request.state.trace_id = trace_id

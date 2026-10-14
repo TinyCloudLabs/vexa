@@ -81,7 +81,7 @@ export async function uploadSignalTapes(
   if (!url) {
     // The local hot-loop path (VEXA_CAPTURE_SIGNAL=1, no control plane) lands here every run, so it
     // is one quiet line naming the reason rather than a failure.
-    signalEvent('tape-upload-skipped', { reason: 'no recordingUploadUrl in the invocation' });
+    signalEvent('tape-upload-skipped');
     summary.skipped.push('captured-signal', 'stt', 'captions', 'csrc', 'observations', 'botlog', 'transcript');
     return summary;
   }
@@ -123,18 +123,16 @@ export async function uploadSignalTapes(
       if (size > maxBytes) {
         // SKIP, not truncate: a truncated tape reads as a complete one to a replay, which turns a
         // missing fixture into a lying fixture.
-        signalEvent('tape-upload-skipped', { part, path: filePath, bytes: size, max_bytes: maxBytes,
-                                             reason: 'larger than the upload size guard' });
+        signalEvent('tape-upload-skipped', { part, bytes: size, max_bytes: maxBytes });
         summary.skipped.push(part);
         continue;
       }
       await upload(part, filePath, size);
-      signalEvent('tape-uploaded', { part, path: filePath, bytes: size,
-                                     capped: recorder.isCapped() });
+      signalEvent('tape-uploaded', { part, bytes: size, capped: recorder.isCapped() });
       summary.uploaded.push(part);
     } catch (e) {
       // Dropped, never retried into the meeting path, never rethrown.
-      signalEvent('tape-upload-failed', { part, path: filePath, error: String(e) });
+      signalEvent('tape-upload-failed', { part, error_code: 'upload_failed' });
       summary.failed.push(part);
     }
   }
@@ -187,8 +185,8 @@ export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: n
     let target: URL;
     try {
       target = new URL(url);
-    } catch (e) {
-      reject(new Error(`bad recordingUploadUrl ${url}: ${String(e)}`));
+    } catch {
+      reject(new Error('invalid_upload_url'));
       return;
     }
     const transport = target.protocol === 'https:' ? https : http;

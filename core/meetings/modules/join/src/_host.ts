@@ -31,7 +31,7 @@ export interface BotConfig {
 // ── Logger (structured single-line JSON, like the monolith's) ──────────
 export function logJSON(obj: Record<string, any>): void {
   try { console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj })); }
-  catch { console.log(String(obj?.msg ?? obj)); }
+  catch { console.log("[join] structured log serialization failed"); }
 }
 export function log(message: string): void { logJSON({ level: "info", msg: message }); }
 export function randomDelay(amount: number): number {
@@ -51,7 +51,7 @@ export interface Hooks {
 }
 
 const defaultHooks: Hooks = {
-  onState: (s, d) => log(`>>> [JOIN-STATE] ${s}${d ? " — " + JSON.stringify(d) : ""}`),
+  onState: (s) => log(`>>> [JOIN-STATE] ${s}`),
   onStopRecording: () => {},
 };
 let hooks: Hooks = { ...defaultHooks };

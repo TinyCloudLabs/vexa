@@ -26,9 +26,8 @@
  *      that matches too much is its own bug).
  *   4. Ordered resolution: the selector list is honoured top-down, so a broad
  *      structural entry can never beat a precise English one on the same DOM.
- *   5. A total miss records the observed URL / html.lang / navigator.language
- *      and the candidate labels into the thrown message, which is what reaches
- *      `meeting.data.last_error` (#846 A4).
+ *   5. A total miss records only a static code, bounded duration, and validated
+ *      html.lang / navigator.language; URLs and visible labels are excluded.
  *
  * FIXTURE HONESTY (#857): the lobby DOMs below are FABRICATED, not captured.
  * They are built to be consistent with the production evidence — every selector
@@ -249,8 +248,7 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
   {
     const hu = scan(HU_LABELLED_CTA);
     assert(isCta(hu.el), 'hu lobby, aria-labelled CTA: the scan uniquely identifies the CTA element (pure function)');
-    assert(hu.labels.length === 1 && hu.labels[0] === HU.ctaText,
-      `exactly one candidate, and it is the CTA label ("${hu.labels[0]}")`);
+    assert(hu.candidate_count === 1, 'exactly one candidate is retained as a count, not page text');
 
     const huNoJsname = scan(HU_NO_JSNAME_CTA);
     assert(isCta(huNoJsname.el), 'hu lobby, CTA without jsname: the scan resolves it too (no attribute dependency)');
@@ -265,16 +263,13 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
   console.log('\n=== 3. Over-match guards — what the scan must NOT pick ===');
   {
     const hu = scan(HU_LABELLED_CTA);
-    assert(!hu.labels.some((t) => [HU.micLabel, HU.camLabel, HU.moreLabel].includes(t)),
-      'mic / camera / 3-dot menu are never candidates (icon-only, in any language)');
-    assert(!hu.labels.some((t) => [HU.phoneLabel, HU.castLabel].includes(t)),
-      'secondary joining options are never candidates (icon + text, in any language)');
+    assert(hu.candidate_count === 1,
+      'mic, camera, menu, phone, and cast labels are not returned from the scan');
 
     const ambiguous = scan(HU_AMBIGUOUS);
     assert(ambiguous.el === null,
       'two text-only buttons → resolves NOTHING (refuses to guess; cannot click the wrong control)');
-    assert(ambiguous.labels.length === 2 && ambiguous.labels.includes('Mégse'),
-      `ambiguity is reported, not swallowed: [${ambiguous.labels.join(' | ')}]`);
+    assert(ambiguous.candidate_count === 2, 'ambiguity is reported by candidate count only');
 
     const prose = scan(HU_PROSE_ONLY);
     assert(prose.el === null, 'a long prose button is not a CTA label (over maxLabelChars)');
@@ -287,14 +282,14 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
       ...HU, ctaAriaLabel: HU.ctaText, ctaJsname: 'Qx7uuf',
       extra: '<button jsname="Zz1" aria-label="Feliratok">closed_caption</button>',
     }));
-    assert(isCta(ligature.el) && !ligature.labels.includes('closed_caption'),
+    assert(isCta(ligature.el) && ligature.candidate_count === 1,
       'an underscored material ligature is filtered out; the CTA is still resolved');
 
     const bareLigature = scan(lobby({
       ...HU, ctaAriaLabel: HU.ctaText, ctaJsname: 'Qx7uuf',
       extra: '<button jsname="Zz1" aria-label="Mikrofon">mic</button>',
     }));
-    assert(bareLigature.el === null && bareLigature.labels.includes('mic'),
+    assert(bareLigature.el === null && bareLigature.candidate_count === 2,
       'a single-word ligature becomes a second candidate → the pick is refused, not guessed');
 
     const offscreen = scan(lobby({ ...HU, ctaAriaLabel: HU.ctaText, ctaJsname: 'Qx7uuf' })
@@ -308,7 +303,7 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
     const iconsOnly = scan(`<!doctype html><html lang="hu"><body>${
       LOBBY_ICON_CHROME.replace('MIC_LABEL', HU.micLabel).replace('CAM_LABEL', HU.camLabel).replace('MORE_LABEL', HU.moreLabel)
     }</body></html>`);
-    assert(iconsOnly.el === null && iconsOnly.labels.length === 0,
+    assert(iconsOnly.el === null && iconsOnly.candidate_count === 0,
       'a lobby of icon buttons only → no candidates at all (the scan is not a catch-all)');
   }
 
@@ -357,8 +352,8 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
         googleJoinButtonSelectors, 900, 'join button');
     } catch (e: any) { message = String(e?.message || e); }
     assert(returned === null, 'a unique scan hit is NOT returned as the CTA (diagnostic-only; the scan cannot click)');
-    assert(/Could not locate join button/.test(message) && /Kérvényezés/.test(message),
-      'the scan candidate label is recorded in the loud miss (evidence for a future re-promotion)');
+    assert(/code=selector_not_found/.test(message) && !/Kérvényezés/.test(message),
+      'the selector miss records a static code without page text');
   }
 
   console.log('\n=== 6. A total miss is diagnosable from last_error alone (#846 A4) ===');
@@ -370,14 +365,12 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
         googleJoinButtonSelectors, 900, 'join button');
     } catch (e: any) { message = String(e?.message || e); }
 
-    assert(/^Could not locate join button by any locale-agnostic or English selector after 900ms/.test(message),
-      'the historical error prefix is preserved verbatim (prod monitoring greps it)');
-    assert(/html\.lang=hu/.test(message) && /navigator\.language=hu-HU/.test(message),
+    assert(/^code=selector_not_found timeout_ms=900/.test(message),
+      'the selector miss exposes only its static code and bounded duration');
+    assert(/html_lang=hu/.test(message) && /navigator_language=hu-HU/.test(message),
       'the observed UI locale is recorded in the error');
-    assert(/url=https:\/\/meet\.google\.com\//.test(message), 'the observed URL is recorded in the error');
-    assert(/Mégse/.test(message) && /Kérvényezés/.test(message),
-      'the visible text-button labels are recorded — the next occurrence is a one-look diagnosis');
-    console.log(`    last_error.reason would read: ${message}`);
+    assert(!/https:|Mégse|Kérvényezés|abc-defg-hij/.test(message),
+      'URLs and visible page text are absent from the error');
   }
 
   console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);

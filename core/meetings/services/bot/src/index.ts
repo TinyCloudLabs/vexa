@@ -22,6 +22,7 @@
  * terminal `failed` (join_failure) rather than crashing the root — same disposability as the
  * lazy redis connect.
  */
+import './install-process-log-sanitizer.js';
 import { createClient } from 'redis';
 import { liveSttEnabled, loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
@@ -208,7 +209,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     captureSignalEnabled(inv)
       ? createCaptureSignalRecorder(inv, { maxBytes: captureSignalMaxBytes })
       : null;
-  if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
+  if (signalRecorder) console.log('[bot] capture-signal recording enabled');
   // The bot's own commentary, teed beside the tape. Started HERE — before the browser launches —
   // because the lines that explain a failed join are the ones emitted before anything else exists.
   const botLog = signalRecorder ? startBotLogSidecar(signalRecorder.botlogPath) : null;

@@ -1,3 +1,4 @@
+import { sanitizeLogText } from './log-sanitizer.js';
 /**
  * O-TEL-1 recorder adapter — the real TelemetrySink behind the capture-bridge tap.
  *
@@ -89,7 +90,7 @@ export function startBotLogSidecar(
   const write = (line: string): void => {
     if (head + line.length <= headBudget) {
       head += line.length;
-      try { appendFileSync(path, line, 'utf8'); } catch (e) { if (faults++ < 3) original.error?.(`[bot] botlog write failed: ${String(e)}`); }
+      try { appendFileSync(path, line, 'utf8'); } catch { if (faults++ < 3) original.error?.('[bot] botlog write failed'); }
       return;
     }
     // Past the head budget the tail ROLLS: the newest `tailBudget` bytes survive, everything
@@ -100,11 +101,11 @@ export function startBotLogSidecar(
   };
 
   const fmt = (level: string, args: unknown[]): string => {
-    const body = args.map((a) => {
+    const body = sanitizeLogText(args.map((a) => {
       if (typeof a === 'string') return a;
       try { return JSON.stringify(a); } catch { return String(a); }
-    }).join(' ');
-    return `${new Date(opts.now?.() ?? Date.now()).toISOString()} ${level} ${body}\n`;
+    }).join(' '));
+    return body ? `${new Date(opts.now?.() ?? Date.now()).toISOString()} ${level} ${body}\n` : '';
   };
 
   for (const m of methods) {
@@ -406,8 +407,8 @@ export function wrapTranscribeWithTap<T extends TranscribeFn>(
       write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: true, text: res.text, language: res.language, duration: res.duration, segments: res.segments.length });
       return res;
     } catch (e) {
-      const x = e as { kind?: string; status?: number; message?: string };
-      write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: false, kind: x?.kind ?? 'unknown', status: x?.status, error: x?.message });
+      const x = e as { kind?: string; status?: number };
+      write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: false, kind: x?.kind ?? 'unknown', status: x?.status, error_code: 'transcription_failed' });
       throw e;
     }
   }) as T;
@@ -496,10 +497,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
       capped = true;
       // ONE observation, not one per dropped frame — a capped 6-hour meeting would otherwise emit
       // hundreds of thousands of identical lines and bury everything else in the pod's logs.
-      signalEvent('tape-capped', {
-        path, max_bytes: maxBytes, bytes: written, frames: seq, hints,
-        note: 'tape stopped; the meeting continues unaffected',
-      });
+      signalEvent('tape-capped', { max_bytes: maxBytes, bytes: written, frames: seq, hints });
       return false;
     }
     written += line.length;
@@ -630,7 +628,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     captureObservation(rec: ObservationRecord): void { observationSidecar.write(rec); },
   };
 
-  if (writer) signalEvent('tape-started', { path, max_bytes: maxBytes, platform: inv.platform });
+  if (writer) signalEvent('tape-started', { max_bytes: maxBytes, platform: inv.platform });
 
   let closed = false;
   return {

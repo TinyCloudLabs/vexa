@@ -814,11 +814,16 @@ def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
 def main() -> None:
     import uvicorn
 
+    from .obs import LOG_CONFIG, configure_privacy_logging
+
+    configure_privacy_logging()
     uvicorn.run(
         build_production_app(),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        log_config=LOG_CONFIG,
+        access_log=False,
     )
 
 

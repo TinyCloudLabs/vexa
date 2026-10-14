@@ -88,7 +88,7 @@ class Scheduler:
         if idem_key:
             existing = self._idem.get(idem_key)
             if existing:
-                logger.info("duplicate idempotency_key=%s, returning existing job", idem_key)
+                logger.info("duplicate scheduled job")
                 return json.loads(existing)
             self._idem[idem_key] = json.dumps(job)
         self._jobs[json.dumps(job)] = job["execute_at"]
@@ -167,15 +167,12 @@ class Scheduler:
                 job["status"] = "pending"
                 self._executing.pop(job_id, None)
                 self._jobs[json.dumps(job)] = self.clock.now() + delay
-                logger.warning(
-                    "job %s attempt %d/%d failed, retry in %ss",
-                    job_id, attempt, max_attempts, delay,
-                )
+                logger.warning("scheduled job dispatch failed; retrying")
                 return
             job["status"] = "failed"
-            job["error"] = str(e)
+            job["error"] = type(e).__name__
             job["failed_at"] = self.clock.now()
-            logger.error("job %s permanently failed after %d attempts", job_id, max_attempts)
+            logger.error("scheduled job dispatch permanently failed")
 
         self._executing.pop(job_id, None)
         self._history[job_id] = json.dumps(job)

@@ -84,17 +84,18 @@ try { syncBrowserDataFromS3(config, liveDir); } catch (e) { restoreErr = e; }
 check(restoreErr instanceof SessionSyncError, 'failing restore must throw SessionSyncError (typed, not a bare exec death)');
 if (restoreErr instanceof SessionSyncError) {
   check(restoreErr.step === 'session-restore', `restore error must name the session-restore step, got '${restoreErr.step}'`);
-  const namedEndpoint = /\(endpoint (.+?), path /.exec(restoreErr.message)?.[1];
-  check(namedEndpoint === config.s3Endpoint, `restore error must name the exact endpoint, got '${namedEndpoint}'`);
+  check(restoreErr.message.includes('session-restore failed: aws sync failed'), 'restore error keeps only a static failure code');
+  check(!restoreErr.message.includes(config.s3Endpoint) && !restoreErr.message.includes(config.userdataS3Path!), 'restore error omits endpoint and S3 key');
 }
 
-// ── 3b. a missing aws CLI is named as such ──────────────────────────────────
+// ── 3b. a missing aws CLI is reduced to the same fixed error code ───────────
 process.env.PATH = join(work, 'empty-bin');   // no aws anywhere on PATH
 mkdirSync(process.env.PATH, { recursive: true });
 let missingErr: unknown;
 try { syncBrowserDataFromS3(config, liveDir); } catch (e) { missingErr = e; }
 check(missingErr instanceof SessionSyncError, 'missing aws CLI must still surface as SessionSyncError');
-check(String((missingErr as Error)?.message ?? '').includes('aws CLI not found'), 'missing aws CLI must be named in the error');
+check(String((missingErr as Error)?.message ?? '').includes('session-restore failed: aws sync failed'),
+  'missing aws CLI must use the fixed session-restore error code');
 process.env.PATH = realPath;
 
 // ── 3c. restore with incomplete config is a no-op (anonymous bots unaffected) ──

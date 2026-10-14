@@ -7,7 +7,7 @@ is eager-created keyed by the bot's connectionId, and the quota / dedup seams su
 from __future__ import annotations
 
 import json
-
+import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
@@ -197,7 +197,7 @@ async def test_bot_spawn_info_log_redacts_user_content(monkeypatch, capsys):
     assert "TC965_PARTICIPANT_CANARY" not in output
     assert "TC965_TRANSCRIPT_CANARY" not in output
     assert "meet.google.com/xxx-xxxx-xxx" not in output
-    assert '"meeting_id":"1"' in output
+    assert f'"meeting_id":"{hashlib.sha256(b"1").hexdigest()[:16]}"' in output
     assert SECRET not in output
     assert "tok-test" not in output
 

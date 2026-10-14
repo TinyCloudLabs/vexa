@@ -36,7 +36,7 @@ export async function checkForTeamsRejection(page: Page): Promise<boolean> {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
-          log(`🚨 Teams admission rejection detected: Found rejection indicator "${selector}"`);
+          log("Teams admission rejection detected");
           return true;
         }
       } catch (e) {
@@ -60,7 +60,7 @@ export async function checkForAdmissionIndicators(page: Page): Promise<boolean> 
       if (isVisible) {
         const isDisabled = await element.getAttribute('aria-disabled');
         if (isDisabled !== 'true') {
-          log(`✅ Found admission indicator: ${selector}`);
+          log("Teams admission indicator found");
           return true;
         }
       }

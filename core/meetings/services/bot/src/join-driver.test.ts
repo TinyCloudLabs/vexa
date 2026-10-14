@@ -59,8 +59,8 @@ const teamsRedirect = new TeamsJoinRedirectError(
 );
 check('TeamsJoinRedirectError is NOT an AdmissionError (driver re-raises → message survives)',
   !(teamsRedirect instanceof AdmissionError));
-check('TeamsJoinRedirectError carries the typed reasonCode in its message',
-  teamsRedirect.message.startsWith(`${TEAMS_AUTH_REDIRECT}:`));
+check('TeamsJoinRedirectError carries only its typed reasonCode in its message',
+  teamsRedirect.message === TEAMS_AUTH_REDIRECT);
 
 for (const event of ['crash', 'close'] as const) {
   const page = Object.assign(new EventEmitter(), { isClosed: () => false });

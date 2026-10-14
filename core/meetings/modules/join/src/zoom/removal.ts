@@ -1,5 +1,5 @@
 import { Page } from "playwright";
-import { log } from "../_host";
+import { log, logJSON } from "../_host";
 import { zoomLeaveButtonSelector, zoomMeetingEndedModalSelector, zoomRemovalTexts } from "./selectors";
 import { dismissZoomPopups } from "./leave";
 
@@ -35,11 +35,11 @@ export function startZoomRemovalMonitor(
   const joinedAtMs = Date.now();
   const GRACE_PERIOD_MS = 20_000; // 20s grace — Zoom audio init can take 10-15s with slow networks
 
-  const triggerRemoval = async (_reason: string) => {
+  const triggerRemoval = async () => {
     if (stopped) return;
     stopped = true;
-    const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
-    log(`[Zoom Web] REMOVAL TRIGGERED (${elapsed}s after join)`);
+    const elapsedMs = Date.now() - joinedAtMs;
+    logJSON({ level: "info", event: "removal.detected", platform: "zoom", removed: true, elapsed_ms: elapsedMs });
     onRemoval && await onRemoval();
   };
 
@@ -66,9 +66,9 @@ export function startZoomRemovalMonitor(
     // Any navigation away from the zoom.us domain means the meeting ended
     // (covers company SSO redirects, homepages, sign-in pages, etc.)
     if (!/zoom\.(us|com|eu|com\.cn|com\.br|com\.au|de|fr|jp|ca|co\.uk)\b/.test(url)) {
-      triggerRemoval('navigation-away');
+      triggerRemoval();
     } else if (url.includes('/signin') || url.includes('/login')) {
-      triggerRemoval('sign-in-redirect');
+      triggerRemoval();
     } else if (url.includes('/wc/') && !url.includes('/meeting')) {
       // Non-meeting /wc/ URL — but only if it's not a known init pattern
       log(`[Zoom Web] Suspicious non-meeting /wc/ URL (${elapsed}s after join) — deferring to polling`);
@@ -95,10 +95,10 @@ export function startZoomRemovalMonitor(
         const trimmed = modalText.trim();
         const isRemoval = zoomRemovalTexts.some(t => trimmed.includes(t));
         if (isRemoval) {
-          await triggerRemoval(`Removal/end modal detected: "${trimmed}"`);
+          await triggerRemoval();
           return;
         } else {
-          log(`[Zoom Web] Ignoring non-removal modal: "${trimmed}"`);
+          log("[Zoom Web] Ignoring non-removal modal");
         }
       }
 
@@ -109,7 +109,7 @@ export function startZoomRemovalMonitor(
       }, zoomRemovalTexts).catch(() => null);
 
       if (detected) {
-        await triggerRemoval(`Removal detected via text: "${detected}"`);
+        await triggerRemoval();
         return;
       }
 
@@ -131,29 +131,29 @@ export function startZoomRemovalMonitor(
         } else {
           // Navigated off Zoom entirely — immediate exit (no counter needed)
           if (url && !url.startsWith('about:') && !/zoom\.(us|com|eu|com\.cn|com\.br|com\.au|de|fr|jp|ca|co\.uk)\b/.test(url)) {
-            await triggerRemoval(`Leave button gone and URL left Zoom domain: ${url}`);
+            await triggerRemoval();
             return;
           }
           // Redirected to sign-in — immediate exit
           if (url.includes('/signin') || url.includes('/login')) {
-            await triggerRemoval(`Leave button gone and redirected to sign-in: ${url}`);
+            await triggerRemoval();
             return;
           }
           // For other conditions, only act after consecutive misses
           if (consecutiveLeaveButtonMisses >= LEAVE_BUTTON_MISS_THRESHOLD) {
             // Redirected away from meeting page within Zoom
             if (url.includes('/wc/') && !url.includes('/meeting')) {
-              await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and URL is non-meeting: ${url}`);
+              await triggerRemoval();
               return;
             }
             // Error page or blank
             if (title === 'Error - Zoom' || title === '') {
-              await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and page shows error (title="${title}")`);
+              await triggerRemoval();
               return;
             }
             // Generic post-meeting title
             if (zoomPostMeetingTitles.includes(title)) {
-              await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and post-meeting title: "${title}"`);
+              await triggerRemoval();
               return;
             }
           }
@@ -166,7 +166,7 @@ export function startZoomRemovalMonitor(
       }
     } catch {
       // Page navigated away or context destroyed
-      await triggerRemoval('Exception in removal poll — page likely navigated away');
+      await triggerRemoval();
       return;
     }
 
@@ -179,7 +179,6 @@ export function startZoomRemovalMonitor(
 
   return () => {
     stopped = true;
-    page.off('framenavigated', onNavigated);
-    log('[Zoom Web] Removal monitor stopped');
+    logJSON({ level: "info", event: "removal.monitor_stopped", platform: "zoom" });
   };
 }

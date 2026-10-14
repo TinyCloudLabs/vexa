@@ -1,4 +1,4 @@
-import { log } from './log.js';
+import { log, logJSON } from './log.js';
 import { isLowConfidenceSegment } from './confidence.js';
 
 export interface TranscriptionWord {
@@ -152,13 +152,13 @@ export class TranscriptionClient {
 
         if (fault.retryable && !isLastAttempt) {
           const delay = this.retryDelayMs * Math.pow(2, attempt);
-          log(`[TranscriptionClient] ${fault.kind} (attempt ${attempt + 1}/${this.maxRetries + 1}): ${fault.message}. Retrying in ${delay}ms...`);
+          logJSON({ level: 'warn', event: 'transcription_retry', kind: fault.kind, attempt: attempt + 1, status: fault.status ?? 0, retry_delay_ms: delay });
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
 
         // Non-retryable (402/401/4xx) or retries exhausted → surface the typed fault.
-        log(`[TranscriptionClient] transcription failed after ${attempt + 1} attempt(s): ${fault.message}`);
+        logJSON({ level: 'error', event: 'transcription_failed', kind: fault.kind, attempt: attempt + 1, status: fault.status ?? 0 });
         throw fault;
       }
     }

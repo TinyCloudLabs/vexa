@@ -1,6 +1,6 @@
 import { AdmissionError } from '../shared/admission';
 import { Page } from "playwright";
-import { log, callJoiningCallback } from "../_host";
+import { log, logJSON, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import {
   zoomNameInputSelector,
@@ -67,7 +67,7 @@ export function buildZoomWebClientUrl(meetingUrl: string): string {
       const pathMatch = url.pathname.match(/\/j\/(\d+)/);
       const meetingId = pathMatch?.[1];
       if (!meetingId) {
-        throw new Error(`Cannot extract meeting ID from Zoom URL: ${meetingUrl}`);
+        throw new Error('zoom_meeting_id_missing');
       }
       const pwd = url.searchParams.get('pwd') || '';
       const wcUrl = new URL(`https://app.zoom.us/wc/${meetingId}/join`);
@@ -80,10 +80,11 @@ export function buildZoomWebClientUrl(meetingUrl: string): string {
     // extra-step UI (T&C, guest-name confirm, etc.). Bot picks back up
     // once Zoom's pre-join name input renders.
     return meetingUrl;
-  } catch (err: any) {
+  } catch (err) {
+    if (err instanceof Error && err.message === 'zoom_meeting_id_missing') throw err;
     // If already a web client URL or unrecognised format, return as-is
     if (meetingUrl.includes('/wc/')) return meetingUrl;
-    throw new Error(`Invalid Zoom meeting URL: ${meetingUrl} — ${err.message}`);
+    throw new Error('zoom_invalid_meeting_url');
   }
 }
 
@@ -153,7 +154,7 @@ export async function joinZoomMeeting(
     if (elapsed >= HOST_NOT_STARTED_MAX_WAIT_MS) {
       throw new Error('[Zoom Web] Host did not start the meeting within the wait timeout');
     }
-    log(`[Zoom Web] Host not started yet (title="${title}"). Retrying in ${HOST_NOT_STARTED_RETRY_INTERVAL_MS / 1000}s...`);
+    log(`[Zoom Web] Host not started yet; retrying after ${HOST_NOT_STARTED_RETRY_INTERVAL_MS / 1000}s`);
     await page.waitForTimeout(HOST_NOT_STARTED_RETRY_INTERVAL_MS);
   }
 
@@ -174,7 +175,7 @@ export async function joinZoomMeeting(
       const otBtn = page.locator(otSel).first();
       if (await otBtn.isVisible({ timeout: 1500 })) {
         await otBtn.click();
-        log(`[Zoom Web] Dismissed cookie-consent banner (${otSel})`);
+        log("[Zoom Web] Cookie-consent banner dismissed");
         await page.waitForTimeout(400);
         break;
       }
@@ -203,7 +204,7 @@ export async function joinZoomMeeting(
       const dismissBtn = page.locator(zoomPermissionDismissSelector).first();
       const visible = await dismissBtn.isVisible({ timeout: 1000 });
       if (visible) {
-        log(`[Zoom Web] WARNING: No "Allow" button found, falling back to dismiss — audio capture may not work (attempt ${attempt + 1})`);
+        log(`[Zoom Web] Audio permission fallback used (attempt ${attempt + 1})`);
         await dismissBtn.click();
         await page.waitForTimeout(600);
       } else {
@@ -255,7 +256,7 @@ export async function joinZoomMeeting(
       await page.locator(passcodeInputSelector).first().fill(passcode);
       log(`[Zoom Web] Filled passcode field`);
     } else {
-      throw new Error('[Zoom Web] passcode_required: meeting requires a passcode but botConfig.passcode is empty; pass passcode to the embedder or include ?pwd=... in the meeting URL');
+      throw new Error('zoom_passcode_required');
     }
   }
 
@@ -278,20 +279,20 @@ export async function joinZoomMeeting(
     if (await nameField.isVisible({ timeout: 1500 }).catch(() => false)) {
       const current = await nameField.inputValue().catch(() => '');
       if (current) {
-        log(`[Zoom Web] Signed-in name pre-filled ("${current}") — using account identity`);
+        logJSON({ level: "info", event: "join.name_entry", platform: "zoom", name_entered: true, success: true });
       } else {
         await nameField.click({ timeout: 5000 }).catch(() => {});
         await page.keyboard.type(botName, { delay: 30 });
-        log(`[Zoom Web] Signed-in name field empty — typed fallback "${botName}"`);
+        logJSON({ level: "info", event: "join.name_entry", platform: "zoom", name_entered: true, success: true });
       }
     } else {
-      log('[Zoom Web] No name field — signed-in client uses the account name directly');
+      logJSON({ level: "info", event: "join.name_entry", platform: "zoom", name_entered: true, success: true });
     }
   } else {
     await page.locator(zoomNameInputSelector).first().click({ timeout: 5000 }).catch(() => {});
     await page.locator(zoomNameInputSelector).first().fill('');
     await page.keyboard.type(botName, { delay: 30 });
-    log(`[Zoom Web] Name typed: "${botName}"`);
+    logJSON({ level: "info", event: "join.name_entry", platform: "zoom", name_entered: true, success: true });
   }
 
   // Wait for Zoom to enable the Join button. The CLASSIC web client gates
@@ -312,9 +313,7 @@ export async function joinZoomMeeting(
   const joinEnableTimeoutMs = humanGate ? 15 * 60 * 1000 : 8000;
   if (humanGate) {
     const which = signInWall ? 'sign-in / bots-not-allowed wall' : 'reCAPTCHA';
-    log(`[Zoom Web] ⚠️ ${which} is gating the Join button — a HUMAN must clear it ` +
-        `via noVNC (sign in as a Zoom account / solve the captcha). ` +
-        `Holding the browser open up to 15 min for Join to become enabled...`);
+    log(`[Zoom Web] Human verification gate active; holding for ${joinEnableTimeoutMs}ms`);
   }
   await page.waitForFunction(
     (sel: string) => {

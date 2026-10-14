@@ -187,10 +187,8 @@ export async function waitForJitsiMeetingAdmission(
 
     const terminal = await isRejectedOrEnded(page);
     if (terminal) {
-      log(`[Jitsi] Terminal state during admission wait (matched: "${terminal}")`);
-      // A lobby decline / kick is a permanent host verdict — a typed denial, not a transient
-      // join_failure — so the driver records `awaiting_admission_rejected`, not a retry.
-      throw new AdmissionError("denial", `Bot was rejected from the Jitsi meeting or meeting ended (matched: "${terminal}")`);
+      log("[Jitsi] Terminal admission state detected");
+      throw new AdmissionError("denial", "jitsi_admission_denied");
     }
 
     if (await isAdmitted(page)) {
@@ -230,7 +228,7 @@ export async function waitForJitsiMeetingAdmission(
   // Timed out waiting to be let in. A typed `lobby_timeout` (not a bare Error) so the driver
   // reports `awaiting_admission_timeout` / stage=awaiting_admission — an honest terminal reason
   // — instead of collapsing to a generic, silently-retried `join_failure` (#592).
-  throw new AdmissionError("lobby_timeout", `[Jitsi] Bot not admitted within ${effectiveTimeout()}ms timeout`);
+  throw new AdmissionError("lobby_timeout", "jitsi_lobby_timeout");
 }
 
 export async function checkForJitsiAdmissionSilent(page: Page): Promise<boolean> {

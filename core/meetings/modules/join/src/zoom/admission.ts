@@ -1,6 +1,6 @@
 import { AdmissionError } from '../shared/admission';
 import { Page } from "playwright";
-import { log, callAwaitingAdmissionCallback, callBlockedCallback } from "../_host";
+import { log, logJSON, callAwaitingAdmissionCallback, callBlockedCallback } from "../_host";
 import { BotConfig } from "../_host";
 import { checkEscalation, triggerEscalation, getEscalationExtensionMs } from "../shared/escalation";
 import {
@@ -164,7 +164,7 @@ export async function waitForZoomMeetingAdmission(
   // isAdmitted() rules out the waiting room before its weaker fallbacks fire,
   // so a true here means the bot is genuinely in the meeting.
   if (await isAdmitted(page)) {
-    log('[Zoom Web] Bot immediately admitted (no waiting room detected)');
+    logJSON({ level: "info", event: "admission.admitted", platform: "zoom", admitted: true });
     return true;
   }
 
@@ -176,23 +176,23 @@ export async function waitForZoomMeetingAdmission(
   {
     const wall = await detectZoomBotBlock(page);
     if (wall) {
-      log(`[Zoom Web] 🚫 Anti-bot wall detected (matched: "${wall}") — this meeting requires Zoom RTMS; bots cannot join via the web client. Failing fast.`);
-      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { matched: wall, phase: 'pre_admission_poll' });
+      logJSON({ level: "warn", event: "admission.rejected", platform: "zoom", admitted: false, error_code: "anti_bot_wall" });
+      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { phase: 'pre_admission_poll' });
       // PERMANENT platform verdict: Zoom itself refuses browser bots here — a re-spawn hits the
       // same wall. `denial` is the closest sealed outcome (a distinct `blocked` CompletionReason
       // needs lane:contract — see join-driver.ts).
-      throw new AdmissionError('denial', '[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins and requires Zoom RTMS (Realtime Media Streams); route to the RTMS path');
+      throw new AdmissionError('denial', 'zoom_requires_rtms');
     }
   }
 
   // Check if in waiting room
   const inWaiting = await isInWaitingRoom(page);
   if (inWaiting) {
-    log('[Zoom Web] Bot is in waiting room — waiting for host admission');
+    logJSON({ level: "info", event: "admission.waiting", platform: "zoom", waiting_room: true });
     try {
       await callAwaitingAdmissionCallback(botConfig);
-    } catch (e: any) {
-      log(`[Zoom Web] Warning: awaiting_admission callback failed: ${e.message}`);
+    } catch {
+      log("[Zoom Web] Awaiting-admission callback failed");
     }
   }
 
@@ -206,7 +206,7 @@ export async function waitForZoomMeetingAdmission(
     await page.waitForTimeout(pollInterval);
 
     if (await isRejectedOrEnded(page)) {
-      log('[Zoom Web] Bot was rejected or meeting ended during admission wait');
+      logJSON({ level: "warn", event: "admission.rejected", platform: "zoom", admitted: false, error_code: "admission_denied" });
       throw new AdmissionError('denial', 'Bot was rejected from the Zoom meeting or meeting ended');
     }
 
@@ -215,13 +215,13 @@ export async function waitForZoomMeetingAdmission(
     // we transition to terminal `blocked` instead of accruing unknown-state time.
     const wall = await detectZoomBotBlock(page);
     if (wall) {
-      log(`[Zoom Web] 🚫 Anti-bot wall detected during poll (matched: "${wall}") — requires Zoom RTMS. Failing fast.`);
-      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { matched: wall, phase: 'admission_poll' });
-      throw new AdmissionError('denial', '[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins and requires Zoom RTMS (Realtime Media Streams); route to the RTMS path');
+      logJSON({ level: "warn", event: "admission.rejected", platform: "zoom", admitted: false, error_code: "anti_bot_wall" });
+      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { phase: 'admission_poll' });
+      throw new AdmissionError('denial', 'zoom_requires_rtms');
     }
 
     if (await isAdmitted(page)) {
-      log('[Zoom Web] Bot admitted — Leave button now visible');
+      logJSON({ level: "info", event: "admission.admitted", platform: "zoom", admitted: true });
       return true;
     }
 
@@ -240,11 +240,11 @@ export async function waitForZoomMeetingAdmission(
       await triggerEscalation(botConfig, escalation.reason);
     }
 
-    const elapsed = Math.round(elapsedMs / 1000);
-    log(`[Zoom Web] Still waiting for admission... ${elapsed}s elapsed`);
+    logJSON({ level: "info", event: "admission.waiting", platform: "zoom", elapsed_ms: elapsedMs, waiting_room: inWaitingNow });
   }
 
-  throw new AdmissionError('lobby_timeout', `[Zoom Web] Bot not admitted within ${effectiveTimeout()}ms timeout`);
+  logJSON({ level: "warn", event: "admission.rejected", platform: "zoom", admitted: false, error_code: "lobby_timeout", duration: Date.now() - startTime });
+  throw new AdmissionError('lobby_timeout', 'zoom_lobby_timeout');
 }
 
 export async function checkForZoomAdmissionSilent(page: Page): Promise<boolean> {

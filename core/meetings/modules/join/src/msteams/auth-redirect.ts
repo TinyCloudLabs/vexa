@@ -77,53 +77,25 @@ export function meetingOriginHost(meetingUrl: string): string | null {
   return hostOf(meetingUrl);
 }
 
-/**
- * `origin + pathname` — the whole diagnostic value with none of the customer data. The sign-in
- * query string carries tenant/client identifiers and the full meetup-join payload in
- * `redirect_uri`; logs and `last_error` are read by humans and shipped off-box, so the query is
- * dropped rather than redacted field-by-field.
- */
-export function redactUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return "(unparseable url)";
-  }
-}
 
 /** The typed terminal for a Teams join that is not on the meeting. */
 export class TeamsJoinRedirectError extends Error {
   readonly reasonCode: TeamsJoinRedirectReason;
-  /** The redacted page URL the join was standing on when it gave up. */
-  readonly observedUrl: string;
-  constructor(reasonCode: TeamsJoinRedirectReason, observedUrl: string, detail: string) {
-    super(`${reasonCode}: ${detail} (url=${observedUrl})`);
+  constructor(reasonCode: TeamsJoinRedirectReason) {
+    super(reasonCode);
     this.name = "TeamsJoinRedirectError";
     this.reasonCode = reasonCode;
-    this.observedUrl = observedUrl;
   }
 }
 
 /** Build the sign-in-redirect terminal for `currentUrl`. */
-export function authRedirectError(currentUrl: string): TeamsJoinRedirectError {
-  return new TeamsJoinRedirectError(
-    TEAMS_AUTH_REDIRECT,
-    redactUrl(currentUrl),
-    "the anonymous Teams join was redirected to the Microsoft sign-in page; this meeting link " +
-      "offered no anonymous pre-join, so the bot never reached the meeting and no host was " +
-      "ever asked to admit it",
-  );
+export function authRedirectError(_currentUrl: string): TeamsJoinRedirectError {
+  return new TeamsJoinRedirectError(TEAMS_AUTH_REDIRECT);
 }
 
 /** Build the off-meeting-origin terminal for `currentUrl`. */
-export function offMeetingOriginError(currentUrl: string, requestedHost: string | null): TeamsJoinRedirectError {
-  return new TeamsJoinRedirectError(
-    TEAMS_OFF_MEETING_ORIGIN,
-    redactUrl(currentUrl),
-    "the Teams pre-join never rendered and the page is on neither the requested meeting host " +
-      `(${requestedHost ?? "unknown"}) nor any Teams host`,
-  );
+export function offMeetingOriginError(_currentUrl: string, _requestedHost: string | null): TeamsJoinRedirectError {
+  return new TeamsJoinRedirectError(TEAMS_OFF_MEETING_ORIGIN);
 }
 
 /**

@@ -1,5 +1,5 @@
 import { Page, ElementHandle } from "playwright";
-import { log, randomDelay, callJoiningCallback } from "../_host";
+import { log, logJSON, randomDelay, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import {
   googleNameInputSelectors,
@@ -59,16 +59,13 @@ const CTA_SCAN_EVERY_POLLS = 5;
  *  not the CTA, and the scan's whole safety argument is uniqueness. */
 const CTA_SCAN_GRACE_MS = 8000;
 /** Origin tag for the structural scan. DIAGNOSTIC-ONLY: the scan never clicks or
- *  returns a handle to the join flow (owner ruling on #856/#917). It is retained
- *  purely to (a) record candidate labels for the failure diagnostic and (b) emit
- *  a telemetry line when it WOULD have uniquely resolved a lobby the selectors
- *  could not — the evidence a future re-promotion would need. */
+ * returns a handle to the join flow. It emits telemetry only when a unique
+ * candidate exists; visible labels never leave the browser context. */
 export const STRUCTURAL_CTA_ORIGIN = "structural:lobby-primary-cta";
 
-/** Result of the browser-context lobby scan. `el` is non-null ONLY when exactly
- *  one candidate passed — see findLobbyPrimaryCta. `labels` is every candidate's
- *  visible text, kept for the failure diagnostic. */
-export interface LobbyCtaScan { el: Element | null; labels: string[] }
+/** Result of the browser-context lobby scan. Text is used only to classify
+ * candidates; only the count and a possible element handle leave the page. */
+export interface LobbyCtaScan { el: Element | null; candidate_count: number }
 export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars: number }
 
 /**
@@ -91,11 +88,10 @@ export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars:
  * the document passes. A second text-labelled button — a consent dialog, a
  * "cancel", an unrecognized icon rendering as ligature text — makes the result
  * ambiguous, and an ambiguous result resolves nothing and clicks nothing. The
- * caller then fails loud with every candidate label recorded. Over-inclusion
+ * caller then fails with a bounded diagnostic and candidate count. Over-inclusion
  * degrades to a diagnosable timeout; it never degrades to the wrong control.
  */
 export function findLobbyPrimaryCta(opts: LobbyCtaScanOptions): LobbyCtaScan {
-  const labels: string[] = [];
   const candidates: Element[] = [];
   const buttons = document.querySelectorAll("button");
   for (let i = 0; i < buttons.length; i++) {
@@ -106,25 +102,20 @@ export function findLobbyPrimaryCta(opts: LobbyCtaScanOptions): LobbyCtaScan {
     if (rect.width <= 0 || rect.height <= 0) continue;
     const style = btn.ownerDocument.defaultView.getComputedStyle(btn);
     if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") continue;
-    // Icon affordance, in any language.
     if (btn.querySelector(opts.iconGlyphSelector) !== null) continue;
     const text = (btn.textContent || "").replace(/\s+/g, " ").trim();
     if (text.length === 0 || text.length > opts.maxLabelChars) continue;
-    // A Material ligature that escaped the icon filter ("mic_off", "more_vert")
-    // is not a label: no natural-language CTA contains an underscore.
     if (text.indexOf("_") >= 0) continue;
-    // Must contain an actual letter — a glyph/number-only button is not a CTA.
     if (!/\p{L}/u.test(text)) continue;
-    labels.push(text);
     candidates.push(btn);
   }
-  return { el: candidates.length === 1 ? candidates[0] : null, labels: labels };
+  return { el: candidates.length === 1 ? candidates[0] : null, candidate_count: candidates.length };
 }
 
 /** Run findLobbyPrimaryCta in the page and lift the winner into an ElementHandle. */
 async function scanLobbyPrimaryCta(
   page: Page
-): Promise<{ handle: ElementHandle<Element> | null; labels: string[] }> {
+): Promise<{ handle: ElementHandle<Element> | null; candidate_count: number }> {
   const opts: LobbyCtaScanOptions = {
     iconGlyphSelector: googleLobbyIconGlyphSelectors.join(", "),
     maxLabelChars: googleLobbyCtaMaxLabelChars,
@@ -132,11 +123,14 @@ async function scanLobbyPrimaryCta(
   let scan: any = null;
   try {
     scan = await page.evaluateHandle(findLobbyPrimaryCta, opts);
-    const labels = (await (await scan.getProperty("labels")).jsonValue()) as string[];
+    const candidateCount = (await (await scan.getProperty("candidate_count")).jsonValue()) as number;
     const handle = (await scan.getProperty("el")).asElement();
-    return { handle: (handle as ElementHandle<Element>) || null, labels: labels || [] };
+    return {
+      handle: (handle as ElementHandle<Element>) || null,
+      candidate_count: Number.isSafeInteger(candidateCount) && candidateCount >= 0 ? candidateCount : 0,
+    };
   } catch {
-    return { handle: null, labels: [] };
+    return { handle: null, candidate_count: 0 };
   } finally {
     if (scan) { try { await scan.dispose(); } catch { /* best-effort */ } }
   }
@@ -169,17 +163,18 @@ async function firstVisibleSelector(
  * the failure is diagnosable from `meeting.data.last_error` alone — the pods
  * that saw the lobby are long gone by the time anyone reads it (#846 A4).
  */
-async function observedPageContext(page: Page): Promise<string> {
-  let url = "?";
-  try { url = page.url(); } catch { /* best-effort */ }
+async function observedPageContext(page: Page): Promise<{ html_lang: string; navigator_language: string }> {
   try {
-    const ctx: any = await page.evaluate(() => ({
+    const ctx = await page.evaluate(() => ({
       lang: document.documentElement.getAttribute("lang") || "",
       nav: navigator.language || "",
     }));
-    return `url=${url} html.lang=${ctx.lang || "?"} navigator.language=${ctx.nav || "?"}`;
+    return {
+      html_lang: /^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(ctx.lang) ? ctx.lang : "unknown",
+      navigator_language: /^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(ctx.nav) ? ctx.nav : "unknown",
+    };
   } catch {
-    return `url=${url} html.lang=? navigator.language=?`;
+    return { html_lang: "unknown", navigator_language: "unknown" };
   }
 }
 
@@ -187,32 +182,36 @@ async function observedPageContext(page: Page): Promise<string> {
  * Screenshot + compose the LOUD failure message for a total selector miss
  * (no-fallbacks.md — a missing control fails with a logged reason + screenshot,
  * never a silent skip). The message keeps its historical prefix verbatim (prod
- * monitoring greps it) and appends the observed locale/URL, plus the visible
- * text-button labels when a structural scan ran — the one datum that turns the
- * next occurrence into a one-look diagnosis.
+ * monitoring greps it) and appends only the observed locale. URLs and visible
+ * page labels are intentionally excluded from the error and process logs.
  */
 export async function describeSelectorMiss(
   page: Page,
   selectors: string[],
   timeoutMs: number,
   label: string,
-  candidateLabels: string[] | null
+  candidateCount: number | null
 ): Promise<string> {
   const shot = `/app/storage/screenshots/bot-checkpoint-${label.replace(/[^a-z0-9]+/gi, "-")}-not-found.png`;
   try { await page.screenshot({ path: shot, fullPage: true }); } catch { /* best-effort */ }
-  log(`📸 Screenshot: ${label} not found by any of ${selectors.length} selectors (tried: ${selectors.join(" | ")})`);
   const context = await observedPageContext(page);
-  const seen = candidateLabels === null
-    ? ""
-    : `; visible text buttons: ${candidateLabels.length === 0 ? "(none)" : candidateLabels.map((t) => `"${t}"`).join(" | ")}`;
-  return `Could not locate ${label} by any locale-agnostic or English selector after ${timeoutMs}ms (${context}${seen})`;
+  logJSON({
+    level: "warn",
+    event: "join.selector_miss",
+    platform: "google_meet",
+    selector_count: selectors.length,
+    candidate_count: candidateCount,
+    timeout_ms: timeoutMs,
+    ...context,
+  });
+  return `code=selector_not_found timeout_ms=${timeoutMs} html_lang=${context.html_lang} navigator_language=${context.navigator_language}`;
 }
 
 /**
  * Wait for the FIRST of an ordered selector list to become visible
  * (locale-agnostic selectors first, English text fallbacks last). Returns the
  * matched handle and the selector that won. On total failure: screenshot + LOUD
- * throw carrying the observed locale/URL.
+ * throw carrying the observed locale only.
  */
 export async function waitForAnySelector(
   page: Page,
@@ -226,7 +225,7 @@ export async function waitForAnySelector(
     signal?.throwIfAborted();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
-      log(`Located ${label} via selector: ${hit.selector}`);
+      log("[Google Meet] Selector matched");
       return hit;
     }
     await page.waitForTimeout(SELECTOR_POLL_MS);
@@ -247,12 +246,10 @@ export async function waitForAnySelector(
  * locale is now pinned, so Meet renders English by construction and the exact
  * selectors above resolve it deterministically.
  *
- * What the scan is kept for: (a) its candidate labels feed the failure diagnostic
- * (so a total miss still records every visible text button), and (b) when it WOULD
- * have uniquely resolved a lobby that the selector list could not, it logs a
- * telemetry line — that is the only evidence a future re-promotion could stand on
- * (does a real non-English lobby exist where the scan uniquely wins?). It does not
- * shorten or lengthen the selector budget.
+ * What the scan is kept for: when it WOULD have uniquely resolved a lobby that
+ * the selector list could not, it logs a telemetry line — the only evidence a
+ * future re-promotion could stand on (does a real non-English lobby exist where
+ * the scan uniquely wins?). It does not shorten or lengthen the selector budget.
  */
 export async function waitForLobbyCta(
   page: Page,
@@ -264,26 +261,24 @@ export async function waitForLobbyCta(
   const started = Date.now();
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
   let polls = 0;
-  // null until the scan has actually run: "(none)" must mean "the lobby showed
-  // no text-labelled button", never "the scan never got to look".
-  let lastLabels: string[] | null = null;
+  let lastCandidateCount: number | null = null;
   do {
     signal?.throwIfAborted();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
-      log(`Located ${label} via selector: ${hit.selector}`);
+      log("[Google Meet] Selector matched");
       return hit;
     }
     if (Date.now() - started >= graceMs && polls % CTA_SCAN_EVERY_POLLS === 0) {
       const scan = await scanLobbyPrimaryCta(page);
-      lastLabels = scan.labels;
+      lastCandidateCount = scan.candidate_count;
       // Diagnostic-only: the scan is NOT allowed to resolve the CTA. If it would
       // have uniquely picked a button the selector list has not matched this poll,
       // record that as telemetry — prod evidence for whether a real non-English
       // lobby exists where re-promoting the scan would help. We do NOT click it,
       // and we dispose the handle so nothing downstream can.
       if (scan.handle) {
-        log(`structural scan candidate (diagnostic-only): "${scan.labels[0]}"`);
+        log("Google Meet diagnostic selector candidate found");
         try { await scan.handle.dispose(); } catch { /* best-effort */ }
       }
     }
@@ -291,7 +286,7 @@ export async function waitForLobbyCta(
     await page.waitForTimeout(SELECTOR_POLL_MS);
   } while (Date.now() - started < timeoutMs);
 
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastLabels));
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastCandidateCount));
 }
 
 /**
@@ -346,7 +341,8 @@ export async function joinGoogleMeeting(
   // Record the resolved UI locale on the SUCCESS path too (#856): the locale used
   // to be invisible until a failure. observedPageContext reads navigator.language
   // and <html lang> — with the pin in place these should read en-US / en.
-  log(`Lobby locale (#856): ${await observedPageContext(page)}`);
+  const locale = await observedPageContext(page);
+  logJSON({ level: "info", event: "join.lobby_locale", platform: "google_meet", ...locale });
 
   // --- Humanized input layer (defeats Google Meet input-authenticity detection) ---
   const uiMode = resolveUiInteractionMode(botConfig);
@@ -354,9 +350,9 @@ export async function joinGoogleMeeting(
   if (uiMode === "humanized") {
     humanizer = new HumanizedInteractor(MOCAP_LIBRARY, {
       log,
-      onMissScreenshot: async (p, reason) => {
+      onMissScreenshot: async (p, _reason) => {
         await p.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-humanized-click-miss.png', fullPage: true });
-        log(`📸 Screenshot: humanized click abandoned as off-target — ${reason}`);
+        log("[Google Meet] Humanized click missed; using synthetic click");
       },
     });
     if (!(await humanizer.available())) {
@@ -374,8 +370,8 @@ export async function joinGoogleMeeting(
       try {
         await humanizer.navigateAndClick(page, handle);
         return;
-      } catch (e) {
-        log(`Humanized click failed for '${label}' (${e}); falling back to synthetic click.`);
+      } catch {
+        log("Google Meet humanized click failed; using synthetic click");
       }
     }
     await handle.click();
@@ -392,8 +388,8 @@ export async function joinGoogleMeeting(
       try {
         await humanizer.fillField(page, handle, text);
         return;
-      } catch (e) {
-        log(`Humanized fill failed for '${label}' (${e}); falling back to page.fill.`);
+      } catch {
+        log("Google Meet humanized fill failed; using page fill");
       }
     }
     await page.fill(selector, text);
@@ -457,7 +453,7 @@ export async function joinGoogleMeeting(
 
     signal?.throwIfAborted();
     await clickHandle(ctaHandle, "authenticated_join");
-    log(`Bot clicked the authenticated join CTA (via ${ctaSelector}).`);
+    log("Google Meet authenticated join CTA clicked");
 
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-join-now.png', fullPage: true });
     log("📸 Screenshot taken: After join click (authenticated)");
@@ -478,6 +474,7 @@ export async function joinGoogleMeeting(
 
     signal?.throwIfAborted();
     await fillField(nameHandle!, nameFieldSelector, botName, "name");
+    logJSON({ level: "info", event: "join.name_entry", platform: "google_meet", success: true });
 
     // Mute mic and camera if available
     try {
@@ -503,7 +500,7 @@ export async function joinGoogleMeeting(
     );
     signal?.throwIfAborted();
     await clickHandle(joinHandle!, "ask_to_join");
-    log(`${botName} joined the Google Meet Meeting.`);
+    log("Google Meet display name entered and join requested");
 
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-ask-to-join.png', fullPage: true });
     log("📸 Screenshot taken: After clicking 'Ask to join'");

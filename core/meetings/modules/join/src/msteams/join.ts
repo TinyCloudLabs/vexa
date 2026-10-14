@@ -1,5 +1,5 @@
 import { Page } from "playwright";
-import { log, callJoiningCallback } from "../_host";
+import { log, logJSON, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import {
   teamsContinueButtonSelectors,
@@ -19,7 +19,6 @@ import {
   classifyNonMeetingUrl,
   isMicrosoftLoginUrl,
   meetingOriginHost,
-  redactUrl,
 } from "./auth-redirect";
 
 // NOTE vs the monolith: the WebRTC remote-audio hook and the voice-agent
@@ -42,7 +41,7 @@ async function warmUpTeamsMediaDevices(page: Page): Promise<void> {
         return `media warm-up failed: ${err?.message || err}`;
       }
     });
-    log(`[Teams Join] ${result}`);
+    log("[Teams Join] Media warm-up completed");
   } catch (err: any) {
     log(`[Teams Join] Media warm-up evaluate failed`);
   }
@@ -215,9 +214,9 @@ export async function joinMicrosoftTeams(
     const nameInput = page.locator(teamsNameInputSelectors.join(', ')).first();
     await nameInput.waitFor({ timeout: 5000 });
     await nameInput.fill(botName);
-    log(`✅ Display name set to "${botName}"`);
-  } catch (error) {
-    log("ℹ️ Display name input not found, continuing...");
+    logJSON({ level: "info", event: "join.name_entry", platform: "teams", name_entered: true, success: true });
+  } catch {
+    logJSON({ level: "warn", event: "join.name_entry", platform: "teams", name_entered: false, success: false });
   }
 
   log("Step 5: Ensuring Computer audio is selected...");

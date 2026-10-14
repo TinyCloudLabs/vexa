@@ -200,9 +200,8 @@ async def upload_signal_tape(
     await storage.upload(key, data, content_type=_content_type(media_format))
     log_event(
         "signal_tape_stored", audience="operator", span="recordings.signal",
-        user_id=owner, meeting_id=str(meeting_id),
-        fields={"session_uid": session_uid, "part": part, "bytes": len(data),
-                "storage_path": key},
+        meeting_id=str(meeting_id),
+        fields={"part": part, "bytes": len(data)},
     )
     return {"status": "stored", "storage_path": key, "bytes": len(data),
             "meeting_id": meeting_id, "part": part}

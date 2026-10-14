@@ -592,11 +592,11 @@ async def test_dead_letter_on_permanent_failure(fake_redis, capsys):
     assert len(dl_logs) == 1, "expected exactly one webhook_dead_lettered log event"
     log = dl_logs[0]
     assert log["audience"] == "system" and log["level"] == "warning"
-    assert log["fields"]["target_host"] == "hooks.example.com"
+    assert log["fields"]["has_target"] is True
+    assert "target_host" not in log["fields"] and "label" not in log["fields"]
     assert "url" not in log["fields"]
-    assert "/vexa" not in json.dumps(log["fields"])
     assert log["fields"]["reason"] == "schedule_exhausted"
-    assert log["fields"]["last_status_code"] == 500
+    assert log["fields"]["status_code"] == 500
 
 
 async def test_dead_letter_on_age_expiry(fake_redis, capsys):
@@ -614,7 +614,9 @@ async def test_dead_letter_on_age_expiry(fake_redis, capsys):
     assert record["reason"] == "max_age_exceeded" and record["label"] == "meeting:7"
     lines = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip().startswith("{")]
     assert any(
-        e.get("event") == "webhook_dead_lettered" and e["fields"]["reason"] == "max_age_exceeded"
+        e.get("event") == "webhook_dead_lettered"
+        and e["fields"]["reason"] == "max_age_exceeded"
+        and e["fields"]["has_target"] is True
         for e in lines
     ), "expected a webhook_dead_lettered log for the age-expired entry"
 
@@ -647,7 +649,7 @@ async def test_transport_exception_text_is_never_logged_or_dead_lettered(
     assert secret_text not in output
     assert "/private/" not in output
     assert "token=do-not-log" not in output
-    assert "transport_exception" in output
+    assert '"error_code":"transport_exception"' in output
 
 
 # ════════════════════════════════════════════════════════════════════════════════════

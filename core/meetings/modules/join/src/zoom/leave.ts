@@ -41,7 +41,7 @@ export async function dismissZoomPopups(page: Page): Promise<void> {
       const btn = page.locator(selector).first();
       if (await btn.isVisible({ timeout: 0 })) {
         await btn.click();
-        log(`[Zoom Web] Dismissed "${label}" popup`);
+        log("[Zoom Web] Popup dismissed");
       }
     } catch { /* not present or already gone */ }
   }
@@ -52,18 +52,17 @@ export async function leaveZoomMeeting(
   botConfig?: BotConfig,
   reason: string = "manual_leave"
 ): Promise<boolean> {
-  log(`[Zoom Web] Leaving meeting (reason: ${reason})`);
+  log("[Zoom Web] Leave requested");
 
   // Notify the host first so it can record the leave intent even if the UI flow fails.
   if (botConfig) {
     try {
       await callLeaveCallback(botConfig, reason);
-    } catch (callbackError: any) {
+    } catch {
       logJSON({
-        level: "warn",
-        msg: "[Zoom Web] Leave callback failed; continuing with leave attempt",
-        error_message: callbackError?.message,
-        leave_reason: reason,
+        event: "leave.failed",
+        platform: "zoom",
+        error_code: "operation_failed",
       });
     }
   }
@@ -71,7 +70,7 @@ export async function leaveZoomMeeting(
   if (!page || page.isClosed()) {
     // No UI to interact with — let the host drain its pipeline and bail
     try { await stopZoomRecording(page ?? undefined, botConfig); } catch { /* ignore */ }
-    log('[Zoom Web] Page not available for leave — skipping UI leave');
+    logJSON({ level: "info", event: "leave.completed", platform: "zoom", leave_result: true });
     return true;
   }
 
@@ -103,7 +102,7 @@ export async function leaveZoomMeeting(
       return null;
     });
     if (clicked) {
-      log(`[Zoom Web] Clicked Leave button (selector: ${clicked})`);
+      log("[Zoom Web] Leave button clicked");
 
       // Small delay for the confirmation dialog to animate in before we query it.
       await page.waitForTimeout(500);
@@ -129,7 +128,7 @@ export async function leaveZoomMeeting(
           return null;
         });
         if (confirmClicked) {
-          log(`[Zoom Web] Confirmed leave (selector: ${confirmClicked})`);
+          log("[Zoom Web] Leave confirmed");
           confirmed = true;
           // Hold the page open long enough for the WebRTC peer to actually
           // disconnect — pre-fix the 1.5s wait was sometimes insufficient.
@@ -151,13 +150,12 @@ export async function leaveZoomMeeting(
       await page.goto('about:blank').catch(() => {});
       await page.waitForTimeout(1000);
     }
-  } catch (e: any) {
+  } catch {
     logJSON({
       level: "error",
-      msg: "[Zoom Web] Error during leave",
-      error_message: e?.message,
-      error_name: e?.name,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "zoom",
+      error_code: "operation_failed",
       confirmed,
     });
   }
@@ -166,15 +164,14 @@ export async function leaveZoomMeeting(
   // pipeline (final chunk, upload queue) after the UI leave completes.
   try {
     await stopZoomRecording(page, botConfig);
-  } catch (e: any) {
+  } catch {
     logJSON({
-      level: "error",
-      msg: "[Zoom Web] Error stopping recording during leave",
-      error_message: e?.message,
-      error_name: e?.name,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "zoom",
+      error_code: "operation_failed",
     });
   }
 
+  logJSON({ level: "info", event: "leave.completed", platform: "zoom", leave_result: confirmed });
   return true;
 }
