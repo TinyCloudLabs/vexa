@@ -229,7 +229,7 @@ test("image-licenses RED: an undeclared image pinned in a helm TEMPLATE (not jus
   // line is now templated. The test's subject is unchanged: inject a LITERAL pin into the
   // template and require the gate to read it.
   const r = withEdited(MINIO_JOB,
-    "image: {{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}",
+    "image: {{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}{{ with .Values.minio.mcImage.digest }}@{{ . }}{{ end }}",
     "image: somevendor/unaudited:1.2",
     () => runGate("image-licenses"));
   assert.equal(r.green, false, "an undeclared image in a helm template sailed through — the gate never read templates");
