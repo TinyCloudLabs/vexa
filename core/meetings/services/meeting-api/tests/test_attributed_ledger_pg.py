@@ -76,11 +76,11 @@ async def _scratch_database(*, converge: bool = True):
     admin_url, scratch_url, scratch_name = _scratch_url(
         os.environ["MEETING_API_TEST_DATABASE_URL"]
     )
-    admin = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    admin = create_async_engine(admin_url, isolation_level="AUTOCOMMIT", hide_parameters=True)
     async with admin.connect() as c:
         await c.execute(text(f'CREATE DATABASE "{scratch_name}"'))
     try:
-        engine = create_async_engine(scratch_url)
+        engine = create_async_engine(scratch_url, hide_parameters=True)
         from meeting_api.sessions.models import Base
         async with engine.begin() as conn:
             # ``meetings`` carries expression indexes over the MIGRATION-0005 helper function,

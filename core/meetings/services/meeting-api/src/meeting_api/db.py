@@ -24,6 +24,7 @@ def engine_pool_kwargs() -> dict:
         "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
         "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
         "pool_pre_ping": True,
+        "hide_parameters": True,
         # #800: every meeting-api statement arrives as an asyncpg prepared statement, and after
         # warm-up Postgres may switch a parameterized plan to its GENERIC form. For the JSONB
         # containment branches of list_meetings the generic plan cannot use the parameter to pick

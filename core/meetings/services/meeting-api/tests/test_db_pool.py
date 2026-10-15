@@ -19,6 +19,7 @@ def test_engine_pool_kwargs_reads_env(monkeypatch):
     monkeypatch.setenv("DB_MAX_OVERFLOW", "3")
     kw = mdb.engine_pool_kwargs()
     assert kw == {"pool_size": 7, "max_overflow": 3, "pool_pre_ping": True,
+                  "hide_parameters": True,
                   "connect_args": {"server_settings": {"plan_cache_mode": "force_custom_plan"}}}
 
 
@@ -28,6 +29,7 @@ def test_engine_pool_kwargs_defaults(monkeypatch):
     monkeypatch.delenv("DB_MAX_OVERFLOW", raising=False)
     kw = mdb.engine_pool_kwargs()
     assert kw == {"pool_size": 5, "max_overflow": 10, "pool_pre_ping": True,
+                  "hide_parameters": True,
                   "connect_args": {"server_settings": {"plan_cache_mode": "force_custom_plan"}}}
 
 

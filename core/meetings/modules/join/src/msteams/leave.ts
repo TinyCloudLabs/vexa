@@ -23,7 +23,7 @@ export async function prepareForRecording(page: Page, botConfig: BotConfig): Pro
     try {
       return Boolean(await page.evaluate(leaveBrowserClick, teamsLeaveButtonMatchers));
     } catch (err: any) {
-      log(`[performLeaveAction] browser leave click failed: ${err?.message}`);
+      log(`[performLeaveAction] browser leave click failed`);
       return false;
     }
   });
@@ -59,14 +59,11 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
   try {
     log("[leaveMicrosoftTeams] Stopping recording pipeline before leave...");
     await stopTeamsRecording(page, botConfig);
-  } catch (flushError: any) {
+  } catch {
     logJSON({
-      level: "error",
-      msg: "[leaveMicrosoftTeams] Recording pipeline stop failed",
-      error_message: flushError?.message,
-      error_name: flushError?.name,
-      error_stack: flushError?.stack,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "teams",
+      error_code: "operation_failed",
     });
   }
 
@@ -76,19 +73,19 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
       log("[leaveMicrosoftTeams] Calling leave callback before attempting to leave");
       await callLeaveCallback(botConfig, reason);
       log("[leaveMicrosoftTeams] Leave callback sent successfully");
-    } catch (callbackError: any) {
+    } catch {
       logJSON({
-        level: "warn",
-        msg: "[leaveMicrosoftTeams] Leave callback failed; continuing with leave attempt",
-        error_message: callbackError?.message,
-        error_name: callbackError?.name,
-        leave_reason: reason,
+        event: "leave.failed",
+        platform: "teams",
+        error_code: "operation_failed",
       });
     }
   } else {
     logJSON({
       level: "warn",
-      msg: "[leaveMicrosoftTeams] No bot config provided; cannot send leave callback",
+      event: "leave.failed",
+      platform: "teams",
+      error_code: "missing_config",
     });
   }
 
@@ -102,9 +99,7 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
       const isVisible = await hangupButton.isVisible({ timeout: 2000 }).catch(() => false);
 
       if (isVisible) {
-        log(`[leaveMicrosoftTeams] Found ${teamsPrimaryHangupButtonSelector}, clicking with Playwright...`);
-        await hangupButton.click({ timeout: 5000 });
-        log(`[leaveMicrosoftTeams] Successfully clicked ${teamsPrimaryHangupButtonSelector} using Playwright`);
+        logJSON({ level: "info", event: "leave.completed", platform: "teams", leave_result: true });
 
         // Wait for Teams to process the leave
         log("[leaveMicrosoftTeams] Waiting 3 seconds for Teams to process leave...");
@@ -112,8 +107,8 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
         log("[leaveMicrosoftTeams] Wait complete. Teams should have processed the leave action.");
         return true;
       }
-    } catch (hangupError: any) {
-      log(`[leaveMicrosoftTeams] Could not click ${teamsPrimaryHangupButtonSelector} with Playwright: ${hangupError.message}`);
+    } catch {
+      log(`[leaveMicrosoftTeams] Could not click the primary hangup button with Playwright`);
     }
 
     // Fallback to browser-side click method for other selectors
@@ -127,7 +122,7 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
         return false;
       }
     });
-    log(`[leaveMicrosoftTeams] Browser leave action result: ${result}`);
+    logJSON({ level: "info", event: "leave.completed", platform: "teams", leave_result: result === true });
 
     // Wait a bit after clicking leave to allow Teams to process the leave action
     if (result === true) {
@@ -138,8 +133,8 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
 
     // Ensure we return a boolean, not undefined
     return result === true;
-  } catch (error: any) {
-    log(`[leaveMicrosoftTeams] Error calling performLeaveAction in browser: ${error.message}`);
+  } catch {
+    logJSON({ level: "error", event: "leave.failed", platform: "teams", error_code: "operation_failed" });
     return false;
   }
 }

@@ -36,7 +36,7 @@ export async function checkForTeamsRejection(page: Page): Promise<boolean> {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
-          log(`🚨 Teams admission rejection detected: Found rejection indicator "${selector}"`);
+          log("Teams admission rejection detected");
           return true;
         }
       } catch (e) {
@@ -46,7 +46,7 @@ export async function checkForTeamsRejection(page: Page): Promise<boolean> {
     }
     return false;
   } catch (error: any) {
-    log(`Error checking for Teams rejection: ${error.message}`);
+    log(`Error checking for Teams rejection`);
     return false;
   }
 }
@@ -60,7 +60,7 @@ export async function checkForAdmissionIndicators(page: Page): Promise<boolean> 
       if (isVisible) {
         const isDisabled = await element.getAttribute('aria-disabled');
         if (isDisabled !== 'true') {
-          log(`✅ Found admission indicator: ${selector}`);
+          log("Teams admission indicator found");
           return true;
         }
       }
@@ -161,7 +161,7 @@ export async function waitForTeamsMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing with admission wait...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing with admission wait...`);
       }
 
       stillInWaitingRoom = true;
@@ -321,7 +321,7 @@ export async function waitForTeamsMeetingAdmission(
             await callAwaitingAdmissionCallback(botConfig);
             log("Awaiting admission callback sent successfully");
           } catch (callbackError: any) {
-            log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}`);
+            log(`Warning: Failed to send awaiting admission callback`);
           }
 
           // Wait for admission in the lobby

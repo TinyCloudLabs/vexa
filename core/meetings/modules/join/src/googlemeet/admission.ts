@@ -1,5 +1,5 @@
 import { Page } from "playwright";
-import { log, callAwaitingAdmissionCallback, callBlockedCallback } from "../_host";
+import { log, logJSON, callAwaitingAdmissionCallback, callBlockedCallback } from "../_host";
 import { BotConfig } from "../_host";
 import { checkEscalation, triggerEscalation, getEscalationExtensionMs } from "../shared/escalation";
 import {
@@ -110,7 +110,7 @@ export async function classifyGoogleRejection(
       if (!isExplicitDenialIndicator(selector)) continue;
       if (!(await isVisible(selector))) continue;
       captchaSuppressionSince.delete(page as unknown as object);
-      log(`🚨 Google Meet admission rejection detected: explicit host denial "${selector}" (wins over any reCAPTCHA element on the page)`);
+      logJSON({ level: "warn", event: "admission.rejected", platform: "google_meet", admitted: false, error_code: "host_denial" });
       return { rejected: true, reason: "host_denial", selector };
     }
 
@@ -126,16 +126,16 @@ export async function classifyGoogleRejection(
           captchaSuppressionSince.set(page as unknown as object, since);
           const waited = now - since;
           if (waited < CAPTCHA_SOLVE_GRACE_MS) {
-            log(`🤖 Live reCAPTCHA challenge alongside ambiguous indicator "${selector}" — treating as bot-detection, NOT admin rejection. Staying for manual/agent solve (${Math.round(waited / 1000)}s/${Math.round(CAPTCHA_SOLVE_GRACE_MS / 1000)}s).`);
+            logJSON({ level: "info", event: "admission.waiting", platform: "google_meet", waiting_room: false, error_code: "captcha_pending", elapsed_ms: waited });
             return { rejected: false, reason: null, selector };
           }
           captchaSuppressionSince.delete(page as unknown as object);
-          log(`⏱️ reCAPTCHA stay-for-solve bound exceeded (${Math.round(waited / 1000)}s > ${Math.round(CAPTCHA_SOLVE_GRACE_MS / 1000)}s) with "${selector}" still on screen — concluding terminal instead of polling forever.`);
+          logJSON({ level: "warn", event: "admission.rejected", platform: "google_meet", admitted: false, error_code: "captcha_unsolved", elapsed_ms: waited });
           return { rejected: true, reason: "captcha_unsolved", selector };
         }
 
         captchaSuppressionSince.delete(page as unknown as object);
-        log(`🚨 Google Meet admission rejection detected: Found rejection indicator "${selector}"`);
+        logJSON({ level: "warn", event: "admission.rejected", platform: "google_meet", admitted: false, error_code: "error_page" });
         return { rejected: true, reason: "error_page", selector };
       } catch (e) {
         // Continue checking other selectors
@@ -144,8 +144,8 @@ export async function classifyGoogleRejection(
     }
     captchaSuppressionSince.delete(page as unknown as object);
     return { rejected: false, reason: null, selector: null };
-  } catch (error: any) {
-    log(`Error checking for Google Meet rejection: ${error.message}`);
+  } catch {
+    log("Google Meet admission check failed");
     return { rejected: false, reason: null, selector: null };
   }
 }
@@ -184,22 +184,17 @@ export async function countRealParticipantTiles(page: Page): Promise<number> {
   }
 }
 
-export async function dumpAdmissionState(page: Page, tag: string): Promise<void> {
+export async function dumpAdmissionState(page: Page, _tag: string): Promise<void> {
   if (!process.env.DEBUG_ADMISSION) return;
   try {
-    const url = page.url();
-    const wr = await checkForWaitingRoomIndicators(page).catch(() => null);
-    const pid = await page.locator("[data-participant-id]").evaluateAll(
-      els => els.map(e => ({ id: e.getAttribute("data-participant-id"), label: e.getAttribute("aria-label") || (e.textContent || "").trim().slice(0, 30) })),
-    ).catch(() => []);
-    const self = await page.locator("[data-self-name]").evaluateAll(
-      els => els.map(e => e.getAttribute("data-self-name") || ""),
-    ).catch(() => []);
+    const waitingRoom = await checkForWaitingRoomIndicators(page).catch(() => null);
+    const participantCount = await page.locator("[data-participant-id]").count().catch(() => 0);
+    const selfCount = await page.locator("[data-self-name]").count().catch(() => 0);
     const recaptchaFrames = page.frames().filter(f => (f.url() || "").includes("/recaptcha/")).length;
     const realTiles = await countRealParticipantTiles(page);
-    log(`🔎 [ADMIT-DUMP ${tag}] url=${url} waitingRoom=${wr} realTiles=${realTiles} participantTiles=${pid.length} ${JSON.stringify(pid)} selfName=${self.length}${self.length ? " " + JSON.stringify(self) : ""} recaptchaFrames=${recaptchaFrames}`);
-  } catch (e: any) {
-    log(`🔎 [ADMIT-DUMP ${tag}] dump error: ${e?.message}`);
+    log(`[ADMIT-DUMP] waiting_room=${waitingRoom === true} real_tiles=${realTiles} participant_tiles=${participantCount} self_name_count=${selfCount} recaptcha_frames=${recaptchaFrames}`);
+  } catch {
+    log("[ADMIT-DUMP] failed");
   }
 }
 
@@ -263,7 +258,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
         }
         const count = await page.locator(selector).count();
         if (count > 0) {
-          log(`✅ Found Google Meet admission indicator (DOM presence, auto-hide-proof): ${selector}`);
+          log("Google Meet admission indicator found");
           return true;
         }
         continue;
@@ -273,7 +268,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
       if (isVisible) {
         const isDisabled = await element.getAttribute('aria-disabled');
         if (isDisabled !== 'true') {
-          log(`✅ Found Google Meet admission indicator: ${selector}`);
+          log("Google Meet admission indicator found");
           return true;
         }
       }
@@ -333,10 +328,10 @@ const REJECTION_MESSAGE: Record<GoogleRejectionReason, string> = {
   captcha_unsolved: `Bot faced a reCAPTCHA challenge that went unsolved for ${Math.round(CAPTCHA_SOLVE_GRACE_MS / 1000)}s alongside a rejection screen`,
 };
 
-async function throwIfGoogleAdmissionRejected(page: Page, context: string): Promise<void> {
+async function throwIfGoogleAdmissionRejected(page: Page, _context: string): Promise<void> {
   const verdict = await classifyGoogleRejection(page);
   if (verdict.rejected) {
-    log(`🚨 Bot admission concluded terminal for the Google Meet meeting (${verdict.reason}, ${context})`);
+    log(`Google Meet admission denied; reason=${verdict.reason}`);
     throw new AdmissionError("denial", REJECTION_MESSAGE[verdict.reason!]);
   }
 }
@@ -373,7 +368,7 @@ export async function waitForGoogleMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully (immediate admission)");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing.`);
       }
       
       log("Successfully admitted to the Google Meet meeting - no waiting room required");
@@ -410,7 +405,7 @@ export async function waitForGoogleMeetingAdmission(
         await callAwaitingAdmissionCallback(botConfig);
         log("Awaiting admission callback sent successfully");
       } catch (callbackError: any) {
-        log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing with admission wait...`);
+        log(`Warning: Failed to send awaiting admission callback. Continuing with admission wait.`);
       }
       
       stillInWaitingRoom = true;
@@ -505,7 +500,7 @@ export async function waitForGoogleMeetingAdmission(
             await callAwaitingAdmissionCallback(botConfig);
             log("Awaiting admission callback sent successfully (during polling)");
           } catch (callbackError: any) {
-            log(`Warning: Failed to send awaiting admission callback: ${callbackError.message}. Continuing...`);
+              log(`Warning: Failed to send awaiting admission callback. Continuing.`);
           }
 
           stillInWaitingRoom = true;

@@ -34,7 +34,7 @@ export async function dismissTeamsAvConfirmModal(page: Page): Promise<boolean> {
       return true;
     }
   } catch (err: any) {
-    log(`ℹ️ Could not dismiss AV-confirm modal: ${err?.message || err}`);
+    log(`Could not dismiss AV-confirm modal`);
   }
   return false;
 }

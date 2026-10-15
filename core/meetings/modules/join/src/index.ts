@@ -76,7 +76,7 @@ export function resolvePlatform(meetingUrl: string): Platform {
     if (host === "zoom.us" || host.endsWith(".zoom.us")) return "zoom";
     if (host === "meet.jit.si" || host === "8x8.vc" || host.endsWith(".8x8.vc")) return "jitsi";
   } catch { /* fall through to throw below */ }
-  throw new Error(`Cannot infer platform from meeting URL: ${meetingUrl}`);
+  throw new Error('unsupported_meeting_url');
 }
 
 /**

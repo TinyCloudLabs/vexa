@@ -75,7 +75,7 @@ spec:
                   + "@" + os.environ["DB_HOST"] + ":" + os.environ["DB_PORT"] + "/" + os.environ["DB_NAME"]
                   + "?sslmode=" + os.environ["DB_SSL_MODE"]
               )
-              e = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+              e = create_engine(admin_url, isolation_level="AUTOCOMMIT", hide_parameters=True)
               with e.connect() as c:
                   exists = c.execute(text("SELECT 1 FROM pg_database WHERE datname=:n"), {"n": name}).first()
                   if not exists:
@@ -232,7 +232,7 @@ spec:
                   + "@" + os.environ["DB_HOST"] + ":" + os.environ["DB_PORT"] + "/" + os.environ["DB_NAME"]
                   + "?sslmode=" + os.environ["DB_SSL_MODE"]
               )
-              e = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+              e = create_engine(admin_url, isolation_level="AUTOCOMMIT", hide_parameters=True)
               with e.connect() as c:
                   exists = c.execute(text("SELECT 1 FROM pg_database WHERE datname=:n"), {"n": name}).first()
                   if not exists:
@@ -373,7 +373,7 @@ spec:
                   + "@" + os.environ["DB_HOST"] + ":" + os.environ["DB_PORT"] + "/" + os.environ["DB_NAME"]
                   + "?sslmode=" + os.environ["DB_SSL_MODE"]
               )
-              e = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+              e = create_engine(admin_url, isolation_level="AUTOCOMMIT", hide_parameters=True)
               with e.connect() as c:
                   exists = c.execute(text("SELECT 1 FROM pg_database WHERE datname=:n"), {"n": name}).first()
                   if not exists:

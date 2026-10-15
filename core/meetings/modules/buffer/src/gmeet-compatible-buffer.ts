@@ -244,7 +244,7 @@ export class GmeetCompatibleBuffer {
       this.timers.set(speakerId, timer);
     }
 
-    this.log(`[SpeakerStreams] Added speaker "${speakerName}" (${speakerId})`);
+    this.log(`[SpeakerStreams] Added speaker (active=${this.buffers.size})`);
   }
 
   /**
@@ -279,11 +279,9 @@ export class GmeetCompatibleBuffer {
         } else if (detached.totalSamples - detached.confirmedSamples > 0 && !detached.inFlight) {
           void this.submitBuffer(detached, 'input-gap').then(() => {
             if (detached.lastTranscript) this.emitSegment(detached, detached.lastTranscript);
-          }).catch((err: any) => {
-            // P18 (ADR 0010): fail LOUD + attributed — never drop a transcription failure silently.
-            // The typed STT fault carries `.kind` (unauthorized / payment_required / rate_limited / …).
-            this.log(`[SpeakerStreams] [STT-FAULT] ${err?.kind ?? 'error'} on deferred close for ` +
-                `"${detached.speakerName}": ${String(err?.message ?? err)} (audio dropped)`);
+          }).catch(() => {
+            // P18: surface a stable failure marker without transcript or participant data.
+            this.log(`[SpeakerStreams] [STT-FAULT] deferred close failed (audio dropped)`);
           });
         }
       }
@@ -357,7 +355,7 @@ export class GmeetCompatibleBuffer {
         return false;
       }
       buffer.idleSubmitted = true;
-      this.log(`[SpeakerStreams] Final resubmit for "${buffer.speakerName}" after deferred close (${(this.unconfirmedSamples(buffer) / this.sampleRate).toFixed(1)}s audio)`);
+      this.log(`[SpeakerStreams] Final resubmit after deferred close (${(this.unconfirmedSamples(buffer) / this.sampleRate).toFixed(1)}s audio)`);
       void this.submitBuffer(buffer, 'deferred-final');
       return false;
     }
@@ -377,7 +375,7 @@ export class GmeetCompatibleBuffer {
 
     // Hallucination filter — drop known junk before it enters the confirmation pipeline
     if (this.isHallucination(trimmed)) {
-      this.log(`[SpeakerStreams] [FILTERED] Hallucination for "${buffer.speakerName}": "${trimmed.substring(0, 60)}"`);
+      this.log(`[SpeakerStreams] [FILTERED] Hallucination (${trimmed.length} chars)`);
       if (buffer.idleSubmitted) {
         // The FINAL submit hallucinated, but earlier pending text was clean —
         // finalize the last good text rather than losing the whole turn.
@@ -442,7 +440,7 @@ export class GmeetCompatibleBuffer {
             const segEndMs = baseWindowMs + Math.floor(seg.end * 1000);
             if (!seg.text.trim() || !this.onSegmentConfirmed) continue;
             if (this.isHallucination(seg.text.trim())) {
-              this.log(`[SpeakerStreams] [FILTERED] Hallucination segment for "${buffer.speakerName}": "${seg.text.trim().substring(0, 60)}"`);
+              this.log(`[SpeakerStreams] [FILTERED] Hallucination segment (${seg.text.trim().length} chars)`);
               continue;
             }
             const segmentId = `${buffer.speakerId}:${buffer.sequenceNumber}`;
@@ -528,7 +526,7 @@ export class GmeetCompatibleBuffer {
   updateSpeakerName(speakerId: string, newName: string): boolean {
     const buffer = this.buffers.get(speakerId);
     if (!buffer || buffer.speakerName === newName) return false;
-    this.log(`[SpeakerStreams] Updated speaker name "${buffer.speakerName}" → "${newName}" (${speakerId})`);
+    this.log(`[SpeakerStreams] Updated speaker name`);
     buffer.speakerName = newName;
     return true;
   }
@@ -645,7 +643,7 @@ export class GmeetCompatibleBuffer {
             if (buffer.terminalRequestId !== undefined) return;
             buffer.pendingFinal = false;
             buffer.idleSubmitted = true;
-            this.log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — starting terminal replacement (${unconfirmedSec.toFixed(1)}s audio held)`);
+            this.log(`[SpeakerStreams] Changed close while in-flight — starting terminal replacement (${unconfirmedSec.toFixed(1)}s audio held)`);
             await this.submitBuffer(buffer, 'deferred-final', true);
             return;
           }
@@ -653,17 +651,17 @@ export class GmeetCompatibleBuffer {
           // outstanding request took its snapshot. That response is not the complete final turn,
           // so discard it and resubmit the full owned window when it lands.
           buffer.pendingFinal = true;
-          this.log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — final resubmit deferred (${unconfirmedSec.toFixed(1)}s audio held)`);
+          this.log(`[SpeakerStreams] Changed close while in-flight — final resubmit deferred (${unconfirmedSec.toFixed(1)}s audio held)`);
         } else {
           // An ordinary turn close did NOT change the owned audio. Accept the outstanding response
           // as terminal instead of doubling inference work while teardown is waiting on it.
           buffer.idleSubmitted = true;
-          this.log(`[SpeakerStreams] Close while in-flight for "${buffer.speakerName}" — awaiting owned final response (${unconfirmedSec.toFixed(1)}s audio held)`);
+          this.log(`[SpeakerStreams] Close while in-flight — awaiting owned final response (${unconfirmedSec.toFixed(1)}s audio held)`);
         }
         return;
       }
       buffer.idleSubmitted = true;
-      this.log(`[SpeakerStreams] Flush-submit for "${buffer.speakerName}" (${unconfirmedSec.toFixed(1)}s audio, no transcript yet)`);
+      this.log(`[SpeakerStreams] Flush-submit (${unconfirmedSec.toFixed(1)}s audio, no transcript yet)`);
       await this.submitBuffer(buffer, 'forced');
       return;
     }
@@ -731,7 +729,7 @@ export class GmeetCompatibleBuffer {
     if (idleMs > this.idleTimeoutSec * 1000 && this.unconfirmedSamples(buffer) > 0) {
       if (!buffer.idleSubmitted) {
         buffer.idleSubmitted = true;
-        this.log(`[SpeakerStreams] Idle submit for "${buffer.speakerName}" (${(idleMs/1000).toFixed(1)}s idle, final submission)`);
+        this.log(`[SpeakerStreams] Idle submit (${(idleMs/1000).toFixed(1)}s idle, final submission)`);
         await this.submitBuffer(buffer, 'interval');
         return;
       }
@@ -739,7 +737,7 @@ export class GmeetCompatibleBuffer {
         if (buffer.lastTranscript) {
           this.emitSegment(buffer, buffer.lastTranscript);
         }
-        this.log(`[SpeakerStreams] Idle cleanup for "${buffer.speakerName}" (${(idleMs/1000).toFixed(1)}s idle)`);
+        this.log(`[SpeakerStreams] Idle cleanup (${(idleMs/1000).toFixed(1)}s idle)`);
         this.fullReset(buffer);
         return;
       }
@@ -752,7 +750,7 @@ export class GmeetCompatibleBuffer {
         // Nothing confirmed — confirmation never triggered. Force-flush whatever
         // transcript we have to prevent monolith segments (e.g. 120s+ buffer).
         if (buffer.lastTranscript) {
-          this.log(`[SpeakerStreams] Hard cap force-flush for "${buffer.speakerName}" (${totalSec.toFixed(1)}s > ${this.maxBufferDuration}s, no confirmation)`);
+          this.log(`[SpeakerStreams] Hard cap force-flush (${totalSec.toFixed(1)}s, no confirmation)`);
           this.emitSegment(buffer, buffer.lastTranscript);
         }
         this.fullReset(buffer);
@@ -805,8 +803,7 @@ export class GmeetCompatibleBuffer {
     // later louder window submits normally, and the idle path (trySubmit) still emits any earlier
     // lastTranscript and resets. The phrase-list filter remains the language-agnostic backstop.
     if (rms(combined) < this.silenceRmsThreshold) {
-      this.log(`[SpeakerStreams] [SILENT-SKIP] "${buffer.speakerName}" ${(unconfirmed / this.sampleRate).toFixed(1)}s window ` +
-          `below RMS ${this.silenceRmsThreshold} — not submitting (no hallucination surface)`);
+      this.log(`[SpeakerStreams] [SILENT-SKIP] ${(unconfirmed / this.sampleRate).toFixed(1)}s window below RMS ${this.silenceRmsThreshold}`);
       return false;
     }
 
@@ -824,14 +821,13 @@ export class GmeetCompatibleBuffer {
       // clear `inFlight` before requestTranscription() resumes, but it was still a real Whisper
       // submission and must advance the manual seam's next-call deadline.
       return true;
-    } catch (err: any) {
+    } catch {
       buffer.inFlight = false;
       buffer.activeRequestId = 0;
       if (terminal) buffer.terminalRequestId = undefined;
       buffer.submittedTotalSamples = 0;
-      // P18: surface the transcription submit failure with its typed kind — do not swallow it.
-      this.log(`[SpeakerStreams] [STT-FAULT] ${err?.kind ?? 'error'} submitting for ` +
-          `"${buffer.speakerName}": ${String(err?.message ?? err)}`);
+      // P18: surface a stable failure marker without transcript or participant data.
+      this.log(`[SpeakerStreams] [STT-FAULT] transcription submit failed`);
       return false;
     }
   }
@@ -842,12 +838,12 @@ export class GmeetCompatibleBuffer {
   private emitSegment(buffer: SpeakerBuffer, text: string): void {
     if (!text || !this.onSegmentConfirmed) return;
     if (this.isHallucination(text)) {
-      this.log(`[SpeakerStreams] [FILTERED] Hallucination in emit for "${buffer.speakerName}": "${text.substring(0, 60)}"`);
+      this.log(`[SpeakerStreams] [FILTERED] Hallucination in emit (${text.length} chars)`);
       return;
     }
     // Dedup: don't re-emit the same text that was just confirmed (acoustic echo / residual audio)
     if (text === buffer.lastConfirmedText) {
-      this.log(`[SpeakerStreams] Dedup skip for "${buffer.speakerName}": "${text.substring(0, 50)}" (same as last confirmed)`);
+      this.log(`[SpeakerStreams] Dedup skip (${text.length} chars)`);
       // The text is already confirmed, but a pending draft of it may still be dangling under a
       // DIFFERENT id — clear it so no completed:false lingers (the stale-pending bug's dedup case).
       this.clearStaleDraft(buffer, buffer.windowStartMs);
@@ -921,7 +917,7 @@ export class GmeetCompatibleBuffer {
     // the next submission republishes the forming draft under the new id, and turn-close finalizes it.
     buffer.pendingDraftText = '';
 
-    this.log(`[SpeakerStreams] Offset advanced for "${buffer.speakerName}" (confirmed=${buffer.confirmedSamples}, total=${buffer.totalSamples}, trimmed to ${buffer.chunks.length} chunks)`);
+    this.log(`[SpeakerStreams] Offset advanced (confirmed=${buffer.confirmedSamples}, total=${buffer.totalSamples}, trimmed=${buffer.chunks.length})`);
   }
 
   /**
@@ -939,7 +935,7 @@ export class GmeetCompatibleBuffer {
       // Boundary predates this window (offset drift or stale commit) — an
       // over-trim would discard real speech; keeping it only risks one
       // duplicated segment. Keep.
-      this.log(`[SpeakerStreams] trimTailAfter skipped for "${buffer.speakerName}": boundary ${tMs} <= windowStart ${buffer.windowStartMs}`);
+      this.log(`[SpeakerStreams] trimTailAfter skipped: boundary=${tMs} windowStart=${buffer.windowStartMs}`);
       return;
     }
     let excess = buffer.totalSamples - keep;
@@ -959,7 +955,7 @@ export class GmeetCompatibleBuffer {
     buffer.lastTranscript = '';
     buffer.confirmCount = 0;
     buffer.lastWords = [];
-    this.log(`[SpeakerStreams] Boundary trim for "${buffer.speakerName}": dropped ${droppedSec.toFixed(2)}s past segmentation boundary`);
+    this.log(`[SpeakerStreams] Boundary trim (dropped=${droppedSec.toFixed(2)}s)`);
   }
 
   /**

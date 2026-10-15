@@ -378,7 +378,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("segment consumer tick failed")
+                log.error("segment consumer tick failed")
             ticks["segment-consumer"] = _time.monotonic()  # #527: alive this iteration
             await asyncio.sleep(seg_interval)
 
@@ -410,7 +410,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("db-writer tick failed")
+                log.error("db-writer tick failed")
             if do_reconcile:
                 last_reconcile[0] = now  # bound the scan cadence per replica, run or guarded-skip
             ticks["db-writer"] = _time.monotonic()  # #527: alive this iteration
@@ -441,7 +441,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("webhook retry-drain tick failed")
+                log.error("webhook retry-drain tick failed")
             await asyncio.sleep(webhook_interval)
 
     async def _stop_reconcile_loop() -> None:
@@ -494,7 +494,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("stop-reconcile tick failed")
+                log.error("stop-reconcile tick failed")
             await asyncio.sleep(stop_interval)
 
     async def _service_authority_loop() -> None:
@@ -528,7 +528,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("service-authority sweep failed")
+                log.error("service-authority sweep failed")
             ticks["service-authority"] = _time.monotonic()
             await asyncio.sleep(service_authority_interval)
 
@@ -593,7 +593,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("auto-join tick failed")
+                log.error("auto-join tick failed")
             await asyncio.sleep(auto_join_interval)
 
     # Calendar sync: each sweep discovers every user with a connected ICS feed (admin-api internal
@@ -637,7 +637,7 @@ def _attach_background_loops(
                             publish=_cal_publish, client=client,
                         )
                     except Exception:
-                        log.exception("calendar sync failed for user %s", user_id)
+                        log.error("calendar sync failed for user %s", user_id)
                         return
                     if stamps:
                         await store_stamp(redis_client, user_id, aggregate_stamps(stamps))
@@ -657,7 +657,7 @@ def _attach_background_loops(
                 # it — the replica that loses the advisory lock skips the whole fetch this tick.
                 await _guarded("calendar-sync", _tick)
             except Exception:
-                log.exception("calendar sync tick failed")
+                log.error("calendar sync tick failed")
             await asyncio.sleep(calendar_interval)
 
     # Captured-signal tape budget (O-TEL-1). Fixture collection is default ON, so the bound lives on
@@ -688,7 +688,7 @@ def _attach_background_loops(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("signal tape janitor tick failed")
+                log.error("signal tape janitor tick failed")
             await asyncio.sleep(signal_janitor_interval)
 
     async def _ensure_fts_index_once() -> None:
@@ -726,7 +726,7 @@ def _attach_background_loops(
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception(
+            log.error(
                 "ensure_fts_index failed — transcript search falls back to a sequential scan "
                 "until the next boot retries it"
             )
@@ -773,6 +773,9 @@ def _attach_background_loops(
 # lifespan, once the event loop is running.
 def __getattr__(name: str):
     if name == "app":
+        from .obs import configure_privacy_logging
+
+        configure_privacy_logging()
         return build_production_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -812,13 +815,22 @@ def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
 
 
 def main() -> None:
+    import logging.config
+
+    from .obs import LOG_CONFIG, install_process_logging_hooks
+
+    logging.config.dictConfig(LOG_CONFIG)
+    install_process_logging_hooks()
     import uvicorn
 
+    app = build_production_app()
     uvicorn.run(
-        build_production_app(),
+        app,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        log_config=LOG_CONFIG,
+        access_log=False,
     )
 
 

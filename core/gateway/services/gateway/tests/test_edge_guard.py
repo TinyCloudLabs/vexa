@@ -38,9 +38,9 @@ from gateway.ratelimit import PerUserRateLimiter
 
 
 def _guard_middleware(app: FastAPI) -> Any:
-    """Return the SecurityMiddleware entry on ``app`` if present, else None."""
+    """Return the third-party or privacy-wrapped guard middleware entry."""
     for mw in app.user_middleware:
-        if getattr(mw.cls, "__name__", "") == "SecurityMiddleware":
+        if getattr(mw.cls, "__name__", "") in {"SecurityMiddleware", "_PrivacySecurityMiddleware"}:
             return mw
     return None
 
@@ -567,3 +567,59 @@ class TestBothLayers:
             assert (
                 resp.headers.get("retry-after") is None
             )  # guard's 429, not the limiter's
+
+
+def test_guard_rate_limit_logs_cannot_bypass_privacy_handlers():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = r"""
+import logging, os, sys
+sys.path.insert(0, sys.argv[1])
+os.environ.update({
+    "GUARD_ENABLED": "true",
+    "GUARD_ENABLE_REDIS": "false",
+    "GUARD_RATE_LIMIT_RPM": "1",
+})
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from gateway.edge_guard import apply_guard, build_guard_config
+from gateway.obs import configure_process_logging
+configure_process_logging()
+config = build_guard_config()
+app = FastAPI()
+async def transcript(native_meeting_id: str):
+    return {"ok": True}
+app.add_api_route("/transcripts/google_meet/{native_meeting_id}", transcript)
+apply_guard(app, config=config)
+with TestClient(app, client=("127.0.0.1", 123)) as client:
+    headers = {"x-api-key": "TC965_GUARD_API_KEY_CANARY"}
+    first = client.get("/transcripts/google_meet/xxx-xxxx-xxx?ticket=TC965_GUARD_TICKET", headers=headers)
+    limited = client.get("/transcripts/google_meet/xxx-xxxx-xxx?ticket=TC965_GUARD_TICKET", headers=headers)
+print(f"GUARD_STATUS:{first.status_code},{limited.status_code}")
+assert first.status_code == 200
+assert limited.status_code == 429
+assert config.log_request_level is None
+assert config.log_suspicious_level is None
+guard_logger = logging.getLogger("guard_core")
+assert not guard_logger.handlers
+assert guard_logger.propagate
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    assert "GUARD_STATUS:200,429" in output, output
+    for canary in (
+        "TC965_GUARD_API_KEY_CANARY",
+        "TC965_GUARD_TICKET",
+        "xxx-xxxx-xxx",
+        "/transcripts/",
+        "127.0.0.1",
+        "Headers",
+    ):
+        assert canary not in output, f"guard leaked {canary}: {output}"

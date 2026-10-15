@@ -424,7 +424,7 @@ async def db_writer_tick(
             )
             await flush_meeting_processed(redis_c, sink, meeting_id)
         except Exception:  # noqa: BLE001 — isolate per meeting; the next tick retries
-            log.exception("db-writer flush failed for meeting %s", raw_id)
+            log.error("db-writer flush failed for meeting %s", raw_id)
 
     # Finalized-but-incomplete processed streams (ADR 0027): re-drain each parked meeting until its
     # view_end marker is drained-through, or its deadline passes. These meetings have LEFT the sweep
@@ -456,7 +456,7 @@ async def db_writer_tick(
                 )
                 await redis_c.zrem(PROC_PENDING_KEY, raw_id)
         except Exception:  # noqa: BLE001 — isolate per meeting; the next tick retries
-            log.exception("pending processed re-drain failed for meeting %s", raw_id)
+            log.error("pending processed re-drain failed for meeting %s", raw_id)
 
     # #527 C2: bound the ingest stream in steady state (trims only acked entries past the retention
     # window; never an unread one). Isolated — a trim failure never blocks the durable flush above.
@@ -464,7 +464,7 @@ async def db_writer_tick(
         now_ms = int((now.timestamp() if now is not None else datetime.now(timezone.utc).timestamp()) * 1000)
         await _trim_segments_stream(redis_c, STREAM_RETENTION_S, now_ms)
     except Exception:  # noqa: BLE001
-        log.exception("segment stream retention trim failed")
+        log.error("segment stream retention trim failed")
     return total
 
 
@@ -485,5 +485,5 @@ async def finalize_meeting(redis_c, sink, meeting_id: int) -> int:
             deadline = datetime.now(timezone.utc).timestamp() + PROC_PENDING_GRACE_SEC
             await redis_c.zadd(PROC_PENDING_KEY, {str(meeting_id): deadline})
         except Exception:  # noqa: BLE001 — parking is the safety net, never fail the finalize
-            log.exception("could not park meeting %s for the pending processed re-drain", meeting_id)
+            log.error("could not park meeting %s for the pending processed re-drain", meeting_id)
     return stored

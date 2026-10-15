@@ -83,6 +83,25 @@ def test_preflight_reports_capability_rows(monkeypatch):
     assert report["capabilities"]["stt"]["probe"]["ok"] is True
     assert "object_storage" in report["capabilities"]
 
+def test_preflight_log_excludes_probe_url_and_token(caplog, monkeypatch):
+    token = "TC965_TOKEN_CANARY"
+    meeting_url = "https://meet.google.com/xxx-xxxx-xxx"
+    secret_url = f"{meeting_url}?signature={token}"
+    env = {
+        "ADMIN_TOKEN": "admin",
+        "TRANSCRIPTION_SERVICE_URL": secret_url,
+        "TRANSCRIPTION_SERVICE_TOKEN": token,
+    }
+    caplog.set_level("WARNING")
+    monkeypatch.setattr(cp, "_run_probe", lambda spec, values: {
+        "ok": False, "status": 401, "kind": "unauthorized",
+        "reason": f"request to {secret_url} rejected with token {token}",
+    })
+    cp.preflight(env)
+    assert "status=401" in caplog.text
+    assert meeting_url not in caplog.text
+    assert token not in caplog.text
+
 
 # ── the capability tri-state (env-level, pure) ───────────────────────────────────────────────────
 

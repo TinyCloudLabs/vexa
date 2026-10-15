@@ -42,7 +42,7 @@ def _dispose_async_engine():
 @pytest.fixture()
 def client(pg_url, pg_async_url, monkeypatch):
     # Converge the schema synchronously (psycopg URL), then point the async app at the same DB.
-    sync_engine = create_engine(pg_url)
+    sync_engine = create_engine(pg_url, hide_parameters=True)
     Base.metadata.drop_all(sync_engine)
     ensure_schema_sync(sync_engine, Base)
     sync_engine.dispose()
@@ -302,7 +302,7 @@ def test_admin_patch_serializes_with_concurrent_foreign_data_update(
         json={"email": "concurrent-entitlement@vexa.ai"},
     ).json()
     user_id = created["id"]
-    engine = create_engine(pg_url)
+    engine = create_engine(pg_url, hide_parameters=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -387,7 +387,7 @@ def test_user_webhook_serializes_with_concurrent_platform_billing_update(
         f"/admin/users/{user_id}/tokens?scope=bot",
         headers=_admin(),
     ).json()["token"]
-    engine = create_engine(pg_url)
+    engine = create_engine(pg_url, hide_parameters=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -525,7 +525,7 @@ def test_internal_validate_requires_secret(client):
 
 def test_internal_validate_fail_closed_when_secret_unset(pg_url, pg_async_url, monkeypatch):
     """FAIL-CLOSED: INTERNAL_API_SECRET unset + not dev mode → 503 (never silently allow)."""
-    sync_engine = create_engine(pg_url)
+    sync_engine = create_engine(pg_url, hide_parameters=True)
     Base.metadata.drop_all(sync_engine)
     ensure_schema_sync(sync_engine, Base)
     sync_engine.dispose()

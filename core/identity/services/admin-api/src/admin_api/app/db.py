@@ -29,7 +29,10 @@ def configure(
     is preserved unconditionally.
     """
     global _engine, _session_factory
-    kwargs = {"connect_args": {"statement_cache_size": 0}}
+    kwargs = {
+        "connect_args": {"statement_cache_size": 0},
+        "hide_parameters": True,
+    }
     if pool_size is not None:
         kwargs["pool_size"] = pool_size
     if max_overflow is not None:

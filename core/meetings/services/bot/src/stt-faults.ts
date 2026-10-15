@@ -75,7 +75,7 @@ export function createSttFaultReporter(
         byKind.set(kind, { kind, count: 1, status: f.status, detail, first_at: now().toISOString() });
         // FIRST of a kind is loud — an operator watching logs should not wait for the terminal
         // event to learn the backend is refusing. Repeats are silent (the count carries them).
-        log(`[bot] STT DEGRADED (${kind}${f.status ? ` HTTP ${f.status}` : ''}): ${detail ?? 'no detail'} — transcription is failing; this meeting will be short or empty`);
+        log(`[bot] STT DEGRADED (${kind}${f.status ? ` HTTP ${f.status}` : ''}) — transcription is failing; this meeting will be short or empty`);
       } catch { /* an accumulator must never break the path that reports to it */ }
     },
     report(): Record<string, unknown> | undefined {

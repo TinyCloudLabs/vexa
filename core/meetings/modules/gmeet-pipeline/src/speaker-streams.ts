@@ -175,7 +175,7 @@ export class SpeakerStreamManager {
     const timer = setInterval(() => this.trySubmit(speakerId), this.submitInterval * 1000);
     this.timers.set(speakerId, timer);
 
-    log(`[SpeakerStreams] Added speaker "${speakerName}" (${speakerId})`);
+    log(`[SpeakerStreams] Added speaker (active=${this.buffers.size})`);
   }
 
   /**
@@ -210,11 +210,9 @@ export class SpeakerStreamManager {
         } else if (detached.totalSamples - detached.confirmedSamples > 0 && !detached.inFlight) {
           void this.submitBuffer(detached).then(() => {
             if (detached.lastTranscript) this.emitSegment(detached, detached.lastTranscript);
-          }).catch((err: any) => {
-            // P18 (ADR 0010): fail LOUD + attributed — never drop a transcription failure silently.
-            // The typed STT fault carries `.kind` (unauthorized / payment_required / rate_limited / …).
-            log(`[SpeakerStreams] [STT-FAULT] ${err?.kind ?? 'error'} on deferred close for ` +
-                `"${detached.speakerName}": ${String(err?.message ?? err)} (audio dropped)`);
+          }).catch(() => {
+            // P18: surface a stable failure marker without participant or provider error data.
+            log(`[SpeakerStreams] [STT-FAULT] deferred close failed (audio dropped)`);
           });
         }
       }
@@ -288,7 +286,7 @@ export class SpeakerStreamManager {
         return false;
       }
       buffer.idleSubmitted = true;
-      log(`[SpeakerStreams] Final resubmit for "${buffer.speakerName}" after deferred close (${(this.unconfirmedSamples(buffer) / this.sampleRate).toFixed(1)}s audio)`);
+      log(`[SpeakerStreams] Final resubmit after deferred close (${(this.unconfirmedSamples(buffer) / this.sampleRate).toFixed(1)}s audio)`);
       void this.submitBuffer(buffer, true);
       return false;
     }
@@ -308,7 +306,7 @@ export class SpeakerStreamManager {
 
     // Hallucination filter — drop known junk before it enters the confirmation pipeline
     if (isHallucination(trimmed)) {
-      log(`[SpeakerStreams] [FILTERED] Hallucination for "${buffer.speakerName}": "${trimmed.substring(0, 60)}"`);
+      log(`[SpeakerStreams] [FILTERED] Hallucination (${trimmed.length} chars)`);
       if (buffer.idleSubmitted) {
         // The FINAL submit hallucinated, but earlier pending text was clean —
         // finalize the last good text rather than losing the whole turn.
@@ -373,7 +371,7 @@ export class SpeakerStreamManager {
             const segEndMs = baseWindowMs + Math.floor(seg.end * 1000);
             if (!seg.text.trim() || !this.onSegmentConfirmed) continue;
             if (isHallucination(seg.text.trim())) {
-              log(`[SpeakerStreams] [FILTERED] Hallucination segment for "${buffer.speakerName}": "${seg.text.trim().substring(0, 60)}"`);
+              log(`[SpeakerStreams] [FILTERED] Hallucination segment (${seg.text.trim().length} chars)`);
               continue;
             }
             const segmentId = `${buffer.speakerId}:${buffer.sequenceNumber}`;
@@ -443,7 +441,7 @@ export class SpeakerStreamManager {
   updateSpeakerName(speakerId: string, newName: string): boolean {
     const buffer = this.buffers.get(speakerId);
     if (!buffer || buffer.speakerName === newName) return false;
-    log(`[SpeakerStreams] Updated speaker name "${buffer.speakerName}" → "${newName}" (${speakerId})`);
+    log(`[SpeakerStreams] Updated speaker name`);
     buffer.speakerName = newName;
     return true;
   }
@@ -547,7 +545,7 @@ export class SpeakerStreamManager {
             if (buffer.terminalRequestId !== undefined) return;
             buffer.pendingFinal = false;
             buffer.idleSubmitted = true;
-            log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — starting terminal replacement (${unconfirmedSec.toFixed(1)}s audio held)`);
+            log(`[SpeakerStreams] Changed close while in-flight — starting terminal replacement (${unconfirmedSec.toFixed(1)}s audio held)`);
             await this.submitBuffer(buffer, true);
             return;
           }
@@ -555,18 +553,18 @@ export class SpeakerStreamManager {
           // outstanding request took its snapshot. That response is not the complete final turn,
           // so discard it and resubmit the full owned window when it lands.
           buffer.pendingFinal = true;
-          log(`[SpeakerStreams] Changed close while in-flight for "${buffer.speakerName}" — final resubmit deferred (${unconfirmedSec.toFixed(1)}s audio held)`);
+          log(`[SpeakerStreams] Changed close while in-flight — final resubmit deferred (${unconfirmedSec.toFixed(1)}s audio held)`);
         } else {
           // An ordinary turn close did NOT change the owned audio. The outstanding response is
           // already the correct final window: accept it as terminal instead of discarding it and
           // doubling inference work at exactly the point teardown is waiting on.
           buffer.idleSubmitted = true;
-          log(`[SpeakerStreams] Close while in-flight for "${buffer.speakerName}" — awaiting owned final response (${unconfirmedSec.toFixed(1)}s audio held)`);
+          log(`[SpeakerStreams] Close while in-flight — awaiting owned final response (${unconfirmedSec.toFixed(1)}s audio held)`);
         }
         return;
       }
       buffer.idleSubmitted = true;
-      log(`[SpeakerStreams] Flush-submit for "${buffer.speakerName}" (${unconfirmedSec.toFixed(1)}s audio, no transcript yet)`);
+      log(`[SpeakerStreams] Flush-submit (${unconfirmedSec.toFixed(1)}s audio, no transcript yet)`);
       await this.submitBuffer(buffer, true);
       return;
     }
@@ -634,7 +632,7 @@ export class SpeakerStreamManager {
     if (idleMs > this.idleTimeoutSec * 1000 && this.unconfirmedSamples(buffer) > 0) {
       if (!buffer.idleSubmitted) {
         buffer.idleSubmitted = true;
-        log(`[SpeakerStreams] Idle submit for "${buffer.speakerName}" (${(idleMs/1000).toFixed(1)}s idle, final submission)`);
+        log(`[SpeakerStreams] Idle submit (${(idleMs/1000).toFixed(1)}s idle, final submission)`);
         await this.submitBuffer(buffer, true);
         return;
       }
@@ -642,7 +640,7 @@ export class SpeakerStreamManager {
         if (buffer.lastTranscript) {
           this.emitSegment(buffer, buffer.lastTranscript);
         }
-        log(`[SpeakerStreams] Idle cleanup for "${buffer.speakerName}" (${(idleMs/1000).toFixed(1)}s idle)`);
+        log(`[SpeakerStreams] Idle cleanup (${(idleMs/1000).toFixed(1)}s idle)`);
         this.fullReset(buffer);
         return;
       }
@@ -655,7 +653,7 @@ export class SpeakerStreamManager {
         // Nothing confirmed — confirmation never triggered. Force-flush whatever
         // transcript we have to prevent monolith segments (e.g. 120s+ buffer).
         if (buffer.lastTranscript) {
-          log(`[SpeakerStreams] Hard cap force-flush for "${buffer.speakerName}" (${totalSec.toFixed(1)}s > ${this.maxBufferDuration}s, no confirmation)`);
+          log(`[SpeakerStreams] Hard cap force-flush (${totalSec.toFixed(1)}s, no confirmation)`);
           this.emitSegment(buffer, buffer.lastTranscript);
         }
         this.fullReset(buffer);
@@ -704,8 +702,7 @@ export class SpeakerStreamManager {
     // later louder window submits normally, and the idle path (trySubmit) still emits any earlier
     // lastTranscript and resets. The phrase-list filter remains the language-agnostic backstop.
     if (rms(combined) < this.silenceRmsThreshold) {
-      log(`[SpeakerStreams] [SILENT-SKIP] "${buffer.speakerName}" ${(unconfirmed / this.sampleRate).toFixed(1)}s window ` +
-          `below RMS ${this.silenceRmsThreshold} — not submitting (no hallucination surface)`);
+      log(`[SpeakerStreams] [SILENT-SKIP] ${(unconfirmed / this.sampleRate).toFixed(1)}s window below RMS ${this.silenceRmsThreshold}`);
       return;
     }
 
@@ -718,14 +715,13 @@ export class SpeakerStreamManager {
 
     try {
       this.onSegmentReady(buffer.speakerId, buffer.speakerName, combined, requestId, terminal);
-    } catch (err: any) {
+    } catch {
       buffer.inFlight = false;
       buffer.activeRequestId = 0;
       if (terminal) buffer.terminalRequestId = undefined;
       buffer.submittedTotalSamples = 0;
-      // P18: surface the transcription submit failure with its typed kind — do not swallow it.
-      log(`[SpeakerStreams] [STT-FAULT] ${err?.kind ?? 'error'} submitting for ` +
-          `"${buffer.speakerName}": ${String(err?.message ?? err)}`);
+      // P18: surface a stable failure marker without participant or provider error data.
+      log(`[SpeakerStreams] [STT-FAULT] Submission failed`);
     }
   }
 
@@ -735,12 +731,12 @@ export class SpeakerStreamManager {
   private emitSegment(buffer: SpeakerBuffer, text: string): void {
     if (!text || !this.onSegmentConfirmed) return;
     if (isHallucination(text)) {
-      log(`[SpeakerStreams] [FILTERED] Hallucination in emit for "${buffer.speakerName}": "${text.substring(0, 60)}"`);
+      log(`[SpeakerStreams] [FILTERED] Hallucination in emit (${text.length} chars)`);
       return;
     }
     // Dedup: don't re-emit the same text that was just confirmed (acoustic echo / residual audio)
     if (text === buffer.lastConfirmedText) {
-      log(`[SpeakerStreams] Dedup skip for "${buffer.speakerName}": "${text.substring(0, 50)}" (same as last confirmed)`);
+      log(`[SpeakerStreams] Dedup skip (${text.length} chars)`);
       // The text is already confirmed, but a pending draft of it may still be dangling under a
       // DIFFERENT id — clear it so no completed:false lingers (the stale-pending bug's dedup case).
       this.clearStaleDraft(buffer, buffer.windowStartMs);
@@ -814,7 +810,7 @@ export class SpeakerStreamManager {
     // the next submission republishes the forming draft under the new id, and turn-close finalizes it.
     buffer.pendingDraftText = '';
 
-    log(`[SpeakerStreams] Offset advanced for "${buffer.speakerName}" (confirmed=${buffer.confirmedSamples}, total=${buffer.totalSamples}, trimmed to ${buffer.chunks.length} chunks)`);
+    log(`[SpeakerStreams] Offset advanced (confirmed=${buffer.confirmedSamples}, total=${buffer.totalSamples}, trimmed=${buffer.chunks.length})`);
   }
 
   /**
@@ -832,7 +828,7 @@ export class SpeakerStreamManager {
       // Boundary predates this window (offset drift or stale commit) — an
       // over-trim would discard real speech; keeping it only risks one
       // duplicated segment. Keep.
-      log(`[SpeakerStreams] trimTailAfter skipped for "${buffer.speakerName}": boundary ${tMs} <= windowStart ${buffer.windowStartMs}`);
+      log(`[SpeakerStreams] trimTailAfter skipped: boundary=${tMs} windowStart=${buffer.windowStartMs}`);
       return;
     }
     let excess = buffer.totalSamples - keep;
@@ -852,7 +848,7 @@ export class SpeakerStreamManager {
     buffer.lastTranscript = '';
     buffer.confirmCount = 0;
     buffer.lastWords = [];
-    log(`[SpeakerStreams] Boundary trim for "${buffer.speakerName}": dropped ${droppedSec.toFixed(2)}s past segmentation boundary`);
+    log(`[SpeakerStreams] Boundary trim (dropped=${droppedSec.toFixed(2)}s)`);
   }
 
   /**

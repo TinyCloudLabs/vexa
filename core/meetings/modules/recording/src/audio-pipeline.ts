@@ -204,26 +204,24 @@ export class UnifiedRecordingPipeline {
     // miss the first chunk (PulseAudio in particular can deliver bytes
     // immediately).
     this.source.on("chunk", (chunk) => {
-      this._handleChunk(chunk).catch((err) => {
+      this._handleChunk(chunk).catch(() => {
         logJSON({
           level: "error",
           msg: "[audio-pipeline] chunk-handler unhandled error",
           platform: this.platform,
           chunk_seq: chunk.seq,
           is_final: chunk.isFinal,
-          error_message: err?.message,
-          error_name: err?.name,
+          error_code: "chunk_handler_failed",
         });
       });
     });
 
-    this.source.on("error", (err) => {
+    this.source.on("error", () => {
       logJSON({
         level: "error",
         msg: "[audio-pipeline] source error",
         platform: this.platform,
-        error_message: err?.message,
-        error_name: err?.name,
+        error_code: "capture_source_failed",
       });
     });
 
@@ -309,7 +307,7 @@ export class UnifiedRecordingPipeline {
           chunk.isFinal,
           chunk.format,
         );
-      } catch (err: any) {
+      } catch {
         // Surface but do NOT swallow — meeting-api's chunk_seq contract
         // means a missing chunk is detectable on the server side. The
         // recording_finalizer can build a master from the chunks that
@@ -321,7 +319,7 @@ export class UnifiedRecordingPipeline {
           platform: this.platform,
           chunk_seq: chunk.seq,
           is_final: chunk.isFinal,
-          error_message: err?.message,
+          error_code: "chunk_upload_failed",
         });
       } finally {
         this.uploadsInFlight -= 1;
@@ -406,7 +404,7 @@ export class PulseAudioCapture extends EventEmitter implements AudioCaptureSourc
       let started = false;
       this.process.stdout.on("data", (buf: Buffer) => {
         if (!started) {
-          log(`[PulseAudioCapture] receiving audio from ${this.device}.monitor`);
+          log("[PulseAudioCapture] Audio capture started");
           started = true;
           // Emit 'started' BEFORE resolve() so listeners (zoom/web/recording.ts
           // attaches one to call publisher.resetSessionStart) can hook the
@@ -422,13 +420,10 @@ export class PulseAudioCapture extends EventEmitter implements AudioCaptureSourc
         this._appendAndSlice(buf);
       });
 
-      this.process.stderr?.on("data", (data: Buffer) => {
-        const msg = data.toString().trim();
-        if (msg) log(`[PulseAudioCapture] parecord stderr: ${msg}`);
-      });
+      this.process.stderr?.resume();
 
       this.process.on("error", (err: Error) => {
-        log(`[PulseAudioCapture] parecord process error: ${err.message}`);
+        log("[PulseAudioCapture] parecord process failed");
         if (!started) reject(err);
         this.emit("error", err);
       });
@@ -455,8 +450,8 @@ export class PulseAudioCapture extends EventEmitter implements AudioCaptureSourc
     if (this.process) {
       try {
         this.process.kill("SIGTERM");
-      } catch (err: any) {
-        log(`[PulseAudioCapture] kill failed: ${err?.message || err}`);
+      } catch {
+        log("[PulseAudioCapture] parecord process stop failed");
       }
       this.process = null;
     }
@@ -612,8 +607,8 @@ export class MediaRecorderCapture extends EventEmitter implements AudioCaptureSo
             }
 
             return true;
-          } catch (err: any) {
-            log(`[MediaRecorderCapture:${platform}] chunk callback error: ${err?.message || err}`);
+          } catch {
+            log("[MediaRecorderCapture] chunk callback failed");
             return false;
           }
         },

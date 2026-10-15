@@ -32,6 +32,7 @@ namespaced under ``vexa:guard:`` to avoid colliding with Vexa's own keys
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import time
 from collections import defaultdict, deque
@@ -161,7 +162,21 @@ def build_guard_config() -> SecurityConfig:
         fail_secure=False,
         lazy_init=True,
         exclude_paths=_GUARD_EXCLUDE_PATHS,
+        log_request_level=None,
+        log_suspicious_level=None,
     )
+
+
+class _PrivacySecurityMiddleware(SecurityMiddleware):
+    """Keep fastapi-guard's own handler from bypassing Vexa's log sanitizer."""
+
+    def __init__(self, app, *, config: SecurityConfig):
+        super().__init__(app, config=config)
+        logger = logging.getLogger("guard_core")
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = True
 
 
 def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:
@@ -170,17 +185,18 @@ def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:
     No-op when ``GUARD_ENABLED=false`` (operator kill switch). When ``config`` is
     omitted it is built from env via :func:`build_guard_config`.
 
-    Complementary to the per-user ``rate_limiter``: that limiter is keyed by API
-    token, guard's by client IP, with auto-banning of repeat offenders. The two
-    gate different abuse shapes — many-tokens-from-one-IP (caught by per-IP +
-    auto-ban) vs. one-token-across-many-IPs (caught by per-key) — and coexist; the
-    per-key limiter is not replaced.
+    Complementary to the per-user ``rate_limiter``: that limiter is keyed to API
+    tokens, guard's by client IP, with auto-banning of repeat offenders. The two
+    gate different abuse shapes — many-tokens-from-one-IP vs. one-token-across-
+    many-IPs — and coexist; the per-key limiter is not replaced.
     """
     if not _env_bool("GUARD_ENABLED", True):
         return
     if config is None:
         config = build_guard_config()
-    app.add_middleware(SecurityMiddleware, config=config)
+    app.add_middleware(_PrivacySecurityMiddleware, config=config)
+
+
 
 
 # ── WS guard hook ─────────────────────────────────────────────────────────────

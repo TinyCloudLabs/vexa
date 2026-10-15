@@ -215,7 +215,7 @@ async def test_pg_advisory_lock_runs_on_real_postgres():
 
     from meeting_api.sweeps.single_flight import PgAdvisoryLock
 
-    engine = create_async_engine(os.environ["MEETING_API_TEST_DATABASE_URL"])
+    engine = create_async_engine(os.environ["MEETING_API_TEST_DATABASE_URL"], hide_parameters=True)
     try:
         sf = async_sessionmaker(engine, expire_on_commit=False)
         holder, contender = PgAdvisoryLock(sf), PgAdvisoryLock(sf)

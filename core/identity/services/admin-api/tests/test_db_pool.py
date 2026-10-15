@@ -20,6 +20,7 @@ def test_configure_applies_pool_size_and_max_overflow():
     engine = app_db.get_engine()
     assert engine.pool.size() == 7
     assert engine.pool._max_overflow == 3
+    assert engine.sync_engine.hide_parameters is True
 
 
 def test_configure_defaults_to_framework_pool_when_unset():

@@ -26,7 +26,6 @@ import {
   TEAMS_OFF_MEETING_ORIGIN,
   isMicrosoftLoginUrl,
   isTeamsMeetingUrl,
-  redactUrl,
 } from './auth-redirect';
 import { joinMicrosoftTeams } from './join';
 
@@ -136,13 +135,6 @@ const PANTOMIME = ['Step 3:', 'Step 4:', 'Step 5:', 'Step 6:', 'Step 6b:'];
   }
   check('garbage url → isMicrosoftLoginUrl = false', isMicrosoftLoginUrl('not a url'), false);
 
-  // The tenant/client ids and the meetup-join payload in redirect_uri are customer data; the
-  // reported URL keeps origin+path and drops the query.
-  check(
-    'reported URL drops the query string',
-    redactUrl(LOGIN_URL) === 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
-    true,
-  );
 
   // ── 2. The reported failure: sign-in redirect present at first URL read ────
   {
@@ -159,14 +151,12 @@ const PANTOMIME = ['Step 3:', 'Step 4:', 'Step 5:', 'Step 6:', 'Step 6b:'];
       'the reason text is NOT an admission/pre-join timeout',
       /admission|pre-join readiness|timeout period/i.test(String(error?.message ?? '')), false,
     );
-    const observedHost = (() => {
-      try {
-        return new URL(error instanceof TeamsJoinRedirectError ? error.observedUrl : '').hostname;
-      } catch {
-        return null;
-      }
-    })();
-    check('the typed error records the exact sign-in host', observedHost === 'login.microsoftonline.com', true);
+    check(
+      'error contains only the static redirect code',
+      String(error?.message ?? '') === TEAMS_AUTH_REDIRECT,
+      true,
+    );
+    check('error omits URL, host, query, and path data', !/https?:|login\.microsoftonline\.com|client_id|authorize/.test(String(error?.message ?? '')), true);
     check('the reason text carries no query string', String(error?.message ?? '').includes('client_id'), false);
     // The RED cost was 45 700ms here (plus 30 000ms of admission polling after it).
     check(`fails fast: ${elapsedMs}ms << 45000ms pre-join wait`, elapsedMs < 5000, true);

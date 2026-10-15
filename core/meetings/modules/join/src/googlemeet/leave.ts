@@ -30,7 +30,7 @@ export async function prepareForRecording(page: Page, botConfig: BotConfig): Pro
     try {
       return Boolean(await page.evaluate(googleLeaveBrowserClick, googleLeaveButtonMatchers));
     } catch (err: any) {
-      log(`[performLeaveAction] browser leave click failed: ${err?.message}`);
+      log(`[performLeaveAction] browser leave click failed`);
       return false;
     }
   });
@@ -69,18 +69,15 @@ export async function leaveGoogleMeet(page: Page | null, botConfig?: BotConfig, 
   try {
     log("[leaveGoogleMeet] Stopping recording pipeline before leave...");
     await stopGoogleRecording();
-  } catch (flushError: any) {
+  } catch {
     // v0.10.5 Pack G.1 — recording-flush failure means the final chunk
     // never made it; chunks already in MinIO are still durable, but the
     // recording_finalizer won't see is_final=true and the meeting Recording
     // row will stay IN_PROGRESS until reconciler cleanup.
     logJSON({
-      level: "error",
-      msg: "[leaveGoogleMeet] Recording pipeline stop failed",
-      error_message: flushError?.message,
-      error_name: flushError?.name,
-      error_stack: flushError?.stack,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "google_meet",
+      error_code: "operation_failed",
     });
   }
 
@@ -90,19 +87,18 @@ export async function leaveGoogleMeet(page: Page | null, botConfig?: BotConfig, 
       log("[leaveGoogleMeet] Calling leave callback before attempting to leave");
       await callLeaveCallback(botConfig, reason);
       log("[leaveGoogleMeet] Leave callback sent successfully");
-    } catch (callbackError: any) {
+    } catch {
       logJSON({
-        level: "warn",
-        msg: "[leaveGoogleMeet] Leave callback failed; continuing with leave attempt",
-        error_message: callbackError?.message,
-        error_name: callbackError?.name,
-        leave_reason: reason,
+        event: "leave.failed",
+        platform: "google_meet",
+        error_code: "operation_failed",
       });
     }
   } else {
     logJSON({
-      level: "warn",
-      msg: "[leaveGoogleMeet] No bot config provided; cannot send leave callback",
+      event: "leave.failed",
+      platform: "google_meet",
+      error_code: "missing_config",
     });
   }
 
@@ -111,23 +107,20 @@ export async function leaveGoogleMeet(page: Page | null, botConfig?: BotConfig, 
     // never depends on the separately-injected window.performLeaveAction).
     const result = await page.evaluate(googleLeaveBrowserClick, googleLeaveButtonMatchers);
     logJSON({
-      level: "info",
-      msg: "[leaveGoogleMeet] Browser leave action complete",
+      event: "leave.completed",
+      platform: "google_meet",
       leave_result: Boolean(result),
-      leave_reason: reason,
     });
     // Contract: this function is typed Promise<boolean>. page.evaluate can return
     // undefined (e.g. a black/captcha page where the click routine never resolves a
     // value), which otherwise propagates as `result: undefined` to callers that treat
     // it as a tri-state. Coerce to match the declared boolean (and the log above).
     return Boolean(result);
-  } catch (error: any) {
+  } catch {
     logJSON({
-      level: "error",
-      msg: "[leaveGoogleMeet] Error calling the browser leave click",
-      error_message: error?.message,
-      error_name: error?.name,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "google_meet",
+      error_code: "operation_failed",
     });
     return false;
   }

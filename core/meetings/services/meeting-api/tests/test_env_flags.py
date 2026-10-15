@@ -72,6 +72,7 @@ class TestVocabulary:
             env_flag("TRANSCRIBE_ENABLED", True, raw="maybe")
         assert "not a recognized boolean" in caplog.text
         assert "TRANSCRIBE_ENABLED" in caplog.text
+        assert "maybe" not in caplog.text
 
 
 class TestSpawnFlagCallSites:

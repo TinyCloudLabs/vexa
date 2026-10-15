@@ -42,20 +42,20 @@ export function createRedisActsSource(opts: RedisActsSourceOptions): ActsSource 
       try {
         decoded = JSON.parse(message);
       } catch {
-        console.error(`[bot] acts.v1: dropped non-JSON message on ${channel}`);
+        console.error('[bot] acts.v1: dropped non-JSON message');
         return;
       }
       const act = parseAct(decoded);
       if (!act) return; // off-contract or unknown action → ignored (acts.v1 README)
       void Promise.resolve(handler(act)).catch((e) => {
-        console.error(`[bot] acts.v1: handler for '${act.action}' rejected: ${String(e)}`);
+        console.error('[bot] acts.v1: handler rejected');
       });
     };
 
     // node-redis `subscribe` may be async; we don't await here (the port returns a sync
     // unsubscribe fn). Surface a subscribe failure via the error log rather than throwing.
     void Promise.resolve(client.subscribe(channel, onMessage)).catch((e) => {
-      console.error(`[bot] acts.v1: subscribe to ${channel} failed: ${String(e)}`);
+      console.error('[bot] acts.v1: subscription failed');
     });
 
     return () => {
@@ -81,7 +81,7 @@ export type LiveRedisActsClient = RedisActsClient & {
 export function redisActsClientFrom(redisUrl: string): LiveRedisActsClient {
   const client = createClient({ url: redisUrl });
   client.on('error', (err: unknown) => {
-    console.error(`[bot] redis (acts) error: ${(err as Error)?.message ?? String(err)}`);
+    console.error('[bot] redis (acts) error');
   });
   // Idempotent lazy connect (shared with the transcript writer): concurrent first-use callers share
   // ONE connect(), so the "Socket already opened" first-use race can't recur. See redis-lazy-connect.ts.

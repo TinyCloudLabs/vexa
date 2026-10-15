@@ -132,11 +132,11 @@ def test_user_vs_system_audience_split(captured_lines):
     for ln in captured_lines:
         by_event.setdefault(ln["event"], set()).add(ln["audience"])
 
-    # Gateway 'request_accepted' and downstream 'bot_join_requested' are USER-facing.
+    # Gateway request acceptance and downstream bot request are USER-facing.
     assert "user" in by_event.get("request_accepted", set()), by_event
     assert by_event.get("bot_join_requested") == {"user"}, by_event
-    # The proxy hop + edge receive are SYSTEM/operator events.
-    assert by_event.get("downstream_forwarded") == {"system"}, by_event
+    # Proxy-hop debug detail is suppressed by the process-wide INFO floor.
+    assert "downstream_forwarded" not in by_event, by_event
     assert by_event.get("request_received") == {"system"}, by_event
 
     # Every line's audience is one of the two contract-allowed values.

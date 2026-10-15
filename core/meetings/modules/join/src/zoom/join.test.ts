@@ -119,7 +119,7 @@ console.log('\n=== buildZoomWebClientUrl — negative cases (canonical-only) ===
 expectThrows(
   'canonical zoom.us without /j/ — throws',
   () => buildZoomWebClientUrl('https://zoom.us/some-other-path'),
-  'Cannot extract meeting ID',
+  'zoom_meeting_id_missing',
 );
 
 expect(

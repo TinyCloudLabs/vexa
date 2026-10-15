@@ -1,5 +1,5 @@
 import { Page } from "playwright";
-import { log, callJoiningCallback } from "../_host";
+import { log, logJSON, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import { isAdmitted, attachMembersOnlyWatch } from "./admission";
 import { fillPasswordPromptIfPresent } from "./password";
@@ -42,12 +42,12 @@ export function buildJitsiMeetingUrl(
   let url: URL;
   try {
     url = new URL(meetingUrl);
-  } catch (err: any) {
-    throw new Error(`Invalid Jitsi meeting URL: ${meetingUrl} — ${err.message}`);
+  } catch {
+    throw new Error("jitsi_invalid_meeting_url");
   }
   const room = url.pathname.replace(/\/+$/, "");
   if (!room || room === "") {
-    throw new Error(`Cannot extract room from Jitsi URL (no path): ${meetingUrl}`);
+    throw new Error("jitsi_meeting_room_missing");
   }
 
   const existing = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
@@ -89,7 +89,7 @@ async function enterAsGuestIfGated(page: Page): Promise<boolean> {
       return null;
     }, jitsiGuestEntryTexts).catch(() => null);
     if (clicked) {
-      log(`[Jitsi] Auth landing detected — entered as guest (clicked "${clicked}")`);
+      log("[Jitsi] Auth landing detected; entered as guest");
       await page.waitForTimeout(2000);
       return true;
     }
@@ -142,7 +142,7 @@ export async function joinJitsiMeeting(
   attachMembersOnlyWatch(page);
 
   const navUrl = buildJitsiMeetingUrl(meetingUrl, { botName });
-  log(`[Jitsi] Navigating to: ${navUrl}`);
+  log("[Jitsi] Navigating to meeting URL (redacted)");
   await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2000);
 
@@ -177,7 +177,7 @@ export async function joinJitsiMeeting(
       await nameField.fill("");
       await page.keyboard.type(botName, { delay: 30 });
     }
-    log(`[Jitsi] Name entered: "${botName}"`);
+    logJSON({ level: "info", event: "join.name_entry", platform: "jitsi", name_entered: true, success: true });
 
     // Click "Join meeting" DOM-direct first (immune to overlay hit-test stalls),
     // with a Playwright click as the fallback.

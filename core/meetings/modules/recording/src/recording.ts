@@ -34,7 +34,7 @@ export class RecordingService {
    * Start recording — open file and write WAV header placeholder.
    */
   start(): void {
-    log(`[Recording] Starting recording to ${this.filePath}`);
+    log("[Recording] Recording started");
     this.writeStream = fs.createWriteStream(this.filePath);
     // Write a placeholder WAV header (44 bytes) — will be rewritten on finalize
     this.writeStream.write(this.createWavHeader(0));
@@ -74,7 +74,7 @@ export class RecordingService {
     // Browser-based recordings may not use the default WAV path.
     // Point uploads/cleanup to the actual written blob file.
     this.filePath = blobPath;
-    log(`[Recording] Wrote ${data.length} bytes blob to ${blobPath}`);
+    log(`[Recording] Recording blob written: bytes=${data.length}`);
     this.isFinalized = true;
     return blobPath;
   }
@@ -104,7 +104,7 @@ export class RecordingService {
 
           const stats = fs.statSync(this.filePath);
           const durationSeconds = this.totalSamples / this.sampleRate;
-          log(`[Recording] Finalized: ${this.filePath} (${stats.size} bytes, ${durationSeconds.toFixed(1)}s, ${this.totalSamples} samples)`);
+          log(`[Recording] Finalized: bytes=${stats.size}, duration_seconds=${durationSeconds.toFixed(1)}, samples=${this.totalSamples}`);
           resolve(this.filePath);
         } catch (err) {
           reject(err);
@@ -130,7 +130,7 @@ export class RecordingService {
       ? this.totalSamples / this.sampleRate
       : (this.startTime > 0 ? (Date.now() - this.startTime) / 1000 : undefined);
 
-    log(`[Recording] Uploading ${fileStats.size} bytes to ${callbackUrl}`);
+    log(`[Recording] Uploading ${fileStats.size} bytes`);
 
     const boundary = `----VexaRecording${Date.now()}`;
     const metadata = JSON.stringify({
@@ -158,25 +158,20 @@ export class RecordingService {
       try {
         await this._sendUpload(callbackUrl, token, boundary, body, uploadTimeoutMs);
         return; // Success
-      } catch (err: any) {
+      } catch {
         const isLastAttempt = attempt === maxRetries;
         if (isLastAttempt) {
-          // v0.10.5 Pack G.1 — recording-loss diagnostic. The structured
-          // record carries enough fields for the operator to recover from
-          // S3 (meeting_id + session_uid + format) without parsing the
-          // free-text message.
+          // Preserve only bounded counts and size metrics on upload failure.
           logJSON({
             level: "error",
             msg: "[Recording] Upload failed permanently",
             attempts: maxRetries + 1,
-            error_message: err?.message,
-            error_name: err?.name,
+            error_code: "upload_failed",
             file_size_bytes: fileStats.size,
             duration_seconds: durationSeconds,
-            recording_meeting_id: this.meetingId,
-            recording_session_uid: this.sessionUid,
+            meeting_id: this.meetingId,
           });
-          throw err;
+          throw new Error('recording_upload_failed');
         }
         const delay = baseDelayMs * Math.pow(2, attempt);
         logJSON({
@@ -185,9 +180,8 @@ export class RecordingService {
           attempt: attempt + 1,
           attempts_max: maxRetries + 1,
           retry_delay_ms: delay,
-          error_message: err?.message,
-          recording_meeting_id: this.meetingId,
-          recording_session_uid: this.sessionUid,
+          error_code: "upload_failed",
+          meeting_id: this.meetingId,
         });
         await new Promise(resolve => setTimeout(resolve, delay));
       }
@@ -265,17 +259,12 @@ export class RecordingService {
           chunk_seq: chunkSeq,
           is_final: isFinal,
           chunk_size_bytes: chunkData.length,
-          recording_meeting_id: this.meetingId,
-          recording_session_uid: this.sessionUid,
+          meeting_id: this.meetingId,
         });
         return;
-      } catch (err: any) {
+      } catch {
         if (attempt === maxRetries) {
-          // v0.10.5 Pack G.1 — chunk-loss diagnostic. Whether is_final
-          // or not is load-bearing here: a lost final chunk leaves the
-          // meeting Recording row stuck IN_PROGRESS forever (Pack E.1's
-          // outbox is the durable fix on the meeting-api side; this log
-          // is the bot-side audit record).
+          // Preserve the chunk index, final marker, and byte count without provider text or ids.
           logJSON({
             level: "error",
             msg: "[Recording] Chunk upload failed permanently",
@@ -283,12 +272,10 @@ export class RecordingService {
             is_final: isFinal,
             chunk_size_bytes: chunkData.length,
             attempts: maxRetries + 1,
-            error_message: err?.message,
-            error_name: err?.name,
-            recording_meeting_id: this.meetingId,
-            recording_session_uid: this.sessionUid,
+            error_code: "upload_failed",
+            meeting_id: this.meetingId,
           });
-          throw err;
+          throw new Error('recording_upload_failed');
         }
         const delay = 500 * Math.pow(2, attempt);
         logJSON({
@@ -299,9 +286,8 @@ export class RecordingService {
           attempt: attempt + 1,
           attempts_max: maxRetries + 1,
           retry_delay_ms: delay,
-          error_message: err?.message,
-          recording_meeting_id: this.meetingId,
-          recording_session_uid: this.sessionUid,
+          error_code: "upload_failed",
+          meeting_id: this.meetingId,
         });
         await new Promise(resolve => setTimeout(resolve, delay));
       }
@@ -326,16 +312,14 @@ export class RecordingService {
           },
         },
         (res) => {
-          let responseData = '';
-          res.on('data', (chunk) => { responseData += chunk; });
+          res.resume();
           res.on('end', () => {
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
               logJSON({
                 level: "info",
                 msg: "[Recording] Upload successful",
                 http_status: res.statusCode,
-                recording_meeting_id: this.meetingId,
-                recording_session_uid: this.sessionUid,
+                meeting_id: this.meetingId,
               });
               resolve();
             } else {
@@ -346,24 +330,19 @@ export class RecordingService {
                 level: "warn",
                 msg: "[Recording] Upload returned non-2xx",
                 http_status: res.statusCode,
-                response_body_preview: typeof responseData === "string"
-                  ? responseData.slice(0, 500)
-                  : "",
-                recording_meeting_id: this.meetingId,
-                recording_session_uid: this.sessionUid,
               });
-              reject(new Error(`Upload failed with status ${res.statusCode}: ${responseData}`));
+              reject(new Error(`upload_failed_http_${res.statusCode ?? 0}`));
             }
           });
         }
       );
       req.on('timeout', () => {
         req.destroy();
-        reject(new Error(`Upload timed out after ${timeoutMs}ms`));
+        reject(new Error(`recording_upload_timeout_${timeoutMs}ms`));
       });
-      req.on('error', (err) => {
-        log(`[Recording] Upload error: ${err.message}`);
-        reject(err);
+      req.on('error', () => {
+        log(`[Recording] Upload error`);
+        reject(new Error('recording_upload_failed'));
       });
       req.write(body);
       req.end();
@@ -377,10 +356,10 @@ export class RecordingService {
     try {
       if (fs.existsSync(this.filePath)) {
         await fs.promises.unlink(this.filePath);
-        log(`[Recording] Cleaned up ${this.filePath}`);
+        log("[Recording] Temporary file cleaned");
       }
-    } catch (err: any) {
-      log(`[Recording] Cleanup error: ${err.message}`);
+    } catch {
+      log("[Recording] Temporary file cleanup failed");
     }
   }
 

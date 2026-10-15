@@ -41,21 +41,24 @@ const dir = mkdtempSync(join(tmpdir(), 'vexa-teardown-'));
   const fake = { log: (...a: unknown[]) => seen.push(String(a[0])), error: (...a: unknown[]) => seen.push(String(a[0])) };
   // A cap small enough to overflow in a handful of lines: the SHAPE is what is under test.
   const tap = startBotLogSidecar(path, { maxBytes: 600, console: fake });
-  for (let i = 0; i < 60; i++) fake.log(`line ${String(i).padStart(3, '0')} of the meeting`);
+  for (let i = 0; i < 60; i++) fake.log(JSON.stringify({ level: 'info', event: 'capture_signal.tape_started', frames: i }));
+  fake.log('SYNTH_TRANSCRIPT_631');
+  fake.error(new Error('SYNTH_PATH_632'));
   tap.stop();
   const body = readFileSync(path, 'utf8');
   check('every line still reached the real console (a tap that swallows output is a regression)',
-    seen.length === 60 && seen[0].startsWith('line 000'), `${seen.length}`);
-  check('the file keeps the HEAD of the session', body.includes('line 000'), body.slice(0, 120));
-  check('and the TAIL', body.includes('line 059'), body.slice(-160));
+    seen.length === 62 && seen[0].includes('"frames":0'), `${seen.length}`);
+  check('the stored log contains no free-text transcript or path', !body.includes('SYNTH_TRANSCRIPT_631') && !body.includes('SYNTH_PATH_632'));
+  check('the file keeps the HEAD of the session', body.includes('"frames":0'), body.slice(0, 120));
+  check('and the TAIL', body.includes('"frames":59'), body.slice(-160));
   check('and names the gap between them instead of pretending it is contiguous',
     /bytes of log dropped here/.test(body) && tap.truncated(), body.slice(0, 400));
-  check('the middle is what was dropped', !body.includes('line 030'), 'line 030 survived');
+  check('the middle is what was dropped', !body.includes('"frames":30'), 'frame 30 survived');
   check('the console is restored when the tap stops',
     (() => { const before = seen.length; fake.log('after stop'); return seen.length === before + 1; })());
-  // A stamped level and timestamp, so a line can be located in time against the tape's clock.
+  // A stamped level and timestamp, so a line can be located in time against the tape clock.
   check('each line carries an ISO timestamp and its level',
-    /^\d{4}-\d{2}-\d{2}T[\d:.]+Z LOG line 000/.test(body.split('\n')[0]), body.split('\n')[0]);
+    /^\d{4}-\d{2}-\d{2}T[\d:.]+Z LOG \{"level":"info","event":"capture_signal\.tape_started","frames":0\}$/.test(body.split('\n')[0]), body.split('\n')[0]);
 }
 
 // ── 2) The transcript snapshot: a fold over publishes and retractions ────────────────────────────

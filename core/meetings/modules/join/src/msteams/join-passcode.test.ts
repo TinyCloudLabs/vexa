@@ -64,11 +64,11 @@ function fakePage() {
   const leaked = logs.filter((l) => l.includes(PASSCODE));
   check('no log line carries the passcode', leaked.length === 0, JSON.stringify(leaked));
 
-  // The redaction must not have swallowed the line — triage still needs to see WHERE the bot went.
   const navLine = logs.find((l) => l.includes('Navigating to Teams meeting'));
   check(
-    'the navigation is still logged, as origin + path',
-    !!navLine && navLine.includes('https://teams.microsoft.com/meet/397421056486982'),
+    'navigation log excludes the meeting URL and native code',
+    !!navLine && !navLine.includes('teams.microsoft.com') &&
+      !navLine.includes('397421056486982') && !navLine.includes(PASSCODE),
     String(navLine),
   );
 

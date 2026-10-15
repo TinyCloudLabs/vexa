@@ -117,24 +117,18 @@ const AUTH_ESSENTIAL_DIRS = [
  * last restore).
  */
 export class SessionSyncError extends Error {
-  constructor(
-    public readonly step: 'session-restore' | 'session-save',
-    detail: string,
-    public readonly cause?: unknown,
-  ) {
+  constructor(public readonly step: 'session-restore' | 'session-save', detail: string) {
     super(`[session-store] ${step} failed: ${detail}`);
     this.name = 'SessionSyncError';
   }
 }
 
-/** Attribute an `aws` exec failure: a missing CLI (ENOENT / 127) is named as such —
- *  the deployment's image must ship the aws CLI — anything else carries the exit status. */
-function describeAwsFailure(err: any): string {
-  const status = err?.status ?? err?.code;
-  if (status === 127 || err?.code === 'ENOENT') {
-    return 'aws CLI not found on PATH — the bot image (or provisioning host) must ship it';
-  }
-  return `aws exited with ${String(status ?? 'unknown')}: ${String(err?.message ?? err)}`;
+function describeAwsFailure(err: unknown): string {
+  if (!err || typeof err !== 'object') return 'aws exited with unknown status';
+  if ('status' in err && typeof err.status === 'number') return `aws exited with status ${err.status}`;
+  if ('code' in err && err.code === 'ENOENT') return 'aws CLI not found on PATH';
+  if ('code' in err && typeof err.code === 'number') return `aws exited with status ${err.code}`;
+  return 'aws exited with unknown status';
 }
 
 function getS3Env(config: S3Config): Record<string, string> {
@@ -149,22 +143,18 @@ export function s3Sync(localDir: string, s3Path: string, config: S3Config, direc
   if (!config.userdataS3Path || !config.s3Endpoint || !config.s3Bucket) return;
   const s3Uri = `s3://${config.s3Bucket}/${s3Path}`;
   const [src, dst] = direction === 'down' ? [s3Uri, `${localDir}/`] : [`${localDir}/`, s3Uri];
-  console.log(`[s3-sync] S3 sync ${direction}: ${src} → ${dst}`);
+  console.log(`[s3-sync] S3 sync started (${direction})`);
   try {
     // argv-exec, never a shell — config values are arguments, they cannot inject.
     execFileSync(
       'aws',
       ['s3', 'sync', src, dst, '--endpoint-url', config.s3Endpoint, ...excludes.flatMap(e => ['--exclude', e])],
-      { env: getS3Env(config), stdio: 'inherit', timeout: 300000 }
+      { env: getS3Env(config), stdio: 'ignore', timeout: 300000 }
     );
-  } catch (err: any) {
-    // Attributed, typed failure naming the sync step + target (#724 C3). The pre-guard shape —
-    // an unguarded exec — killed the process before Chromium launched with nothing on the
-    // log naming the step (the #461 signature).
+  } catch {
     throw new SessionSyncError(
       direction === 'down' ? 'session-restore' : 'session-save',
-      `${describeAwsFailure(err)} (endpoint ${config.s3Endpoint}, path ${s3Path})`,
-      err,
+      'aws sync failed',
     );
   }
 }
@@ -189,7 +179,7 @@ export function syncBrowserDataToS3(config: S3Config, dataDir: string = BROWSER_
   const endpointArgs = ['--endpoint-url', config.s3Endpoint];
   let uploaded = 0;
 
-  console.log(`[s3-sync] S3 save (auth-essential files only) from ${dataDir}...`);
+  console.log('[s3-sync] S3 save started');
 
   for (const file of AUTH_ESSENTIAL_FILES) {
     const local = join(dataDir, file);
@@ -198,7 +188,7 @@ export function syncBrowserDataToS3(config: S3Config, dataDir: string = BROWSER_
       execFileSync('aws', ['s3', 'cp', local, `${s3Base}/${file}`, ...endpointArgs], { env, stdio: 'pipe', timeout: 10000 });
       uploaded++;
     } catch (err: any) {
-      console.log(`[s3-sync] Warning: failed to upload ${file}: ${describeAwsFailure(err)}`);
+      console.log(`[s3-sync] File upload failed: ${describeAwsFailure(err)}`);
     }
   }
 
@@ -209,7 +199,7 @@ export function syncBrowserDataToS3(config: S3Config, dataDir: string = BROWSER_
       execFileSync('aws', ['s3', 'sync', `${local}/`, `${s3Base}/${dir}/`, ...endpointArgs], { env, stdio: 'pipe', timeout: 10000 });
       uploaded++;
     } catch (err: any) {
-      console.log(`[s3-sync] Warning: failed to sync ${dir}: ${describeAwsFailure(err)}`);
+      console.log(`[s3-sync] Directory sync failed: ${describeAwsFailure(err)}`);
     }
   }
 
@@ -228,20 +218,20 @@ export function saveSessionLocal(destDir: string, srcDataDir: string = BROWSER_D
     if (!existsSync(src)) continue;
     const dst = join(destDir, file);
     mkdirSync(dirname(dst), { recursive: true });
-    try { cpSync(src, dst); n++; } catch (err: any) { console.log(`[session-store] save skip ${file}: ${err.message}`); }
+    try { cpSync(src, dst); n++; } catch { console.log('[session-store] Save item skipped'); }
   }
   for (const dir of AUTH_ESSENTIAL_DIRS) {
     const src = join(srcDataDir, dir);
     if (!existsSync(src)) continue;
-    try { cpSync(src, join(destDir, dir), { recursive: true }); n++; } catch (err: any) { console.log(`[session-store] save skip ${dir}: ${err.message}`); }
+    try { cpSync(src, join(destDir, dir), { recursive: true }); n++; } catch { console.log('[session-store] Save directory skipped'); }
   }
-  console.log(`[session-store] Saved ${n} auth-essential items → ${destDir}`);
+  console.log(`[session-store] Saved ${n} auth-essential items`);
   return n;
 }
 
 /** Copy the auth-essential profile subset back INTO a profile dir before launch. */
 export function loadSessionLocal(srcDir: string, destDataDir: string = BROWSER_DATA_DIR): number {
-  if (!existsSync(srcDir)) { console.log(`[session-store] no saved session at ${srcDir}`); return 0; }
+  if (!existsSync(srcDir)) { console.log('[session-store] No saved session'); return 0; }
   mkdirSync(destDataDir, { recursive: true });
   let n = 0;
   for (const file of AUTH_ESSENTIAL_FILES) {
@@ -249,14 +239,14 @@ export function loadSessionLocal(srcDir: string, destDataDir: string = BROWSER_D
     if (!existsSync(src)) continue;
     const dst = join(destDataDir, file);
     mkdirSync(dirname(dst), { recursive: true });
-    try { cpSync(src, dst); n++; } catch (err: any) { console.log(`[session-store] load skip ${file}: ${err.message}`); }
+    try { cpSync(src, dst); n++; } catch { console.log('[session-store] Load item skipped'); }
   }
   for (const dir of AUTH_ESSENTIAL_DIRS) {
     const src = join(srcDir, dir);
     if (!existsSync(src)) continue;
-    try { cpSync(src, join(destDataDir, dir), { recursive: true }); n++; } catch (err: any) { console.log(`[session-store] load skip ${dir}: ${err.message}`); }
+    try { cpSync(src, join(destDataDir, dir), { recursive: true }); n++; } catch { console.log('[session-store] Load directory skipped'); }
   }
-  console.log(`[session-store] Loaded ${n} auth-essential items ← ${srcDir}`);
+  console.log(`[session-store] Loaded ${n} auth-essential items`);
   return n;
 }
 
@@ -268,7 +258,7 @@ export function cleanStaleLocks(dir: string = BROWSER_DATA_DIR): void {
     const p = join(dir, f);
     if (existsSync(p)) {
       try { unlinkSync(p); } catch {}
-      console.log(`[session-store] Removed stale lock: ${f}`);
+      console.log('[session-store] Removed stale profile lock');
     }
   }
 }

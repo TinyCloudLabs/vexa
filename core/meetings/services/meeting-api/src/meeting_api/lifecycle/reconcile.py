@@ -53,9 +53,9 @@ async def _teardown_verdict(
         return "confirmed"
     except WorkloadUnknown as e:
         log.error(
-            "reconcile: runtime does not know workload %s for meeting %s — termination "
-            "UNCONFIRMED, a live container may be orphaned; NOT advancing the meeting (%s)",
-            bot_container_id, meeting_id, e,
+            "reconcile: runtime does not know workload for meeting %s — termination "
+            "UNCONFIRMED, a live container may be orphaned; NOT advancing the meeting",
+            meeting_id,
         )
         _log_orphan_kill_failed(meeting_id, bot_container_id, e, unconfirmed=True)
         return "untracked"
@@ -92,7 +92,7 @@ async def reconcile_stale_stopping_sweep(
             log.info("stop-reconcile completed stuck meeting %s (session %s) → %s",
                      meeting_id, session_uid, status)
         except Exception:
-            log.exception("stop-reconcile completion failed for meeting %s", meeting_id)
+            log.error("stop-reconcile completion failed for meeting %s", meeting_id)
     return reconciled
 
 
@@ -140,7 +140,7 @@ async def _probe_bot_workload(
     try:
         info = await runtime.get_workload(bot_container_id)
     except Exception:  # noqa: BLE001 — probe is best-effort; unknown ⇒ do NOT reap
-        log.warning("nonterminal-reconcile: get_workload(%s) failed; not reaping", bot_container_id)
+        log.warning("nonterminal-reconcile: get_workload failed; not reaping")
         return "unknown", None
     if info is None:  # 404 — the kernel does not KNOW; never mistake amnesia for evidence
         return "untracked", None
@@ -282,17 +282,15 @@ async def _escalate_untracked_zombie(
         )
         if evidence is not None:
             body["join_evidence"] = evidence
-    log.warning(
-        "nonterminal-reconcile: meeting %s (%s) escalated to failed — %s",
-        meeting_id, status, reason,
-    )
-    _log_untracked_escalated(meeting_id, status, bot_container_id, reason)
+    log.warning("nonterminal-reconcile: meeting %s (%s) escalated to failed",
+                meeting_id, status)
+    _log_untracked_escalated(meeting_id, status, bot_container_id)
     try:
         await post_lifecycle(body)
         tracker.pop(meeting_id, None)
         return True
     except Exception:  # noqa: BLE001 — best-effort; the window stays open, retried next sweep
-        log.exception("untracked-escalation failed for meeting %s", meeting_id)
+        log.error("untracked-escalation failed for meeting %s", meeting_id)
         return False
 
 
@@ -334,7 +332,7 @@ async def reconcile_stale_nonterminal_sweep(
             preactive_grace=active_grace if preactive_grace is None else preactive_grace,
         )
     except Exception:
-        log.exception("nonterminal-reconcile: list_stale_nonterminal failed")
+        log.error("nonterminal-reconcile: list_stale_nonterminal failed")
         return 0
     reconciled = 0
     tracker = _UNTRACKED_SINCE if untracked_since is None else untracked_since
@@ -358,10 +356,10 @@ async def reconcile_stale_nonterminal_sweep(
             if probe == "untracked":
                 _log_workload_untracked(meeting_id, status, bot_container_id)
                 log.error(
-                    "nonterminal-reconcile: runtime does not know workload %s for %s meeting %s — "
+                    "nonterminal-reconcile: runtime does not know workload for %s meeting %s — "
                     "NOT evidence the bot is gone; not reaping (waiting for runtime re-adoption / "
                     "the bot's own callback)",
-                    bot_container_id, status, meeting_id,
+                    status, meeting_id,
                 )
                 # BOUNDED (the zombie-loop fix): once the meeting has been CONTINUOUSLY untracked
                 # past the escalation window — no re-adoption, no bot callback — it converges to
@@ -444,7 +442,7 @@ async def reconcile_stale_nonterminal_sweep(
             log.info("nonterminal-reconcile %s meeting %s (status %s, session %s) → %s",
                      terminal, meeting_id, status, session_uid, result)
         except Exception:
-            log.exception("nonterminal-reconcile failed for meeting %s (status %s)", meeting_id, status)
+            log.error("nonterminal-reconcile failed for meeting %s (status %s)", meeting_id, status)
     # RECOVERY resets the window: any meeting NOT observed untracked in THIS sweep — the runtime
     # re-adopted it (probe alive/gone), a bot callback bumped/terminated the row (no longer listed
     # stale), or it was reconciled — drops its tracker entry. Only CONTINUOUS untracked escalates.
@@ -463,7 +461,7 @@ def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool =
             audience="system",
             level="error" if unconfirmed else "warning",
             span="reconcile.stop",
-            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error": str(err)},
+            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error_type": type(err).__name__},
         )
     except Exception:
         pass
@@ -483,17 +481,15 @@ def _log_workload_untracked(meeting_id, status, workload_id) -> None:
         pass
 
 
-def _log_untracked_escalated(meeting_id, status, workload_id, reason) -> None:
-    """The bounded escalation fired: a meeting whose workload stayed untracked past the window was
-    advanced to `failed` with the evidence note. WARN (declared policy converging), not error —
-    and it fires exactly once per meeting: the terminal row leaves the sweep's listing."""
+def _log_untracked_escalated(meeting_id, status, workload_id) -> None:
+    """The bounded escalation fired after a workload stayed untracked past the window."""
     try:
         from ..obs import log_event
 
         log_event("meeting_workload_untracked_escalated", audience="system", level="warning",
                   span="reconcile.liveness",
                   fields={"meeting_id": meeting_id, "status": status,
-                          "workload_id": workload_id, "reason": reason})
+                          "workload_id": workload_id})
     except Exception:
         pass
 
@@ -580,8 +576,8 @@ async def synthesize_terminal_for_dead_workload(
         return False
     try:
         info = await repo.find_by_container(bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — lookup is best-effort
-        log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
+    except Exception:  # noqa: BLE001 — lookup is best-effort
+        log.warning("runtime-callback: find_by_container failed")
         return False
     if not info or not info.get("session_uid"):
         return False
@@ -637,8 +633,8 @@ async def synthesize_terminal_for_dead_workload(
         log.info("runtime-callback: drove synthetic %s for meeting %s (workload %s %s, was %s)",
                  body["status"], info.get("meeting_id"), workload_id, state, status)
         return True
-    except Exception as e:  # noqa: BLE001 — best-effort; the stop/stale sweeps remain the backstop
-        log.warning("runtime-callback: synthetic terminal POST failed for %s: %s", workload_id, e)
+    except Exception:  # noqa: BLE001 — best-effort; the stop/stale sweeps remain the backstop
+        log.warning("runtime-callback: synthetic terminal POST failed")
         return False
 
 
@@ -659,8 +655,8 @@ async def synthesize_failed_for_dead_workload(
         return False
     try:
         info = await repo.find_by_container(bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — lookup is best-effort
-        log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
+    except Exception:  # noqa: BLE001 — lookup is best-effort
+        log.warning("runtime-callback: find_by_container failed")
         return False
     if not info or info.get("status") not in _PRE_ACTIVE_STATUSES:
         return False  # old contract: only pre-active drove a synthetic failed

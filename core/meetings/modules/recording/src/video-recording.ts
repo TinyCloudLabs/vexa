@@ -55,7 +55,7 @@ export class VideoRecordingService {
     }
 
     const args = this.buildFfmpegArgs();
-    log(`[VideoRecording] Starting ffmpeg (hwaccel=${this.hwaccel}): ffmpeg ${args.join(' ')}`);
+    log("[VideoRecording] Capture starting");
 
     this.ffmpegProcess = spawn('ffmpeg', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -63,22 +63,17 @@ export class VideoRecordingService {
     this.isRunning = true;
     this.startTime = Date.now();
 
-    this.ffmpegProcess.stderr?.on('data', (data: Buffer) => {
-      // ffmpeg writes progress to stderr; only log errors
-      const text = data.toString().trim();
-      if (text.includes('Error') || text.includes('error') || text.includes('failed')) {
-        log(`[VideoRecording] ffmpeg: ${text}`);
-      }
-    });
+    this.ffmpegProcess.stdout?.resume();
+    this.ffmpegProcess.stderr?.resume();
 
     this.ffmpegProcess.on('exit', (code) => {
       this.isRunning = false;
       log(`[VideoRecording] ffmpeg exited with code ${code}`);
     });
 
-    this.ffmpegProcess.on('error', (err) => {
+    this.ffmpegProcess.on('error', () => {
       this.isRunning = false;
-      log(`[VideoRecording] ffmpeg spawn error: ${err.message}`);
+      log("[VideoRecording] ffmpeg spawn failed");
     });
   }
 
@@ -118,7 +113,7 @@ export class VideoRecordingService {
    */
   async upload(callbackUrl: string, token: string): Promise<void> {
     if (!fs.existsSync(this.filePath)) {
-      log(`[VideoRecording] File not found for upload: ${this.filePath}`);
+      log("[VideoRecording] File unavailable for upload");
       return;
     }
 
@@ -126,7 +121,7 @@ export class VideoRecordingService {
     const fileStats = await fs.promises.stat(this.filePath);
     const durationSeconds = (Date.now() - this.startTime) / 1000;
 
-    log(`[VideoRecording] Uploading ${fileStats.size} bytes (${durationSeconds.toFixed(1)}s) to ${callbackUrl}`);
+    log(`[VideoRecording] Uploading bytes=${fileStats.size} duration_seconds=${durationSeconds.toFixed(1)}`);
 
     const boundary = `----VexaVideoRecording${Date.now()}`;
     const contentTypeMap: Record<string, string> = {
@@ -157,7 +152,13 @@ export class VideoRecordingService {
     const body = Buffer.concat(parts);
 
     return new Promise((resolve, reject) => {
-      const url = new URL(callbackUrl);
+      let url: URL;
+      try {
+        url = new URL(callbackUrl);
+      } catch {
+        reject(new Error('video_invalid_upload_url'));
+        return;
+      }
       const transport = url.protocol === 'https:' ? https : http;
       const req = transport.request(
         {
@@ -172,22 +173,22 @@ export class VideoRecordingService {
           },
         },
         (res) => {
-          let responseData = '';
-          res.on('data', (chunk) => { responseData += chunk; });
+          res.resume();
           res.on('end', () => {
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-              log(`[VideoRecording] Upload successful: ${res.statusCode}`);
+            const status = res.statusCode ?? 0;
+            if (status >= 200 && status < 300) {
+              log(`[VideoRecording] Upload successful: ${status}`);
               resolve();
             } else {
-              log(`[VideoRecording] Upload failed: ${res.statusCode} - ${responseData}`);
-              reject(new Error(`Video upload failed with status ${res.statusCode}: ${responseData}`));
+              log(`[VideoRecording] Upload failed: http_status=${status}`);
+              reject(new Error(`video_upload_http_${status}`));
             }
           });
         }
       );
-      req.on('error', (err) => {
-        log(`[VideoRecording] Upload error: ${err.message}`);
-        reject(err);
+      req.on('error', () => {
+        log("[VideoRecording] Upload failed");
+        reject(new Error('video_upload_failed'));
       });
       req.write(body);
       req.end();
@@ -207,11 +208,11 @@ export class VideoRecordingService {
    */
   async muxAudio(audioPath: string, audioDelayMs: number = 0): Promise<void> {
     if (!fs.existsSync(this.filePath)) {
-      log(`[VideoRecording] Video file not found for muxing: ${this.filePath}`);
+      log("[VideoRecording] Video file unavailable for muxing");
       return;
     }
     if (!fs.existsSync(audioPath)) {
-      log(`[VideoRecording] Audio file not found for muxing: ${audioPath}`);
+      log("[VideoRecording] Audio input unavailable for muxing");
       return;
     }
 
@@ -232,12 +233,10 @@ export class VideoRecordingService {
       muxedPath,
     ];
 
-    log(`[VideoRecording] Muxing audio into video: ffmpeg ${args.join(' ')}`);
+    log(`[VideoRecording] Muxing audio (delay_ms=${audioDelayMs})`);
 
     return new Promise((resolve) => {
-      const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      let stderr = '';
-      proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+      const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] });
       proc.on('exit', async (code) => {
         if (code === 0 && fs.existsSync(muxedPath)) {
           // Replace the original video-only file with the muxed one
@@ -246,15 +245,15 @@ export class VideoRecordingService {
           } catch {}
           this.filePath = muxedPath;
           const stats = fs.statSync(muxedPath);
-          log(`[VideoRecording] Muxed file ready: ${muxedPath} (${stats.size} bytes)`);
+          log(`[VideoRecording] Muxed file ready (${stats.size} bytes)`);
         } else {
-          log(`[VideoRecording] Mux failed (code=${code}): ${stderr.slice(-500)}`);
+          log(`[VideoRecording] Mux failed (code=${code ?? 0})`);
           // Keep the original video-only file for upload
         }
         resolve();
       });
-      proc.on('error', (err) => {
-        log(`[VideoRecording] Mux spawn error: ${err.message}`);
+      proc.on('error', () => {
+        log("[VideoRecording] Mux spawn failed");
         resolve();
       });
     });
@@ -264,10 +263,10 @@ export class VideoRecordingService {
     try {
       if (fs.existsSync(this.filePath)) {
         await fs.promises.unlink(this.filePath);
-        log(`[VideoRecording] Cleaned up ${this.filePath}`);
+        log("[VideoRecording] Temporary file cleaned");
       }
-    } catch (err: any) {
-      log(`[VideoRecording] Cleanup error: ${err.message}`);
+    } catch {
+      log("[VideoRecording] Temporary file cleanup failed");
     }
   }
 

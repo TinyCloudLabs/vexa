@@ -21,6 +21,7 @@
  * Exit codes: 0 = signed in AND (when S3 is configured) uploaded; 1 = login not confirmed
  * (the userdata prefix is untouched) or the upload shipped nothing.
  */
+import './privacy-logging';
 import { provisionLogin } from './login';
 import { BROWSER_DATA_DIR, syncBrowserDataToS3, type S3Config } from './session-store';
 import type { AuthPlatform } from './types';

@@ -42,7 +42,7 @@ from . import routes_manifest
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 
-from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
+from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event
 from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 
 # #495: the honest answer when the auth path itself is unreachable — a retryable 503, never a
@@ -55,7 +55,7 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
         audience="system",
         level="error",
         span=span,
-        fields={"reason": type(exc).__name__, "detail": str(exc)},
+        fields={"reason": type(exc).__name__},
     )
     return Response(
         content=json.dumps({"detail": "Authentication temporarily unavailable, retry"}),
@@ -190,6 +190,11 @@ def _invalid_path_param_response() -> Response:
     )
 
 
+def _route_template(request: Request) -> Optional[str]:
+    route = request.scope.get("route")
+    return getattr(route, "path", None)
+
+
 def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
     """The scopes declared for the route this request MATCHED, or ``None`` when it declares none.
 
@@ -307,7 +312,7 @@ def create_app(
         if not user_data:
             return Response(content=json.dumps({"detail": "Invalid API key"}),
                             status_code=401, media_type="application/json")
-        set_user_id(user_data["user_id"])
+
         return {
             "user_id": user_data["user_id"],
             "email": user_data.get("email", ""),
@@ -345,9 +350,7 @@ def create_app(
                 media_type="application/json",
             )
 
-        # Bind the resolved user to the trace context so every later line carries user_id.
         user_id = user_data["user_id"]
-        set_user_id(user_id)
 
         # Per-user request rate limit (WS-6) — a valid key could otherwise fire unlimited requests at
         # the control plane (the max_concurrent_bots cap bounds active bots, not request rate). 429 when
@@ -376,8 +379,7 @@ def create_app(
                 audience="system",
                 level="error",
                 span="auth",
-                user_id=user_id,
-                fields={"method": method, "path": request.url.path},
+                fields={"method": method, "route": _route_template(request)},
             )
             return None, _insufficient_scope_response()
         user_scopes = set(user_data.get("scopes", []))
@@ -387,8 +389,11 @@ def create_app(
                 audience="user",
                 level="warning",
                 span="auth",
-                user_id=user_id,
-                fields={"method": method, "path": request.url.path, "required": sorted(required)},
+                fields={
+                    "method": method,
+                    "route": _route_template(request),
+                    "required": sorted(required),
+                },
             )
             return None, _insufficient_scope_response()
 
@@ -397,8 +402,7 @@ def create_app(
             "request_accepted",
             audience="user",
             span="auth",
-            user_id=user_id,
-            fields={"method": method, "path": request.url.path},
+            fields={"method": method, "route": _route_template(request)},
         )
 
         # Inject identity headers + forward the SAME trace_id downstream (main.py:322-326, 365).
@@ -468,7 +472,11 @@ def create_app(
             audience="system",
             level="debug",
             span="proxy",
-            fields={"method": method, "path": url, "downstream_status": resp.status_code},
+            fields={
+                "method": method,
+                "route": _route_template(request),
+                "downstream_status": resp.status_code,
+            },
         )
 
         # Return downstream body + status VERBATIM (drop hop-by-hop headers; main.py:367).
@@ -867,7 +875,11 @@ def create_app(
             audience="system",
             level="debug",
             span="proxy",
-            fields={"method": method, "path": url, "downstream_status": upstream.status_code},
+            fields={
+                "method": method,
+                "route": _route_template(request),
+                "downstream_status": upstream.status_code,
+            },
         )
 
         async def body():
@@ -1045,7 +1057,7 @@ async def run_multiplex(ws: WebSocket, authorizer: Authorizer, redis: RedisBus) 
         # asserts the key is bad) and NOT an uncaught raise (which drops the socket 1006/1011 with
         # no signal). A valid key must not be told it is invalid because our auth path is down.
         log_event("auth_infra_unavailable", audience="system", level="error", span="ws",
-                  fields={"reason": type(e).__name__, "detail": str(e)})
+                  fields={"reason": type(e).__name__})
         try:
             await ws.send_text(json.dumps({"type": "error", "error": "auth_unavailable"}))
         finally:
@@ -1058,7 +1070,7 @@ async def run_multiplex(ws: WebSocket, authorizer: Authorizer, redis: RedisBus) 
             await ws.close(code=4401)  # Unauthorized
         return
     user_id = user_data["user_id"]
-    set_user_id(user_id)
+
 
     sub_tasks: Dict[Tuple, asyncio.Task] = {}
     subscribed_meetings: Set[Tuple] = set()

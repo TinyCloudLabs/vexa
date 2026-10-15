@@ -31,6 +31,7 @@ COMPOSE_BOT=1 (opt-in; real bot lifecycle — slow + needs the ~7GB vexaai/vexa-
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -538,6 +539,7 @@ def test_07_webhook_delivery_outcome_reported(stack):
     )
     assert code == 200, f"lifecycle callback: {code} {body!r}"
 
+    expected_meeting_hash = hashlib.sha256(str(meeting_id).encode("ascii")).hexdigest()[:16]
     deadline = time.time() + 30
     events = []
     while time.time() < deadline and not events:
@@ -550,7 +552,7 @@ def test_07_webhook_delivery_outcome_reported(stack):
                 continue
             if not isinstance(rec, dict):
                 continue
-            if rec.get("event") == "webhook_delivery" and rec.get("meeting_id") in (meeting_id, str(meeting_id)):
+            if rec.get("event") == "webhook_delivery" and rec.get("meeting_id") == expected_meeting_hash:
                 events.append(rec)
         if not events:
             time.sleep(2)
@@ -564,6 +566,8 @@ def test_07_webhook_delivery_outcome_reported(stack):
     assert "blocked" in outcomes, f"private webhook target was not reported as blocked: {outcomes}"
     blocked = next(e for e in events if e["fields"]["outcome"] == "blocked")
     assert blocked["level"] == "warning", "a non-delivery must not be logged as a success"
-    assert blocked["fields"]["target_host"] == "receiver.internal"
+    assert blocked["fields"]["has_target"] is True
+    assert "target_host" not in blocked["fields"] and "target_host" not in blocked
+    assert "receiver.internal" not in json.dumps(blocked)
     assert blocked["fields"]["event_type"] in ("meeting.status_change", "meeting.completed")
-    print(f"\n[7/webhook] outcomes reported for meeting {meeting_id}: {sorted(outcomes)}")
+    print(f"\n[7/webhook] outcomes reported: {sorted(outcomes)}")

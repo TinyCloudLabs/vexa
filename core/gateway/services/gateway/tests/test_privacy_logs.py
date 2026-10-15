@@ -1,0 +1,283 @@
+"""Privacy regressions for gateway event and process-boundary logging."""
+from __future__ import annotations
+
+import copy
+import asyncio
+import json
+import contextlib
+import hashlib
+import io
+import logging
+import socket
+import threading
+import time
+
+from fastapi.testclient import TestClient
+
+from conftest import FakeAuthorizer, FakeDownstream, FakeRedis, VALID_KEY
+from gateway import CARRIED_DOMAINS, create_app
+from gateway import obs
+
+AUTH = {"x-api-key": VALID_KEY}
+NATIVE = "native-meeting-canary-9f31"
+TICKET = "query-ticket-canary-2b76"
+CLIENT_IP = "198.51.100.77"
+
+
+def _json_lines(output: str):
+    return [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+
+
+def test_testclient_logs_no_request_data_and_keeps_safe_route_fields(capsys):
+    app = create_app(FakeAuthorizer(user={"user_id": "private-user-321", "scopes": ["bot"]}),
+                     FakeDownstream(status_code=200, body={}), FakeRedis())
+    headers = {**AUTH, "x-forwarded-for": CLIENT_IP}
+    with TestClient(app) as client:
+        response = client.get(
+            f"/transcripts/google_meet/{NATIVE}?ticket={TICKET}", headers=headers
+        )
+    assert response.status_code == 403
+    output = capsys.readouterr().out
+    for canary in (NATIVE, TICKET, CLIENT_IP, "private-user-321", "meeting-api"):
+        assert canary not in output
+    events = {record.get("event"): record for record in _json_lines(output)}
+    assert "request_received" in events
+    assert events["request_received"]["level"] != "debug"
+    assert "path" not in events["request_received"].get("fields", {})
+    assert "request_denied_scope" in events
+    assert events["request_denied_scope"]["fields"]["route"] == "/transcripts/{platform}/{native_meeting_id}"
+
+
+def test_gateway_log_event_sanitizes_direct_stdout(capsys):
+    obs.log_event(
+        "request_accepted", audience="user", user_id="private-user-321",
+        meeting_id=NATIVE,
+        fields={"path": f"/transcripts/{NATIVE}?ticket={TICKET}", "host": CLIENT_IP,
+                "method": "GET", "downstream_status": 200, "count": 3},
+    )
+    output = capsys.readouterr().out
+    for canary in (NATIVE, TICKET, CLIENT_IP, "private-user-321"):
+        assert canary not in output
+    record = json.loads(output)
+    assert "meeting_id" not in record
+    assert "user_id" not in record
+    assert "path" not in record.get("fields", {})
+    assert record["fields"]["method"] == "GET"
+    assert record["fields"]["downstream_status"] == 200
+    internal = obs.log_event("request_accepted", audience="user", meeting_id=42)
+    internal_record = json.loads(capsys.readouterr().out)
+    assert internal_record["meeting_id"] == hashlib.sha256(b"42").hexdigest()[:16]
+
+def test_only_bounded_numeric_internal_ids_are_hashed(capsys):
+    for invalid in (True, "native-id", "9" * 21, 10**100):
+        event = obs.log_event("request_accepted", audience="user", meeting_id=invalid)
+        assert "meeting_id" not in event
+    output = capsys.readouterr().out
+    assert all("meeting_id" not in record for record in _json_lines(output))
+
+
+def test_trace_header_is_validated_and_debug_is_below_stdout_floor(capsys):
+    app = create_app(FakeAuthorizer(), FakeDownstream(status_code=204), FakeRedis())
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"x-trace-id": TICKET})
+    assert response.headers["x-trace-id"] != TICKET
+    assert TICKET not in capsys.readouterr().out
+    obs.log_event("debug_probe", audience="system", level="debug")
+    obs.log_event("debug_probe", audience="system", level="DEBUG")
+    assert capsys.readouterr().out == ""
+
+
+def test_log_event_does_not_forward_non_allowlisted_values(capsys):
+    obs.log_event("downstream_forwarded", audience="system", fields={
+        "route": "/transcripts/{meeting_id}", "method": "GET", "status": 202,
+        "host": "meeting-api", "url": f"http://meeting-api/{NATIVE}?ticket={TICKET}",
+        "ip": CLIENT_IP, "detail": NATIVE,
+    })
+    output = capsys.readouterr().out
+    for canary in (NATIVE, TICKET, CLIENT_IP, "meeting-api"):
+        assert canary not in output
+    assert _json_lines(output)[0]["fields"]["route"] == "/transcripts/{meeting_id}"
+
+
+def test_route_field_rejects_raw_meeting_id_even_when_path_has_template_segment(capsys):
+    obs.log_event(
+        "downstream_forwarded", audience="system",
+        fields={"route": f"/transcripts/{{platform}}/{NATIVE}"},
+    )
+    output = capsys.readouterr().out
+    assert NATIVE not in output
+    assert "route" not in _json_lines(output)[0].get("fields", {})
+
+def test_actual_uvicorn_access_and_arbitrary_logs_are_sanitized():
+    import uvicorn
+    from gateway.__main__ import LOG_CONFIG
+
+    app = create_app(FakeAuthorizer(), FakeDownstream(status_code=200, body={}), FakeRedis())
+    captured = io.StringIO()
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.listen(128)
+    logging_config = copy.deepcopy(LOG_CONFIG)
+    logging_config["handlers"]["default"]["stream"] = captured
+    config = uvicorn.Config(app, log_config=logging_config, access_log=False, lifespan="off")
+    assert config.access_log is False
+    server = uvicorn.Server(config)
+
+    def run_server():
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            task = asyncio.new_event_loop()
+            asyncio.set_event_loop(task)
+            try:
+                task.run_until_complete(server.serve(sockets=[sock]))
+            finally:
+                task.close()
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    try:
+        import httpx
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/missing/{NATIVE}?ticket={TICKET}",
+            headers={**AUTH, "x-forwarded-for": CLIENT_IP}, timeout=2,
+        )
+        assert response.status_code == 404
+        try:
+            raise RuntimeError(f"exception-canary-{NATIVE}")
+        except RuntimeError:
+            logging.getLogger("uvicorn.error").exception(
+                "request failed for %s", TICKET,
+                extra={
+                    "host": CLIENT_IP, "meeting_id": NATIVE, "count": 4,
+                    "status": 502, "duration_ms": 12,
+                    "trace_id": "feedfacecafebeef0123456789abcdef",
+                },
+            )
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        sock.close()
+
+    output = captured.getvalue()
+    for canary in (NATIVE, TICKET, CLIENT_IP, "private-user-321", "meeting-api"):
+        assert canary not in output
+    entries = _json_lines(output)
+    assert entries
+    assert not any(entry.get("logger") == "uvicorn.access" for entry in entries)
+    assert any(entry.get("fields") == {"status": 502, "count": 4, "duration_ms": 12}
+               for entry in entries)
+    assert any(entry.get("trace_id") == "feedfacecafebeef0123456789abcdef"
+               for entry in entries)
+def test_real_gateway_main_configures_handlers_before_uvicorn_and_hooks():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = r"""
+import logging, sys, threading, warnings, uvicorn
+sys.path.insert(0, sys.argv[1])
+from gateway import __main__ as entry
+def fake_run(app, **kwargs):
+    assert app == "gateway.adapters:app"
+    assert kwargs["log_config"] is entry.LOG_CONFIG
+    assert kwargs["access_log"] is False
+    try:
+        raise RuntimeError("BOOTSTRAP_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=BOOTSTRAP_TOKEN")
+    except RuntimeError:
+        logging.getLogger("bootstrap.child").warning("BOOTSTRAP_NAME_CANARY", exc_info=True)
+uvicorn.run = fake_run
+entry.main()
+warnings.warn("WARNING_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=WARNING_TOKEN")
+sys.excepthook(RuntimeError, RuntimeError("SYS_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=SYS_TOKEN"), None)
+def fail_in_thread():
+    raise RuntimeError("THREAD_EXCEPTION_CANARY https://meet.google.com/xxx-xxxx-xxx?token=THREAD_TOKEN")
+thread = threading.Thread(target=fail_in_thread)
+thread.start()
+thread.join()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    for canary in (
+        "BOOTSTRAP_URL_CANARY", "BOOTSTRAP_NAME_CANARY", "BOOTSTRAP_TOKEN",
+        "WARNING_URL_CANARY", "WARNING_TOKEN", "SYS_EXCEPTION_CANARY",
+        "SYS_TOKEN", "THREAD_EXCEPTION_CANARY", "THREAD_TOKEN",
+        "xxx-xxxx-xxx", "Traceback", "RuntimeError",
+    ):
+        assert canary not in output
+    records = _json_lines(output)
+    assert len(records) >= 4
+    assert all(record["service"] == "gateway" for record in records)
+    assert all(record["event"] == "python_log" for record in records)
+    allowed = {"ts", "level", "service", "event", "logger", "trace_id", "fields"}
+    assert all(set(record) <= allowed for record in records)
+
+
+def test_real_uvicorn_gateway_lazy_target_sanitizes_access_and_bootstrap_logs():
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    script = r"""
+import logging, sys, threading, time, urllib.error, urllib.request
+sys.path.insert(0, sys.argv[1])
+from fastapi import FastAPI
+import gateway.adapters as adapters
+def build_production_app():
+    try:
+        raise RuntimeError("BOOTSTRAP_URL_CANARY https://meet.google.com/xxx-xxxx-xxx?token=BOOTSTRAP_TOKEN")
+    except RuntimeError:
+        logging.getLogger("bootstrap.child").warning("BOOTSTRAP_NAME_CANARY", exc_info=True)
+    return FastAPI()
+adapters.build_production_app = build_production_app
+import uvicorn
+server = uvicorn.Server(uvicorn.Config(
+    "gateway.adapters:app", host="127.0.0.1", port=int(sys.argv[2]),
+    access_log=True, lifespan="off",
+))
+thread = threading.Thread(target=server.run, daemon=True)
+thread.start()
+deadline = time.monotonic() + 8
+while not server.started and time.monotonic() < deadline:
+    time.sleep(.01)
+assert server.started
+try:
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{sys.argv[2]}/transcripts/google_meet/native-meeting-canary?ticket=query-ticket-canary",
+        timeout=3,
+    )
+except urllib.error.HTTPError as error:
+    assert error.code == 404
+server.should_exit = True
+thread.join(timeout=5)
+assert not thread.is_alive()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(source), str(port)],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    for canary in (
+        "native-meeting-canary", "query-ticket-canary", "127.0.0.1",
+        "BOOTSTRAP_URL_CANARY", "BOOTSTRAP_NAME_CANARY", "BOOTSTRAP_TOKEN",
+        "Traceback", "RuntimeError",
+    ):
+        assert canary not in output
+    records = _json_lines(output)
+    assert records
+    assert all(record["service"] == "gateway" for record in records)
+    assert not any(record.get("logger") == "uvicorn.access" for record in records)

@@ -8,18 +8,18 @@ export async function leaveJitsiMeeting(
   botConfig?: BotConfig,
   reason: string = "manual_leave",
 ): Promise<boolean> {
-  log(`[Jitsi] Leaving meeting (reason: ${reason})`);
+  log("[Jitsi] Leave requested");
 
   // Notify the host first so it records the leave intent even if the UI flow fails.
   if (botConfig) {
     try {
       await callLeaveCallback(botConfig, reason);
-    } catch (callbackError: any) {
+    } catch {
       logJSON({
         level: "warn",
-        msg: "[Jitsi] Leave callback failed; continuing with leave attempt",
-        error_message: callbackError?.message,
-        leave_reason: reason,
+        event: "leave.failed",
+        platform: "jitsi",
+        error_code: "operation_failed",
       });
     }
   }
@@ -27,7 +27,7 @@ export async function leaveJitsiMeeting(
   if (!page || page.isClosed()) {
     // No UI to interact with — let the host drain its pipeline and bail.
     try { await stopJitsiRecording(page ?? undefined, botConfig); } catch { /* ignore */ }
-    log("[Jitsi] Page not available for leave — skipping UI leave");
+    logJSON({ level: "info", event: "leave.completed", platform: "jitsi", leave_result: true });
     return true;
   }
 
@@ -56,7 +56,7 @@ export async function leaveJitsiMeeting(
         return null;
       }, jitsiHangupButtonSelectors).catch(() => null);
       if (clicked) {
-        log(`[Jitsi] Clicked hangup (selector: ${clicked})`);
+        log("[Jitsi] Hangup button clicked");
         await page.waitForTimeout(500);
         // Hangup-menu variant: a "Leave meeting" item appears after the click.
         await page.evaluate(() => {
@@ -72,13 +72,11 @@ export async function leaveJitsiMeeting(
         await page.waitForTimeout(1000);
       }
     }
-  } catch (e: any) {
+  } catch {
     logJSON({
-      level: "error",
-      msg: "[Jitsi] Error during leave",
-      error_message: e?.message,
-      error_name: e?.name,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "jitsi",
+      error_code: "operation_failed",
     });
   }
 
@@ -86,15 +84,14 @@ export async function leaveJitsiMeeting(
   // pipeline (final chunk, upload queue) after the UI leave completes.
   try {
     await stopJitsiRecording(page, botConfig);
-  } catch (e: any) {
+  } catch {
     logJSON({
-      level: "error",
-      msg: "[Jitsi] Error stopping recording during leave",
-      error_message: e?.message,
-      error_name: e?.name,
-      leave_reason: reason,
+      event: "leave.failed",
+      platform: "jitsi",
+      error_code: "operation_failed",
     });
   }
 
+  logJSON({ level: "info", event: "leave.completed", platform: "jitsi", leave_result: true });
   return true;
 }

@@ -1,5 +1,5 @@
 import { Page } from "playwright";
-import { log } from "../_host";
+import { log, logJSON } from "../_host";
 import { googleRemovalIndicators } from "./selectors";
 
 // Function to check if bot has been removed from the meeting
@@ -10,17 +10,17 @@ export async function checkForGoogleRemoval(page: Page): Promise<boolean> {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
-          log(`🚨 Google Meet removal detected: Found removal indicator "${selector}"`);
+          logJSON({ level: "info", event: "removal.detected", platform: "google_meet", removed: true });
           return true;
         }
-      } catch (e) {
+      } catch {
         // Continue checking other selectors
         continue;
       }
     }
     return false;
-  } catch (error: any) {
-    log(`Error checking for Google Meet removal: ${error.message}`);
+  } catch {
+    log("Google Meet removal check failed");
     return false;
   }
 }
@@ -72,7 +72,7 @@ export function startGoogleRemovalMonitor(page: Page, onRemoval?: () => void | P
         try { await onRemoval?.(); } catch {}
       }
     } catch (error: any) {
-      log(`Error during Google Meet removal check: ${error.message}`);
+      log(`Error during Google Meet removal check`);
     }
   }, 1500);
 

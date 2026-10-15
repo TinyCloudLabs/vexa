@@ -99,19 +99,19 @@ console.log('\n=== buildJitsiMeetingUrl — negative cases ===');
 expectThrows(
   'bare origin without a room — throws',
   () => buildJitsiMeetingUrl('https://meet.jit.si/'),
-  'Cannot extract room',
+  'jitsi_meeting_room_missing',
 );
 
 expectThrows(
   'bare origin without any path — throws',
   () => buildJitsiMeetingUrl('https://meet.jit.si'),
-  'Cannot extract room',
+  'jitsi_meeting_room_missing',
 );
 
 expectThrows(
   'not a URL — throws',
   () => buildJitsiMeetingUrl('not a url'),
-  'Invalid Jitsi meeting URL',
+  'jitsi_invalid_meeting_url',
 );
 
 console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);

@@ -188,18 +188,26 @@ check('isolation: NO caption reached pipeline.recordHint — captions are not na
   // A page whose toolbar never yields the More button: bounded retries, then ONE typed
   // captions-enable-failed observation — and no throw, because the join must not care.
   const logs: string[] = [];
+  const observations: Array<{ type?: string; attempts?: number }> = [];
   const deadPage = {
     async evaluate() { return false; },
     locator() { return { first: () => ({ async click() { throw new Error('no More button here'); } }) }; },
     async waitForTimeout() { /* instant */ },
     keyboard: { async press() { /* */ } },
   } as never;
-  const result = await runTeamsCaptionEnable(deadPage, (m) => logs.push(m), 2, 0);
+  const result = await runTeamsCaptionEnable(
+    deadPage,
+    (m) => logs.push(m),
+    2,
+    0,
+    (_source, observation) => observations.push(observation as { type?: string; attempts?: number }),
+  );
   check('enable: an unreachable toolbar ends as failed/more-button-unreachable, never a throw',
     result.outcome === 'failed' && result.reason === 'more-button-unreachable', JSON.stringify(result));
-  const obsLine = logs.find((l) => l.includes('captions-enable-failed'));
-  check('enable: failure is a TYPED captions-enable-failed observation on the caption log stream',
-    !!obsLine && JSON.parse(obsLine.slice(obsLine.indexOf('{'))).attempts === 2, logs.join(' | '));
+  check('enable: failure emits one typed captions-enable-failed observation after both attempts',
+    observations.length === 1 && observations[0]?.type === 'captions-enable-failed'
+      && observations[0]?.attempts === 2,
+    JSON.stringify(observations));
   check('enable: the fallback is stated — the DOM watcher carries on alone',
     logs.some((l) => l.includes('voice-level-outline watcher alone')), logs.join(' | '));
 }

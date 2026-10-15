@@ -27,7 +27,7 @@ ICS_2 = "https://outlook.office365.com/owa/calendar/private-fedcba654321/calenda
 
 @pytest.fixture()
 def client(pg_url, pg_async_url, monkeypatch):
-    sync_engine = create_engine(pg_url)
+    sync_engine = create_engine(pg_url, hide_parameters=True)
     Base.metadata.drop_all(sync_engine)
     ensure_schema_sync(sync_engine, Base)
     sync_engine.dispose()

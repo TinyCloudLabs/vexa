@@ -1,3 +1,4 @@
+import { sanitizeLogText } from './log-sanitizer.js';
 /**
  * O-TEL-1 recorder adapter — the real TelemetrySink behind the capture-bridge tap.
  *
@@ -89,7 +90,7 @@ export function startBotLogSidecar(
   const write = (line: string): void => {
     if (head + line.length <= headBudget) {
       head += line.length;
-      try { appendFileSync(path, line, 'utf8'); } catch (e) { if (faults++ < 3) original.error?.(`[bot] botlog write failed: ${String(e)}`); }
+      try { appendFileSync(path, line, 'utf8'); } catch { if (faults++ < 3) original.error?.('[bot] botlog write failed'); }
       return;
     }
     // Past the head budget the tail ROLLS: the newest `tailBudget` bytes survive, everything
@@ -100,11 +101,11 @@ export function startBotLogSidecar(
   };
 
   const fmt = (level: string, args: unknown[]): string => {
-    const body = args.map((a) => {
+    const body = sanitizeLogText(args.map((a) => {
       if (typeof a === 'string') return a;
       try { return JSON.stringify(a); } catch { return String(a); }
-    }).join(' ');
-    return `${new Date(opts.now?.() ?? Date.now()).toISOString()} ${level} ${body}\n`;
+    }).join(' '));
+    return body ? `${new Date(opts.now?.() ?? Date.now()).toISOString()} ${level} ${body}\n` : '';
   };
 
   for (const m of methods) {
@@ -188,9 +189,9 @@ export function wrapTranscriptWithSnapshot<
       try {
         mkdirSync(dirname(path), { recursive: true });
         if (rows.length > 0) await appendFile(path, rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
-        log(`${rows.length} row(s) → ${path}`);
+        log(`${rows.length} row(s) written`);
       } catch (e) {
-        log(`write failed: ${String(e)}`);
+        log('write failed');
       }
       return rows.length;
     },
@@ -397,7 +398,7 @@ export function wrapTranscribeWithTap<T extends TranscribeFn>(
   let faults = 0;
   const write = (rec: Record<string, unknown>): void => {
     appendFile(path, JSON.stringify(rec) + '\n', 'utf8')
-      .catch((e) => { if (faults++ < 5) log(`write failed: ${String(e)}`); });
+      .catch(() => { if (faults++ < 5) log('write failed'); });
   };
   const tapped = (async (pcm: Float32Array, prompt?: string) => {
     const t0 = Date.now();
@@ -406,8 +407,8 @@ export function wrapTranscribeWithTap<T extends TranscribeFn>(
       write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: true, text: res.text, language: res.language, duration: res.duration, segments: res.segments.length });
       return res;
     } catch (e) {
-      const x = e as { kind?: string; status?: number; message?: string };
-      write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: false, kind: x?.kind ?? 'unknown', status: x?.status, error: x?.message });
+      const x = e as { kind?: string; status?: number };
+      write({ at: new Date(t0).toISOString(), ms: Date.now() - t0, pcm_len: pcm.length, prompt_len: prompt?.length ?? 0, ok: false, kind: x?.kind ?? 'unknown', status: x?.status, error_code: 'transcription_failed' });
       throw e;
     }
   }) as T;
@@ -457,7 +458,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     if (opts.writer) {
       writer = opts.writer;
       // Chain the header into the flush sequence so it always precedes frame lines.
-      flushing = writer.append(headerLine).catch((e) => log(`header write failed: ${String(e)}`));
+      flushing = writer.append(headerLine).catch(() => log('header write failed'));
     } else {
       mkdirSync(dir, { recursive: true });
       // Header lands synchronously so even a zero-frame session leaves an attributable file.
@@ -466,7 +467,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     }
   } catch (e) {
     // A broken writer disables recording for the session — capture is never affected.
-    log(`disabled (writer init failed): ${String(e)}`);
+    log('disabled (writer init failed)');
     writer = null;
   }
 
@@ -496,10 +497,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
       capped = true;
       // ONE observation, not one per dropped frame — a capped 6-hour meeting would otherwise emit
       // hundreds of thousands of identical lines and bury everything else in the pod's logs.
-      signalEvent('tape-capped', {
-        path, max_bytes: maxBytes, bytes: written, frames: seq, hints,
-        note: 'tape stopped; the meeting continues unaffected',
-      });
+      signalEvent('tape-capped', { max_bytes: maxBytes, bytes: written, frames: seq, hints });
       return false;
     }
     written += line.length;
@@ -515,7 +513,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     // Serialize flushes so lines never interleave out of order.
     flushing = flushing
       .then(() => w.append(chunk))
-      .catch((e) => { if (faults++ < 5) log(`flush failed (frames dropped): ${String(e)}`); });
+      .catch(() => { if (faults++ < 5) log('flush failed (frames dropped)'); });
     return flushing;
   };
 
@@ -553,7 +551,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
           try { mkdirSync(dirname(filePath), { recursive: true }); } catch { /* best-effort */ }
           await appendFile(filePath, line, 'utf8');
         })
-        .catch((e) => { if (faults++ < 5) log(`${part} write failed: ${String(e)}`); });
+        .catch(() => { if (faults++ < 5) log(`${part} write failed`); });
     });
     return {
       count: () => count,
@@ -630,7 +628,7 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
     captureObservation(rec: ObservationRecord): void { observationSidecar.write(rec); },
   };
 
-  if (writer) signalEvent('tape-started', { path, max_bytes: maxBytes, platform: inv.platform });
+  if (writer) signalEvent('tape-started', { max_bytes: maxBytes, platform: inv.platform });
 
   let closed = false;
   return {
@@ -655,10 +653,10 @@ export function createCaptureSignalRecorder(inv: Invocation, opts: RecorderOptio
         await captionSidecar.drain();
         await csrcSidecar.drain();
         await observationSidecar.drain();
-        log(`session written: ${path} (${seq} frames, ${hints} hints, ${captionSidecar.count()} captions, `
+        log(`session written (${seq} frames, ${hints} hints, ${captionSidecar.count()} captions, `
           + `${csrcSidecar.count()} csrc, ${observationSidecar.count()} observations)`);
       } catch (e) {
-        log(`close failed: ${String(e)}`);
+        log('close failed');
       }
     },
   };

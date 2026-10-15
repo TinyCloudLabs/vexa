@@ -288,8 +288,7 @@ async def _cancel_planned(repo, row: dict) -> None:
         log_event(
             "stop_cancelled_planned", audience="user", span="bots.stop",
             user_id=row.get("user_id"), meeting_id=str(row["id"]),
-            fields={"was_status": row.get("status"),
-                    "native_meeting_id": row.get("native_meeting_id")},
+            fields={"was_status": row.get("status")},
         )
     except Exception:  # noqa: BLE001 — logging never fails a stop
         pass
@@ -327,7 +326,7 @@ async def _mark_stop_requested(repo, row: dict) -> None:
         await merge(row["id"], {"stop_requested": True})
 
 
-def _log_stop_evicted(meeting_id, sibling_ids, native_meeting_id) -> None:
+def _log_stop_evicted(meeting_id, sibling_ids, _native_meeting_id) -> None:
     """A stop that took down MORE than the row the caller named is a fact worth a line: it means a
     duplicate bot existed for that room, and the count is the only cheap signal of how often."""
     try:
@@ -335,8 +334,7 @@ def _log_stop_evicted(meeting_id, sibling_ids, native_meeting_id) -> None:
 
         log_event(
             "stop_evicted_siblings", audience="operator", level="warning", span="bots.stop",
-            fields={"meeting_id": meeting_id, "evicted": sibling_ids,
-                    "native_meeting_id": native_meeting_id},
+            fields={"meeting_id": meeting_id, "evicted": len(sibling_ids)},
         )
     except Exception:
         pass
@@ -355,7 +353,7 @@ def _log_stop_teardown_failed(meeting_id, workload_id, err) -> None:
             audience="system",
             level="error" if unconfirmed else "warning",
             span="bots.stop",
-            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error": str(err)},
+            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error_type": type(err).__name__},
         )
     except Exception:
         pass

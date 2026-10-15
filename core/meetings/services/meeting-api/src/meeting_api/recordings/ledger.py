@@ -210,11 +210,9 @@ def union_ranges(inline_rows, table_rows, *, meeting_id: Optional[int] = None,
 
 
 def report_dropped_union_rows(dropped, merged, *, meeting_id, context: str) -> None:
-    """One WARNING line per row the union displaced — enough identity to find the orphaned
-    storage object later. A row whose (key AND sequence) identity survives is a same-identity
-    merge's superseded LOSER; anything else (crossed key/sequence collision, malformed or
-    duplicate row) is an outright drop — the two read differently because only the second can
-    leave an untracked ``attributed-audio/…`` object that nothing references."""
+    """One WARNING line per displaced row plus an aggregate; row identifiers and storage paths stay
+    out of logs. A row whose (key AND sequence) identity survives is a same-identity merge's
+    superseded loser; anything else is dropped."""
     if not dropped:
         return
     survivor_ids = {
@@ -233,24 +231,17 @@ def report_dropped_union_rows(dropped, merged, *, meeting_id, context: str) -> N
             superseded += 1
         else:
             dropped_lost += 1
-        if isinstance(row, dict):
-            log.warning(
-                "%s: %s range row sequence=%r idempotency_key=%r storage_path=%r "
-                "for meeting %s",
-                context,
-                "superseded same-identity" if is_superseded else "dropped",
-                row.get("sequence"), row.get("idempotency_key"),
-                row.get("storage_path"), meeting_id,
-            )
-        else:
-            log.warning(
-                "%s: dropped malformed range row %r for meeting %s",
-                context, row, meeting_id,
-            )
+        log.warning(
+            "%s: %s range row omitted",
+            context,
+            "superseded same-identity" if is_superseded else "dropped",
+            extra={"meeting_id": meeting_id, "fields": {"count": 1}},
+        )
     log.warning(
-        "%s: %d range row(s) not in the union for meeting %s "
+        "%s: %d range row(s) not in the union "
         "(%d superseded by a same-identity merge, %d dropped)",
-        context, len(dropped), meeting_id, superseded, dropped_lost,
+        context, len(dropped), superseded, dropped_lost,
+        extra={"meeting_id": meeting_id, "fields": {"count": len(dropped)}},
     )
 
 

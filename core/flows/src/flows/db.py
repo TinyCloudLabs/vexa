@@ -51,7 +51,7 @@ def postgres_db(url: str):  # pragma: no cover — production composition; lazy 
     claim) pays for the schema application once; every caller after it is free."""
     from sqlalchemy import create_engine, text
 
-    engine = create_engine(url, pool_pre_ping=True)
+    engine = create_engine(url, pool_pre_ping=True, hide_parameters=True)
 
     class _Pg:
         dialect = "postgres"

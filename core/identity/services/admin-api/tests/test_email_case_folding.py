@@ -31,7 +31,7 @@ LOWER = "anna.smith@acme.test"
 
 @pytest.fixture()
 def client(pg_url, pg_async_url, monkeypatch):
-    sync_engine = create_engine(pg_url)
+    sync_engine = create_engine(pg_url, hide_parameters=True)
     Base.metadata.drop_all(sync_engine)
     ensure_schema_sync(sync_engine, Base)
     sync_engine.dispose()
@@ -92,7 +92,7 @@ def test_an_address_already_stored_is_never_rewritten(pg_url, client):
     there, and rewriting the table to suit an index is changing data to suit a query plan."""
     from sqlalchemy import create_engine, text as sa_text
 
-    engine = create_engine(pg_url)
+    engine = create_engine(pg_url, hide_parameters=True)
     with engine.begin() as conn:
         conn.execute(sa_text("INSERT INTO users (email, data) VALUES (:e, '{}'::jsonb)"),
                      {"e": MIXED})
@@ -112,7 +112,7 @@ def test_a_second_create_in_another_case_cannot_land_a_second_row(pg_url, client
     the existing row instead of 500."""
     from sqlalchemy import create_engine, text as sa_text
 
-    engine = create_engine(pg_url)
+    engine = create_engine(pg_url, hide_parameters=True)
     with engine.begin() as conn:
         conn.execute(sa_text("INSERT INTO users (email, data) VALUES (:e, '{}'::jsonb)"),
                      {"e": LOWER})
@@ -132,7 +132,7 @@ def test_an_instance_that_already_holds_duplicates_resolves_the_same_row_every_t
     account and the meetings on another."""
     from sqlalchemy import create_engine, text as sa_text
 
-    engine = create_engine(pg_url)
+    engine = create_engine(pg_url, hide_parameters=True)
     with engine.begin() as conn:
         conn.execute(sa_text("INSERT INTO users (email, data) VALUES (:e, '{}'::jsonb)"),
                      {"e": MIXED})           # the older row
