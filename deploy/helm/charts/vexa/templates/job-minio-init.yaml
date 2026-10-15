@@ -28,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: minio-init
-          image: {{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}
+          image: {{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}{{ with .Values.minio.mcImage.digest }}@{{ . }}{{ end }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           resources:
             {{- toYaml .Values.minio.initResources | nindent 12 }}
