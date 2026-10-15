@@ -441,7 +441,7 @@ minio:
   image:
     repository: ghcr.io/tinycloudlabs/mirror/minio
     tag: RELEASE.2025-09-07T16-13-09Z
-    digest: sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6
+    digest: sha256:618d099a3b19a8a8397e16d8ffb0a05722ac820a6ac08dae856ef31d40004358
   accessKey: vexa-access-key
   secretKey: vexa-secret-key
   bucket: vexa
@@ -465,7 +465,7 @@ minio:
   mcImage:
     repository: ghcr.io/tinycloudlabs/mirror/minio-mc
     tag: RELEASE.2025-08-13T08-35-41Z
-    digest: sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380
+    digest: sha256:b534423345786a9b222c2f5908aeda7fdc205c813914dd210255dc2f2d31c801
   # ...and the Job declared no resources at all, so a namespace LimitRange would
   # silently assign it whatever default it likes — the 64Mi-squeeze class.
   initResources:
