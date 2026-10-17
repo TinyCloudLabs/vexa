@@ -88,16 +88,6 @@ A prepared issue is a worked delivery spec — read it end to end before touchin
 
 ## How you work the checkout
 
-- **Contribution rights are a human decision; automate the mechanics.** Before the first commit,
-  read [`CONTRIBUTOR_RIGHTS.md`](CONTRIBUTOR_RIGHTS.md) and ask the human to choose independent,
-  employer/client-controlled, or unsure. Never choose or tick the PR declaration for them. After
-  the human explicitly chooses the independent or corporate path, inspect repository-local
-  `user.name` and `user.email`, surface any mismatch, and create every commit with
-  `git commit --signoff`. Never change global identity, insert another person's sign-off, enable
-  third-party remediation, or use a maintainer override. Diagnose missing/mismatched commits by
-  SHA. Before an amend/rebase/force-push, show the exact rewrite and obtain explicit approval;
-  prefer the DCO App's individual remediation commit on a shared branch.
-
 - **Discord is the working channel** — blockers, steering, quick questions live there while you
   work. One rule keeps the record honest: **anything decided lands back on the issue**, or it
   didn't happen. The issue is the source of truth; Discord is the speed.
@@ -190,3 +180,5 @@ exactly how you'll be read. Then a **non-author validates the value**
 ([the attestation shape](https://docs.vexa.ai/governance/delivery#validation)); validators are
 credited in release notes alongside you, and the reporter of the original bug is the preferred
 signer of your fix.
+
+> This fork merges on CI; upstream's merge-card and value gates are not used here.
