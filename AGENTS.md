@@ -190,3 +190,5 @@ exactly how you'll be read. Then a **non-author validates the value**
 ([the attestation shape](https://docs.vexa.ai/governance/delivery#validation)); validators are
 credited in release notes alongside you, and the reporter of the original bug is the preferred
 signer of your fix.
+
+> This fork merges on CI; upstream's merge-card and value gates are not used here.
