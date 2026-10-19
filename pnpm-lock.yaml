@@ -5,15 +5,15 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  postcss@<8.5.23: '>=8.5.23'
-  adm-zip@<0.6.1: '>=0.6.1'
+  postcss@<8.5.23: ^8.5.23
+  adm-zip@<0.6.1: ^0.6.1
   nanoid@<3.3.18: ^3.3.18
   fast-uri@>=3.0.0 <3.1.6: ^3.1.6
-  brace-expansion@1: '>=1.1.21'
-  sharp@<0.35.4: '>=0.35.4'
+  brace-expansion@1: ^1.1.21
+  sharp@<0.35.4: ^0.35.4
   protobufjs@>=7.5.0 <7.6.5: ^7.6.5
   undici@>=7.0.0 <7.29.1: ^7.29.1
-  source-map-js@<1.2.2: '>=1.2.2'
+  source-map-js@<1.2.2: ^1.2.2
   vitest@<4.1.11: ^4.1.11
   '@vitest/mocker@<4.1.11': ^4.1.11
 
@@ -1779,9 +1779,8 @@ packages:
   bail@2.0.2:
     resolution: {integrity: sha512-0xO6mYd7JB2YesxDKplafRpsiOzPt9V02ddPCLbY1xYGPOX24NTyN50qnUxgCPcSoYMhKpAuBTjQoRZCAkUDRw==}
 
-  balanced-match@4.0.4:
-    resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
-    engines: {node: 18 || 20 || >=22}
+  balanced-match@1.0.2:
+    resolution: {integrity: sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==}
 
   bidi-js@1.0.3:
     resolution: {integrity: sha512-RKshQI1R3YQ+n9YJz2QQ147P66ELpa1FQEg20Dk8oW9t2KgLbpDLLp9aGZ7y8WHSshDknG0bknqGw5/tyCs5tw==}
@@ -1790,9 +1789,8 @@ packages:
     resolution: {integrity: sha512-d0II/GO9uf9lfUHH2BQsjxzRJZBdsjgsBiW4BvhWk/3qoKwQFjIDVN19PfX8F2D/r9PCMTtLWjYVCFrpeYUzsw==}
     deprecated: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.
 
-  brace-expansion@5.0.9:
-    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
-    engines: {node: 20 || >=22}
+  brace-expansion@1.1.21:
+    resolution: {integrity: sha512-9zeA+KLZNNzglF2TPKRQEDyx6Yby7daAkuy8MiPzpXPsYDWi/DRM8jmwUDxokQjYqBpv5DgPiwD4h4ZZSy1Ujw==}
 
   caniuse-lite@1.0.30001799:
     resolution: {integrity: sha512-hG1bReV+OUU+MOqK4t/ZWI0tZOyz3rqS9XuhOUz1cIcbwBKjOyJEJuw9ER5JuNyqxNk8u/JUVbGibBOL1yrjFw==}
@@ -1864,6 +1862,9 @@ packages:
   commander@4.1.1:
     resolution: {integrity: sha512-NOKm8xhkzAjzFx8B2v5OAHT+u5pRQc2UCa2Vq9jYL/31o2wi9mxBA7LIFs3sV5VSC49z6pEhfbMULvShKj26WA==}
     engines: {node: '>= 6'}
+
+  concat-map@0.0.1:
+    resolution: {integrity: sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==}
 
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
@@ -4308,7 +4309,7 @@ snapshots:
 
   bail@2.0.2: {}
 
-  balanced-match@4.0.4: {}
+  balanced-match@1.0.2: {}
 
   bidi-js@1.0.3:
     dependencies:
@@ -4316,9 +4317,10 @@ snapshots:
 
   boolean@3.2.0: {}
 
-  brace-expansion@5.0.9:
+  brace-expansion@1.1.21:
     dependencies:
-      balanced-match: 4.0.4
+      balanced-match: 1.0.2
+      concat-map: 0.0.1
 
   caniuse-lite@1.0.30001799: {}
 
@@ -4380,6 +4382,8 @@ snapshots:
   commander@13.1.0: {}
 
   commander@4.1.1: {}
+
+  concat-map@0.0.1: {}
 
   convert-source-map@2.0.0: {}
 
@@ -5391,7 +5395,7 @@ snapshots:
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.9
+      brace-expansion: 1.1.21
 
   minimist@1.2.8: {}
 

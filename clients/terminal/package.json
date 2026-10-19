@@ -53,10 +53,10 @@
   },
   "_overrides_comment": "Advisory floors for transitive deps of the SHIPPED terminal image, which is built with `npm ci` from package-lock.json (see Dockerfile) and therefore does not see pnpm-workspace.yaml's overrides. Keep the two lists in sync for any package present in both trees.",
   "overrides": {
-    "postcss": ">=8.5.23",
+    "postcss": "^8.5.23",
     "nanoid": "^3.3.18",
-    "sharp": ">=0.35.4",
-    "source-map-js": ">=1.2.2",
+    "sharp": "^0.35.4",
+    "source-map-js": "^1.2.2",
     "undici": "^7.29.1"
   }
 }
