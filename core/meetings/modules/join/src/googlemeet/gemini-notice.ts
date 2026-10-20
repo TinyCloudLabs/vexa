@@ -4,8 +4,9 @@ import type { BotConfig } from "../_host";
 import { triggerEscalation } from "../shared/escalation";
 import {
   googleGeminiNoticeDialogSelectors,
-  googleGeminiNoticeButtonSelectors,
-  googleGeminiNoticeTexts,
+  googleGeminiNoticeControlSelectors,
+  googleGeminiNoticeSentences,
+  googleGeminiNoticeCaptureSentenceCount,
   googleGeminiNoticeLeaveLabel,
   googleGeminiNoticeContinueLabel,
 } from "./selectors";
@@ -25,10 +26,12 @@ import { resolveUiInteractionMode } from "./join";
 //   note-taken by Gemini. It is the capturing party and has already been admitted by the host. Never
 //   auto-click anything that grants consent on behalf of others or shares data.
 //
-// The click is scoped to EXACTLY this shape: a visible dialog whose text is about the call being recorded /
-// transcribed / note-taken AND whose visible buttons are exactly {Leave, Join now}. Any other dialog — the
-// pre-admission "take notes for me" consent prompt, a dialog with extra buttons, a dialog without "Join now"
-// — is not the notice and is never clicked.
+// The click is scoped to EXACTLY this shape: a visible `role="dialog"` (never `alertdialog`) whose text, minus
+// the two control labels, consists only of the known notice sentences (recorded / transcribed / "Gemini is
+// taking notes"), containing EXACTLY two interactive controls of any kind, named Leave and Join now. Any other
+// dialog — the pre-admission "take notes for me" consent prompt, one with an extra button/link/checkbox/input
+// (e.g. a share or allow control), one without "Join now" — is not the notice and is never clicked.
+// admission.ts additionally calls it only once the bot is in the call (lobby gone, a real tile present).
 
 /** How many times the click is attempted before the bot gives up and summons a human. */
 export const GEMINI_NOTICE_MAX_CLICKS = 3;
@@ -37,8 +40,9 @@ const SETTLE_AFTER_CLICK_MS = 1000;
 
 export interface GeminiNoticeScanArgs {
   dialogSelectors: string[];
-  buttonSelectors: string[];
-  texts: string[];
+  controlSelectors: string[];
+  sentences: string[];
+  captureSentenceCount: number;
   leaveLabel: string;
   continueLabel: string;
 }
@@ -60,21 +64,29 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
   };
   const dialogs = Array.from(document.querySelectorAll(args.dialogSelectors.join(","))).filter(isVisible);
   for (const dialog of dialogs) {
-    const text = normalize(dialog.textContent || "");
-    if (!args.texts.some((t) => text.includes(t))) continue;
-    const buttons = Array.from(dialog.querySelectorAll(args.buttonSelectors.join(","))).filter(isVisible);
-    const labels = buttons.map((b) => normalize(b.textContent || ""));
-    // Exactly {Leave, Join now}: two buttons, one of each.
-    if (labels.length !== 2 || !labels.includes(args.leaveLabel) || !labels.includes(args.continueLabel)) continue;
-    return buttons[labels.indexOf(args.continueLabel)];
+    // EXACTLY two interactive controls, of any kind (hidden ones count: a conservative scope), named
+    // exactly Leave and Join now. A checkbox, link, share/allow control or a third button disqualifies.
+    const controls = Array.from(dialog.querySelectorAll(args.controlSelectors.join(",")));
+    if (controls.length !== 2) continue;
+    const labels = controls.map((c) => normalize(c.textContent || ""));
+    if (!labels.includes(args.leaveLabel) || !labels.includes(args.continueLabel)) continue;
+    if (!controls.every(isVisible)) continue;
+    // The dialog text with the control labels removed must consist ONLY of the known notice sentences.
+    const clone = dialog.cloneNode(true) as Element;
+    for (const c of Array.from(clone.querySelectorAll(args.controlSelectors.join(",")))) c.remove();
+    const sentences = normalize(clone.textContent || "").split(".").map((x) => x.trim()).filter((x) => x.length > 0);
+    if (sentences.length === 0 || !sentences.every((x) => args.sentences.includes(x))) continue;
+    if (!sentences.some((x) => args.sentences.indexOf(x) < args.captureSentenceCount)) continue;
+    return controls[labels.indexOf(args.continueLabel)];
   }
   return null;
 }
 
 const scanArgs: GeminiNoticeScanArgs = {
   dialogSelectors: googleGeminiNoticeDialogSelectors,
-  buttonSelectors: googleGeminiNoticeButtonSelectors,
-  texts: googleGeminiNoticeTexts,
+  controlSelectors: googleGeminiNoticeControlSelectors,
+  sentences: googleGeminiNoticeSentences,
+  captureSentenceCount: googleGeminiNoticeCaptureSentenceCount,
   leaveLabel: googleGeminiNoticeLeaveLabel,
   continueLabel: googleGeminiNoticeContinueLabel,
 };

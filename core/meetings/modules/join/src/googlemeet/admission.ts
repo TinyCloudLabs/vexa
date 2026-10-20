@@ -347,6 +347,14 @@ const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
 
 // The post-admission notice is handled (clicked) by handleGeminiNotice, called at the top of every
 // admission poll below. Exception policy and its scope: gemini-notice.ts.
+// It is only ever attempted once there is evidence the bot was admitted: no lobby text on screen and a real
+// participant tile (or the self tile) rendered behind the dialog. Without that evidence nothing is clicked.
+async function handleNoticeIfInCall(page: Page, botConfig: BotConfig): Promise<void> {
+  if (await checkForWaitingRoomIndicators(page)) return;
+  const inCall = (await countRealParticipantTiles(page)) > 0 || (await page.locator("[data-self-name]").count()) > 0;
+  if (!inCall) return;
+  await handleGeminiNotice(page, botConfig);
+}
 
 // Terminal admission verdicts carry an honest reason: a host denial says so, and an
 // unsolved captcha says THAT — both map to AdmissionError("denial") (PERMANENT, no
@@ -383,7 +391,7 @@ export async function waitForGoogleMeetingAdmission(
     
     // Check for any visible admission indicator (multiple selectors for robustness)
     // If meeting controls are visible, the bot is admitted — lobby indicators are unreliable
-    await handleGeminiNotice(page, botConfig);
+    await handleNoticeIfInCall(page, botConfig);
     const initialAdmissionFound = await checkForGoogleAdmissionIndicators(page);
 
     if (initialAdmissionFound) {
@@ -453,7 +461,7 @@ export async function waitForGoogleMeetingAdmission(
 
       while (Date.now() - startTime < effectiveTimeout()) {
         botConfig.signal?.throwIfAborted();
-        await handleGeminiNotice(page, botConfig);
+        await handleNoticeIfInCall(page, botConfig);
         // Host denial can leave stale waiting-room text in the DOM. Check the
         // terminal rejection state before treating the page as still waiting.
         await throwIfGoogleAdmissionRejected(page, "waiting-room polling");
@@ -505,7 +513,7 @@ export async function waitForGoogleMeetingAdmission(
       const effectiveTimeout2 = () => timeout + getEscalationExtensionMs();
       while (Date.now() - startTime < effectiveTimeout2()) {
         botConfig.signal?.throwIfAborted();
-        await handleGeminiNotice(page, botConfig);
+        await handleNoticeIfInCall(page, botConfig);
         // #444 — the `blocked` state is wired (callBlockedCallback), but NOT emitted yet.
         // hasRecaptchaChallenge() detects a VISIBLE, challenge-sized widget, which is the
         // narrow half of the signal; the blank block page half needs a run that actually
@@ -554,18 +562,30 @@ export async function waitForGoogleMeetingAdmission(
       }
 
       if (stillInWaitingRoom) {
-        // Re-run the waiting room loop with the remaining time
+        // Re-run the waiting room loop with the remaining time. Like the two loops above, it MUST escalate:
+        // a bot held behind a dialog we do not recognise would otherwise sit in `awaiting_admission` until
+        // the deadline and fail with no needs_human_help (TC-1606 review P2).
         const checkInterval = 2000;
         const startTime2 = Date.now();
-        while (Date.now() - startTime2 < timeout) {
+        let unknownStateDuration3 = 0;
+        while (Date.now() - startTime2 < timeout + getEscalationExtensionMs()) {
           botConfig.signal?.throwIfAborted();
-          await handleGeminiNotice(page, botConfig);
+          await handleNoticeIfInCall(page, botConfig);
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
           const stillWaiting = await checkForWaitingRoomIndicators(page);
           if (!stillWaiting) {
+            unknownStateDuration3 += checkInterval;
             const admissionFound2 = await checkForGoogleAdmissionIndicators(page);
             if (admissionFound2) return true;
+            // Pre-admission consent held behind a dialog: say so (consent_required), like the entry check.
+            if (await hasConsentPrompt(page)) await triggerEscalation(botConfig, "consent_required");
+          } else {
+            unknownStateDuration3 = 0;
+          }
+          const escalation3 = checkEscalation(Date.now() - startTime2, timeout, unknownStateDuration3);
+          if (escalation3) {
+            await triggerEscalation(botConfig, escalation3.reason);
           }
           await page.waitForTimeout(checkInterval);
         }

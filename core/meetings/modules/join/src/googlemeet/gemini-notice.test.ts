@@ -224,8 +224,9 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
       ({ width: 120, height: 40, top: 0, left: 0, right: 120, bottom: 40, x: 0, y: 0, toJSON() {} }) as DOMRect;
     const args = {
       dialogSelectors: selectors.googleGeminiNoticeDialogSelectors,
-      buttonSelectors: selectors.googleGeminiNoticeButtonSelectors,
-      texts: selectors.googleGeminiNoticeTexts,
+      controlSelectors: selectors.googleGeminiNoticeControlSelectors,
+      sentences: selectors.googleGeminiNoticeSentences,
+      captureSentenceCount: selectors.googleGeminiNoticeCaptureSentenceCount,
       leaveLabel: selectors.googleGeminiNoticeLeaveLabel,
       continueLabel: selectors.googleGeminiNoticeContinueLabel,
     };
@@ -250,6 +251,14 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     ['notice text with [Decline] [Join now]', '<div role="dialog"><h2>This video call is being recorded</h2><button>Decline</button><button>Join now</button></div>'],
     ['[Leave] [Join now] but unrelated text', '<div role="dialog"><h2>Ready to join?</h2><button>Leave</button><button>Join now</button></div>'],
     ['[Leave] [Join now] outside any dialog role', '<div><h2>This video call is being recorded</h2><button>Leave</button><button>Join now</button></div>'],
+    ['role=alertdialog with the notice text and [Leave] [Join now]', '<div role="alertdialog"><h2>This video call is being recorded</h2><button>Leave</button><button>Join now</button></div>'],
+    ['notice with an extra share control (checkbox "Share transcript")', '<div role="dialog"><h2>This video call is being recorded</h2><label><input type="checkbox"> Share transcript</label><button>Leave</button><button>Join now</button></div>'],
+    ['notice with an extra role=checkbox control', '<div role="dialog"><h2>This video call is being transcribed. Gemini is taking notes.</h2><div role="checkbox" aria-checked="false">Allow Gemini to share notes</div><button>Leave</button><button>Join now</button></div>'],
+    ['notice with a link (e.g. "Learn more") plus [Leave] [Join now]', '<div role="dialog"><h2>This video call is being recorded</h2><a href="#x">Learn more</a><button>Leave</button><button>Join now</button></div>'],
+    ['notice with a text input plus [Leave] [Join now]', '<div role="dialog"><h2>This video call is being recorded</h2><input type="text"><button>Leave</button><button>Join now</button></div>'],
+    ['pre-admission consent that also says "taking notes" with [Leave] [Join now]', '<div role="dialog"><h2>Gemini is taking notes. Take notes for me?</h2><button>Leave</button><button>Join now</button></div>'],
+    ['"taking notes" alone ([Leave] [Join now], no recording/transcription sentence)', '<div role="dialog"><h2>Gemini is taking notes.</h2><button>Leave</button><button>Join now</button></div>'],
+    ['notice text plus extra prose (a data-sharing sentence)', '<div role="dialog"><h2>This video call is being recorded</h2><p>Your name and email will be shared with the organizer.</p><button>Leave</button><button>Join now</button></div>'],
     ['share-data style dialog', '<div role="dialog"><h2>Allow Gemini to share meeting content?</h2><button>Leave</button><button>Allow</button></div>'],
   ];
   for (const [name, html] of negatives) {
@@ -280,6 +289,46 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     check('pressed "Join now" exactly 3 times', d.clicks.join(','), 'join now,join now,join now');
     check('3 handled events, attempts 1..3', JSON.stringify(run.handled.map((e) => e.attempt)), JSON.stringify([1, 2, 3]));
     check('escalates to needs_human_help with reason gemini_notice, once', run.helpReasons.join(','), 'gemini_notice');
+  }
+
+  console.log('\n=== the notice is only clicked once the bot is in the call ===');
+  {
+    // Lobby text still on screen, dialog present: not post-admission evidence → no click.
+    const lobbyAndNotice = mount(callWith(`${LOBBY}${RECORDING_HTML}`)); wireDialogButtons(lobbyAndNotice);
+    const run1 = await runWait(lobbyAndNotice);
+    check('lobby text visible + notice dialog → never clicked', lobbyAndNotice.clicks.length, 0);
+    check('lobby text visible + notice dialog → not admitted', run1.result === true, false);
+    // No participant tile / self tile rendered: no evidence of being in the call → no click.
+    const noTile = mount(`${TOOLBAR}${RECORDING_HTML}`); wireDialogButtons(noTile);
+    const run2 = await runWait(noTile);
+    check('notice dialog but no tile rendered (no evidence of admission) → never clicked', noTile.clicks.length, 0);
+    check('notice dialog but no tile rendered → not admitted', run2.result === true, false);
+  }
+
+  console.log('\n=== every exit of the late waiting-room loop escalates (review P2) ===');
+  // Production shape: first poll sees no lobby text, then the lobby appears (→ the late loop), then the lobby
+  // goes away behind a dialog the detector does not recognise.
+  const lateLobby = (page: string) => {
+    const d = mount('<div></div>');
+    const drive = (n: number) => {
+      if (n === 1) d.doc.body.innerHTML = LOBBY;
+      if (n === 4) { d.doc.body.innerHTML = page; wireDialogButtons(d); }
+    };
+    return { d, drive };
+  };
+  {
+    const { d, drive } = lateLobby(callWith(negatives[1][1])); // "taking notes" consent-like dialog, no Join now
+    const run = await runWait(d, drive);
+    check('late lobby, then an unmatched "taking notes" consent dialog → never clicked', d.clicks.length, 0);
+    check('late lobby, then unmatched consent dialog → fails by timeout, not admitted', run.result === 'AdmissionError:join_failure' || run.result === 'AdmissionError:lobby_timeout', true);
+    check('late lobby, then unmatched consent dialog → needs_human_help with reason consent_required', run.helpReasons.join(','), 'consent_required');
+  }
+  {
+    const { d, drive } = lateLobby(`${TOOLBAR}<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>`); // no tile: nothing says admitted
+    const run = await runWait(d, drive);
+    check('late lobby, then an unknown blocking dialog → escalates with a reason (not silent)',
+      run.helpReasons.length === 1 && run.helpReasons[0].length > 0, true);
+    check('late lobby, then an unknown blocking dialog → reason is unknown_blocking_state', run.helpReasons.join(','), 'unknown_blocking_state');
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);
