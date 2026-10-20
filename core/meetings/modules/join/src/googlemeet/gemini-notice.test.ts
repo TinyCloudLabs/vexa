@@ -165,7 +165,7 @@ const BOT = { platform: 'google_meet', botName: 'x', uiInteractionMode: 'synthet
  * run on Date.now(), which advances only when the loop waits — no real sleeping). `onWait(n)` mutates the page
  * on the n-th wait. Returns the verdict plus everything the bot emitted.
  */
-async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) {
+async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, tweak?: (page: any) => void) {
   resetEscalation();
   const helpReasons: string[] = [];
   setHooks({ onState: (st, detail) => { if (st === 'needs_human_help') helpReasons.push(String(detail?.reason)); } });
@@ -174,6 +174,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) 
   Date.now = () => clock;
   let waits = 0;
   const page = domPage(d, (ms) => { clock += ms; waits++; onWait?.(waits); });
+  tweak?.(page);
   try {
     const { result, lines } = await captureLogs(async () => {
       try { return await waitForGoogleMeetingAdmission(page, budgetMs, BOT); }
@@ -189,7 +190,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) 
 
 (async () => {
   delete process.env.DISPLAY; // escalation must not try to start a VNC stack here
-  const withDialog = (html: string, dismissOnJoin = true) => { const d = mount(callWith(html), dismissOnJoin); wireDialogButtons(d); return d; };
+  const withDialog = (html: string, dismissOnJoin = true, mutate?: (d: Dom) => void) => { const d = mount(callWith(html), dismissOnJoin); mutate?.(d); wireDialogButtons(d); return d; };
   const copies: [string, string][] = [['Gemini notes / transcription', NOTICE_HTML], ['recording only', RECORDING_HTML]];
 
   for (const [name, html] of copies) {
@@ -277,6 +278,49 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) 
     check(`${name} → not the notice`, (await detectGeminiNotice(domPage(d))).present, false);
     check(`${name} → handleGeminiNotice clicks nothing`, await handleGeminiNotice(domPage(d), BOT), 'absent');
     check(`${name} → zero clicks`, d.clicks.length, 0);
+  }
+
+  console.log('\n=== accessible-tree check: names, shadow roots, unknown content, hidden/nested dialogs ===');
+  const REC = 'This video call is being recorded';
+  const shadowShare = (d: Dom, mode: 'open' | 'closed', inner: string) => {
+    const host = d.doc.getElementById('host') as Element;
+    const root = host.attachShadow({ mode });
+    root.innerHTML = inner;
+  };
+  const treeNegatives: [string, string, ((d: Dom) => void) | undefined][] = [
+    ['Join now button whose aria-label says "Share meeting data"', `<div role="dialog"><h2>${REC}</h2><button>Leave</button><button aria-label="Share meeting data">Join now</button></div>`, undefined],
+    ['Join now button whose aria-labelledby names another element', `<div role="dialog"><h2 id="t">${REC}</h2><button>Leave</button><button aria-labelledby="t">Join now</button></div>`, undefined],
+    ['Leave button whose aria-label says something else', `<div role="dialog"><h2>${REC}</h2><button aria-label="Allow sharing">Leave</button><button>Join now</button></div>`, undefined],
+    ['Join now button whose aria-label is "Join now now" (name != visible text)', `<div role="dialog"><h2>${REC}</h2><button>Leave</button><button aria-label="Join now now">Join now</button></div>`, undefined],
+    ['third "Share" button inside an OPEN shadow root', `<div role="dialog"><h2>${REC}</h2><div id="host"></div><button>Leave</button><button>Join now</button></div>`, (d) => shadowShare(d, 'open', '<button>Share</button>')],
+    ['third focusable div inside an OPEN shadow root', `<div role="dialog"><h2>${REC}</h2><div id="host"></div><button>Leave</button><button>Join now</button></div>`, (d) => shadowShare(d, 'open', '<div tabindex="0">Share</div>')],
+    ['prose inside an open shadow root', `<div role="dialog"><h2>${REC}</h2><div id="host"></div><button>Leave</button><button>Join now</button></div>`, (d) => shadowShare(d, 'open', '<p>Your email will be shared.</p>')],
+    ['CLOSED shadow host (custom element) inside the dialog', `<div role="dialog"><h2>${REC}</h2><x-share id="host"></x-share><button>Leave</button><button>Join now</button></div>`, (d) => shadowShare(d, 'closed', '<button>Share</button>')],
+    ['custom element without a shadow root inside the dialog', `<div role="dialog"><h2>${REC}</h2><x-share></x-share><button>Leave</button><button>Join now</button></div>`, undefined],
+    ['iframe inside the dialog', `<div role="dialog"><h2>${REC}</h2><iframe></iframe><button>Leave</button><button>Join now</button></div>`, undefined],
+    ['dialog is aria-hidden="true"', `<div role="dialog" aria-hidden="true"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div>`, undefined],
+    ['dialog sits under an aria-hidden ancestor', `<div aria-hidden="true"><div role="dialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div></div>`, undefined],
+    ['dialog sits under an inert ancestor', `<div inert><div role="dialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div></div>`, undefined],
+    ['matching dialog nested inside a "Take notes for me?" consent dialog', `<div role="dialog"><h2>Take notes for me?</h2><div role="dialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div></div>`, undefined],
+    ['matching dialog nested inside an alertdialog', `<div role="alertdialog"><h2>Heads up</h2><div role="dialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div></div>`, undefined],
+  ];
+  for (const [name, html, mutate] of treeNegatives) {
+    const d = withDialog(html, true, mutate);
+    check(`${name} → not the notice`, (await detectGeminiNotice(domPage(d))).present, false);
+    check(`${name} → handleGeminiNotice clicks nothing`, await handleGeminiNotice(domPage(d), BOT), 'absent');
+    check(`${name} → zero clicks`, d.clicks.length, 0);
+  }
+  {
+    // Positive controls for the name algorithm: a matching aria-label / aria-labelledby is still the notice.
+    const ok1 = `<div role="dialog"><h2>${REC}</h2><button aria-label="Leave">Leave</button><button aria-label="Join now">Join now</button></div>`;
+    const ok2 = `<div role="dialog"><h2>${REC}</h2><button>Leave</button><button aria-labelledby="jn"><span id="jn">Join now</span></button></div>`;
+    check('matching aria-label on both buttons → still the notice', (await detectGeminiNotice(domPage(withDialog(ok1)))).present, true);
+    check('aria-labelledby resolving to "Join now" → still the notice', (await detectGeminiNotice(domPage(withDialog(ok2)))).present, true);
+    // The real captured notice inside an open-shadow-root-free page is unaffected by an unrelated open shadow root
+    // OUTSIDE the dialog (the walk is scoped to the dialog's own tree).
+    const outside = mount(callWith(`<div id="host"></div>${NOTICE_HTML}`)); wireDialogButtons(outside);
+    shadowShare(outside, 'open', '<button>Share</button>');
+    check('open shadow root outside the dialog does not disqualify the real notice', (await detectGeminiNotice(domPage(outside))).present, true);
   }
 
   console.log('\n=== positive control: a non-focusable (tabindex=-1) wrapper does not disqualify the real notice ===');
@@ -380,6 +424,37 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) 
     const run = await runWait(d, undefined, 1_000);
     check('budget 1000 ms, lobby only → lobby_timeout', run.result, 'AdmissionError:lobby_timeout');
     check('budget 1000 ms, lobby only → escalated waiting_room_timeout_approaching', run.helpReasons.join(','), 'waiting_room_timeout_approaching');
+  }
+
+  console.log('\n=== a failing side effect cannot skip the escalation (review round 3 P2) ===');
+  {
+    // Screenshot rejects only at the final no-indicators checkpoint (budget shorter than a poll, lobby never leaves).
+    const d = mount(LOBBY);
+    const run = await runWait(d, undefined, 1_000, (page) => {
+      page.screenshot = async (o: { path?: string }) => { if (o?.path?.includes('no-indicators')) throw new Error('screenshot failed'); };
+    });
+    check('screenshot fails at the no-indicators checkpoint → still lobby_timeout', run.result, 'AdmissionError:lobby_timeout');
+    check('screenshot fails at the no-indicators checkpoint → escalated', run.helpReasons.join(','), 'waiting_room_timeout_approaching');
+  }
+  {
+    // Late lobby then an unknown dialog; the same screenshot failure on the join_failure path.
+    const d = mount('<div></div>');
+    const run = await runWait(d, (n) => {
+      if (n === 1) d.doc.body.innerHTML = LOBBY;
+      if (n === 2) d.doc.body.innerHTML = `${TOOLBAR}<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>`;
+    }, 2_500, (page) => {
+      page.screenshot = async (o: { path?: string }) => { if (o?.path?.includes('no-indicators')) throw new Error('screenshot failed'); };
+    });
+    check('screenshot fails on the join_failure path → verdict unchanged', run.result, 'AdmissionError:join_failure');
+    check('screenshot fails on the join_failure path → escalated unknown_blocking_state', run.helpReasons.join(','), 'unknown_blocking_state');
+  }
+  {
+    // Every screenshot throws, including the very first one at the start of the wait: an unexpected error still
+    // surfaces as join_failure AND escalates.
+    const d = mount(LOBBY);
+    const run = await runWait(d, undefined, 1_000, (page) => { page.screenshot = async () => { throw new Error('screenshot failed'); }; });
+    check('every screenshot fails → join_failure', run.result, 'AdmissionError:join_failure');
+    check('every screenshot fails → escalated, once, with a reason', run.helpReasons.length === 1 && run.helpReasons[0] !== 'undefined', true);
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

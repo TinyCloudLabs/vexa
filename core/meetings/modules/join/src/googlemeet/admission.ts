@@ -345,16 +345,26 @@ const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
   '[role="alertdialog"]:has-text("taking notes")': true,
 };
 
-// Every unresolved exit of the admission wait summons a human, whatever the loop timing: a short budget can
-// end a loop before checkEscalation's poll-boundary thresholds (>80% of budget, >10 s unknown) are crossed,
-// and the bot would then fail with only `awaiting_admission` on record (TC-1606 review). triggerEscalation is
-// idempotent, so a loop that already escalated is not repeated. The reason names what the page is showing.
-async function escalateUnresolvedExit(page: Page, botConfig: BotConfig, lobbyVisible: boolean): Promise<void> {
+// Every unresolved exit of the admission wait summons a human, whatever the loop timing and whatever else
+// fails on the way out: a short budget can end a loop before checkEscalation's poll-boundary thresholds
+// (>80% of budget, >10 s unknown) are crossed, and a failing diagnostic screenshot, log or page query must
+// not skip it (TC-1606 review). triggerEscalation is idempotent, so a loop that already escalated is not
+// repeated. The reason names what the page is showing; every page query is best-effort, and the escalation
+// itself is always attempted. A failing escalation is logged, never allowed to replace the join verdict.
+async function escalateUnresolvedExit(page: Page, botConfig: BotConfig): Promise<void> {
+  const attempt = async <T>(probe: () => Promise<T>, fallback: T): Promise<T> => {
+    try { return await probe(); } catch { return fallback; }
+  };
+  const lobbyVisible = await attempt(() => checkForWaitingRoomIndicators(page), false);
   let reason: string;
-  if (await hasConsentPrompt(page)) reason = "consent_required";
-  else if ((await detectGeminiNotice(page)).present) reason = "gemini_notice";
+  if (await attempt(() => hasConsentPrompt(page), false)) reason = "consent_required";
+  else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present) reason = "gemini_notice";
   else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
-  await triggerEscalation(botConfig, reason);
+  try {
+    await triggerEscalation(botConfig, reason);
+  } catch {
+    log("Escalation failed while leaving the admission wait; continuing with the join verdict");
+  }
 }
 
 // The post-admission notice is handled (clicked) by handleGeminiNotice, called at the top of every
@@ -514,7 +524,7 @@ export async function waitForGoogleMeetingAdmission(
       const finalWaitingCheck = await checkForWaitingRoomIndicators(page);
       
       if (finalWaitingCheck) {
-        await escalateUnresolvedExit(page, botConfig, true);
+        await escalateUnresolvedExit(page, botConfig);
         throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout - not admitted to the meeting");
       }
     } else {
@@ -622,11 +632,16 @@ export async function waitForGoogleMeetingAdmission(
 
     // Distinguish lobby-timeout from join-failure by checking waiting-room state
     const lobbyStillVisible = await checkForWaitingRoomIndicators(page);
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-3-no-indicators.png', fullPage: true });
-    log("📸 Screenshot taken: No meeting indicators found after timeout");
-    // Every unresolved exit escalates, independent of loop timing (a short budget can end the loop before
-    // checkEscalation's poll-boundary thresholds are ever crossed).
-    await escalateUnresolvedExit(page, botConfig, lobbyStillVisible);
+    // Every unresolved exit escalates, independent of loop timing and of the diagnostics below (a short
+    // budget can end the loop before checkEscalation's thresholds are crossed; a failing screenshot must not
+    // skip the escalation or change the lobby_timeout / join_failure verdict).
+    await escalateUnresolvedExit(page, botConfig);
+    try {
+      await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-3-no-indicators.png', fullPage: true });
+      log("📸 Screenshot taken: No meeting indicators found after timeout");
+    } catch {
+      log("Diagnostic screenshot failed at the no-indicators checkpoint; continuing");
+    }
     if (lobbyStillVisible) {
       throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout — host did not admit");
     }
@@ -635,8 +650,14 @@ export async function waitForGoogleMeetingAdmission(
   } catch (error: any) {
     // A cancelled join is the embedder's decision, not a platform verdict: surface the abort itself.
     if (botConfig.signal?.aborted) throw botConfig.signal.reason;
-    // Re-throw AdmissionError instances unchanged so callers can inspect outcome.
-    if (error instanceof AdmissionError) throw error;
+    // Re-throw AdmissionError instances unchanged so callers can inspect outcome. Any unresolved failure
+    // (not a host denial, not a cancelled join) escalates here too, so no exit — including an unexpected error
+    // from a step above — can leave the bot silent in `awaiting_admission`.
+    if (error instanceof AdmissionError) {
+      if (error.outcome === "lobby_timeout" || error.outcome === "join_failure") await escalateUnresolvedExit(page, botConfig);
+      throw error;
+    }
+    await escalateUnresolvedExit(page, botConfig);
     throw new AdmissionError("join_failure",
       `Bot was not admitted into the Google Meet meeting within the timeout period: ${error.message}`
     );

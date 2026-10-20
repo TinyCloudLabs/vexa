@@ -49,39 +49,136 @@ export interface GeminiNoticeScanArgs {
   continueLabel: string;
 }
 
-// Runs INSIDE the page (shipped through page.evaluateHandle), so it is self-contained by contract: DOM
-// globals and its argument only, plain-CSS selectors only (document.querySelector has no Playwright
-// engines). Matches by role + text, never by Google's generated class names. Returns the "Join now" button
-// of the notice dialog, or null when the page is not showing the notice.
+// Runs INSIDE the page (shipped through page.evaluateHandle), so it is self-contained by contract: DOM globals
+// and its argument only, plain-CSS selectors only (document.querySelector has no Playwright engines).
+// Returns the "Join now" button of the notice dialog, or null when the page is not showing exactly the notice.
+//
+// ONE accessible-tree check, no per-probe special cases. The dialog is accepted only if, walking its WHOLE tree
+// (light DOM and every open shadow root), ALL of these hold:
+//   1. it is a visible `role="dialog"`, not aria-hidden/inert, with no dialog/alertdialog ancestor (a nested
+//      dialog inside a consent dialog is not the notice);
+//   2. nothing in the tree is "unknown": an iframe/frame/object/embed, or a custom element without an open
+//      shadow root (it may host a closed one, which cannot be inspected) — unknown means no click;
+//   3. exactly two focusable/interactive elements exist in that full tree, both real buttons, both visible;
+//   4. each button's visible text, its accessible name (aria-labelledby, then aria-label, then text — the same
+//      algorithm for both) and the expected label ("leave" / "join now") are all equal after normalization;
+//   5. every other text node in the tree, joined, consists only of the known notice sentences.
+// Matches by role + text, never by Google's generated class names.
 export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Element | null {
   // Serialization contract (see shared/leave-click.ts): esbuild-family compilers wrap nested function
   // expressions in a `__name` helper that does not exist in the page. Define it before any nested function.
   // The identity is an anonymous argument on purpose: a named binding would itself be wrapped in `__name`.
   Reflect.set(globalThis, "__name", Reflect.get(globalThis, "__name") || ((f: unknown) => f));
   const normalize = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
-  const isVisible = (el: Element) => {
+  const shown = (el: Element) => {
     const rect = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
   };
-  const dialogs = Array.from(document.querySelectorAll(args.dialogSelectors.join(","))).filter(isVisible);
+  const controlSel = args.controlSelectors.join(",");
+  const buttonSel = args.buttonSelectors.join(",");
+  const dialogSel = args.dialogSelectors.join(",");
+  const nestedDialogSel = '[role="dialog"],[role="alertdialog"],dialog';
+  const UNKNOWN_TAGS = ["iframe", "frame", "object", "embed"];
+
+  // Parent across shadow boundaries (a shadow root's parent is its host).
+  const parentOf = (n: Node): Element | null => {
+    if (n.parentElement) return n.parentElement;
+    const root = n.getRootNode() as unknown as { host?: Element };
+    return root && root.host ? root.host : null;
+  };
+
+  // Text of an element as a user sees it: text nodes whose own ancestors (up to the element) are rendered.
+  const visibleText = (el: Element): string => {
+    const parts: string[] = [];
+    const stack: Node[] = [el];
+    while (stack.length > 0) {
+      const node = stack.pop() as Node;
+      if (node.nodeType === 3) {
+        let ok = true;
+        for (let p = node.parentElement; p; p = p.parentElement) {
+          const cs = getComputedStyle(p);
+          if (cs.display === "none" || cs.visibility === "hidden") ok = false;
+          if (p === el) break;
+        }
+        if (ok) parts.push(node.textContent || "");
+      } else {
+        const kids = Array.from(node.childNodes);
+        for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+        const host = node as Element;
+        if (host.shadowRoot) stack.push(host.shadowRoot);
+      }
+    }
+    return normalize(parts.join(" "));
+  };
+
+  // Accessible name, one algorithm for every control: aria-labelledby, then aria-label, then text.
+  const accessibleName = (el: Element): string => {
+    const root = el.getRootNode() as unknown as { getElementById?: (id: string) => Element | null };
+    const labelledby = el.getAttribute("aria-labelledby");
+    if (labelledby && root.getElementById) {
+      const named = labelledby.split(/\s+/).map((id) => {
+        const ref = root.getElementById ? root.getElementById(id) : null;
+        return ref ? normalize(ref.getAttribute("aria-label") || ref.textContent || "") : "";
+      }).filter((t) => t.length > 0).join(" ");
+      if (named.length > 0) return named;
+    }
+    const label = normalize(el.getAttribute("aria-label") || "");
+    if (label.length > 0) return label;
+    return visibleText(el);
+  };
+
+  const dialogs = Array.from(document.querySelectorAll(dialogSel)).filter(shown);
   for (const dialog of dialogs) {
-    // EXACTLY two focusable/interactive elements of any kind (hidden ones count: a conservative scope), both
-    // real buttons, named exactly Leave and Join now. A checkbox, link, focusable div, share/allow control or
-    // a third button disqualifies.
-    const controls = Array.from(dialog.querySelectorAll(args.controlSelectors.join(",")));
-    if (controls.length !== 2) continue;
-    // Both must be real buttons: a link or any other element named "Join now" is never clicked.
-    if (!controls.every((c) => c.matches(args.buttonSelectors.join(",")))) continue;
-    const labels = controls.map((c) => normalize(c.textContent || ""));
-    if (!labels.includes(args.leaveLabel) || !labels.includes(args.continueLabel)) continue;
-    if (!controls.every(isVisible)) continue;
-    // The dialog text with the control labels removed must consist ONLY of the known notice sentences.
-    const clone = dialog.cloneNode(true) as Element;
-    for (const c of Array.from(clone.querySelectorAll(args.controlSelectors.join(",")))) c.remove();
-    const sentences = normalize(clone.textContent || "").split(".").map((x) => x.trim()).filter((x) => x.length > 0);
+    // 1. the dialog itself: not hidden from the accessibility tree, not nested in another dialog.
+    let blocked = false;
+    for (let p: Element | null = dialog; p; p = parentOf(p)) {
+      if (p.getAttribute("aria-hidden") === "true" || p.hasAttribute("inert")) blocked = true;
+      if (p !== dialog && p.matches(nestedDialogSel)) blocked = true;
+    }
+    if (blocked) continue;
+
+    // 2./3. walk the whole tree (open shadow roots included): collect controls and stray text, flag unknowns.
+    const controls: Element[] = [];
+    const strayText: Text[] = [];
+    let unknown = false;
+    const stack: Node[] = [dialog];
+    while (stack.length > 0) {
+      const node = stack.pop() as Node;
+      if (node.nodeType === 3) { strayText.push(node as Text); continue; }
+      if (node.nodeType === 1) {
+        const el = node as Element;
+        if (el !== dialog) {
+          if (UNKNOWN_TAGS.indexOf(el.localName) >= 0) unknown = true;
+          if (el.localName.indexOf("-") >= 0 && !el.shadowRoot) unknown = true;
+          if (el.matches(controlSel)) controls.push(el);
+        }
+        if (el.shadowRoot) stack.push(el.shadowRoot);
+      }
+      const kids = Array.from(node.childNodes);
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+    if (unknown || controls.length !== 2) continue;
+    if (!controls.every((c) => c.matches(buttonSel) && shown(c))) continue;
+
+    // 4. accessible name == visible text == the expected label, for each button.
+    const labels: string[] = [];
+    let named = true;
+    for (const c of controls) {
+      const text = visibleText(c);
+      if (text !== accessibleName(c)) named = false;
+      labels.push(text);
+    }
+    if (!named || !labels.includes(args.leaveLabel) || !labels.includes(args.continueLabel)) continue;
+
+    // 5. everything else on the dialog is the known notice sentences.
+    const prose = strayText
+      .filter((t) => !controls.some((c) => c.contains(t)))
+      .map((t) => t.textContent || "").join(" ");
+    const sentences = normalize(prose).split(".").map((x) => x.trim()).filter((x) => x.length > 0);
     if (sentences.length === 0 || !sentences.every((x) => args.sentences.includes(x))) continue;
     if (!sentences.some((x) => args.sentences.indexOf(x) < args.captureSentenceCount)) continue;
+
     return controls[labels.indexOf(args.continueLabel)];
   }
   return null;
