@@ -1,7 +1,7 @@
 /**
  * TC-1606 — Meet bot never enters the call when Gemini notes / transcription / recording is on.
  *
- * OBSERVED (live, anonymous-guest bot, qa@ host): ~4 s after the host admits the bot, Meet shows the
+ * OBSERVED (live, anonymous-guest bot, QA host): ~4 s after the host admits the bot, Meet shows the
  * GUEST a modal dialog — "This video call is being transcribed. Gemini is taking notes." (Gemini notes /
  * transcription) or "This video call is being recorded" (recording only) — with exactly [Leave] [Join now].
  * The guest is not in the call (host People never lists it) until "Join now" is pressed. Both copies are
