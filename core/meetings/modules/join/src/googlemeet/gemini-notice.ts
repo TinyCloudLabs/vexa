@@ -158,7 +158,16 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
     const cx = Math.floor((window.innerWidth || 0) / 2);
     const cy = Math.floor((window.innerHeight || 0) / 2);
     let hit: Element | null = null;
-    try { hit = document.elementFromPoint(cx, cy); } catch { hit = null; }
+    try {
+      hit = document.elementFromPoint(cx, cy);
+      // Chromium retargets the document-level hit to an open-shadow HOST: descend through every open shadow
+      // root with that root's own hit-test until it settles on the deepest element.
+      for (let depth = 0; hit && hit.shadowRoot && depth < 32; depth++) {
+        const inner: Element | null = hit.shadowRoot.elementFromPoint(cx, cy);
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+    } catch { /* keep whatever was resolved; a failed hit-test only loses the "covering" signal */ }
     for (const dialog of dialogs) {
       if (dialog.matches(modalSel)) return true;
       for (let p: Element | null = hit; p; p = parentOf(p)) if (p === dialog) return true;

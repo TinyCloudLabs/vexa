@@ -413,6 +413,28 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     ['unknown alertdialog modal', '<div role="alertdialog" aria-modal="true"><h2>Something unexpected</h2><button>OK</button></div>', undefined],
     ['open <dialog> with unknown copy', '<dialog open><h2>Something unexpected</h2><button>OK</button></dialog>', undefined],
     ['shadow-hosted unknown modal', '<div id="host"></div>', (d) => { (d.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = '<div role="dialog" aria-modal="true"><h2>Something unexpected</h2><button>OK</button></div>'; }],
+    // Chromium retargets the document-level centre hit-test to the open-shadow HOST; only ShadowRoot.elementFromPoint
+    // reaches the dialog. The stubs below reproduce exactly that retargeting.
+    ['shadow-hosted, centred, NO aria-modal, reworded copy (hit-test retargeted to the host)', '<div id="host"></div>', (d) => {
+      const host = d.doc.getElementById('host') as Element;
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<div role="dialog"><h2>This video call is recorded</h2><button>Leave</button><button>Join now</button></div>';
+      const inner = root.querySelector('h2') as Element;
+      (d.doc as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => host;
+      (root as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => inner;
+    }],
+    ['two nested open shadow roots, centred, NO aria-modal (hit-test descends both)', '<div id="host"></div>', (d) => {
+      const outer = d.doc.getElementById('host') as Element;
+      const outerRoot = outer.attachShadow({ mode: 'open' });
+      outerRoot.innerHTML = '<div id="mid"></div>';
+      const mid = outerRoot.getElementById('mid') as Element;
+      const midRoot = mid.attachShadow({ mode: 'open' });
+      midRoot.innerHTML = '<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>';
+      const inner = midRoot.querySelector('h2') as Element;
+      (d.doc as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => outer;
+      (outerRoot as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => mid;
+      (midRoot as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => inner;
+    }],
     ['role=dialog WITHOUT aria-modal that covers the middle of the viewport', '<div role="dialog" id="cover"><h2>Something unexpected</h2><button>OK</button></div>', (d) => {
       const cover = d.doc.getElementById('cover') as Element;
       (d.doc as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => cover.querySelector('h2') as Element;
@@ -439,6 +461,16 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     check('Gemini pill (role=status) + real tile → still admitted',
       await checkForGoogleAdmissionIndicators(domPage(mount(callWith('<div role="status">Gemini is taking notes</div>')))), true);
     const run = await runWait(mount(callWith(toast)));
+    {
+      // Control: a shadow-hosted toast away from the centre must not block (hit-test lands on the call UI).
+      const d = mount(callWith('<div id="host"></div>'));
+      const host = d.doc.getElementById('host') as Element;
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<div role="dialog"><h2>Microphone not found</h2><button>Close</button></div>';
+      const tile = d.doc.querySelector('[data-participant-id]') as Element;
+      (d.doc as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => tile;
+      check('shadow-hosted non-modal toast away from the centre + real tile → still admitted', await checkForGoogleAdmissionIndicators(domPage(d)), true);
+    }
     check('non-modal toast → wait resolves admitted, no escalation', run.result === true && run.helpReasons.length === 0, true);
   }
   {
