@@ -4,6 +4,8 @@ import type { BotConfig } from "../_host";
 import { triggerEscalation } from "../shared/escalation";
 import {
   googleGeminiNoticeDialogSelectors,
+  googleGeminiNoticeBlockingDialogSelectors,
+  googleGeminiNoticeBlockingTexts,
   googleGeminiNoticeControlSelectors,
   googleGeminiNoticeButtonSelectors,
   googleGeminiNoticeSentences,
@@ -40,7 +42,12 @@ export const GEMINI_NOTICE_MAX_CLICKS = 3;
 const SETTLE_AFTER_CLICK_MS = 1000;
 
 export interface GeminiNoticeScanArgs {
+  /** "click": return the Join now button of exactly the notice (or null). "block": return true when ANY dialog
+   *  in the tree (open shadow roots included) says capture is on, clickable or not. Same walk for both. */
+  mode: "click" | "block";
   dialogSelectors: string[];
+  blockingDialogSelectors: string[];
+  blockingTexts: string[];
   controlSelectors: string[];
   buttonSelectors: string[];
   sentences: string[];
@@ -64,7 +71,7 @@ export interface GeminiNoticeScanArgs {
 //      algorithm for both) and the expected label ("leave" / "join now") are all equal after normalization;
 //   5. every other text node in the tree, joined, consists only of the known notice sentences.
 // Matches by role + text, never by Google's generated class names.
-export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Element | null {
+export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Element | boolean | null {
   // Serialization contract (see shared/leave-click.ts): esbuild-family compilers wrap nested function
   // expressions in a `__name` helper that does not exist in the page. Define it before any nested function.
   // The identity is an anonymous argument on purpose: a named binding would itself be wrapped in `__name`.
@@ -128,7 +135,17 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
     return visibleText(el);
   };
 
-  const dialogs = Array.from(document.querySelectorAll(dialogSel)).filter(shown);
+  // Candidate dialogs: found recursively through every OPEN shadow root, not just the light DOM, so a notice
+  // hosted in a shadow root is seen by the click check and by the admission guard alike.
+  const candidateSel = args.mode === "block" ? args.blockingDialogSelectors.join(",") : dialogSel;
+  const dialogs: Element[] = [];
+  const roots: ParentNode[] = [document];
+  for (let r = 0; r < roots.length; r++) {
+    for (const el of Array.from(roots[r].querySelectorAll("*"))) {
+      if (el.matches(candidateSel) && shown(el)) dialogs.push(el);
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+    }
+  }
   for (const dialog of dialogs) {
     // 1. the dialog itself: not hidden from the accessibility tree, not nested in another dialog.
     let blocked = false;
@@ -136,7 +153,7 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
       if (p.getAttribute("aria-hidden") === "true" || p.hasAttribute("inert")) blocked = true;
       if (p !== dialog && p.matches(nestedDialogSel)) blocked = true;
     }
-    if (blocked) continue;
+    if (blocked && args.mode === "click") continue;
 
     // 2./3. walk the whole tree (open shadow roots included): collect controls and stray text, flag unknowns.
     const controls: Element[] = [];
@@ -157,6 +174,12 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
       }
       const kids = Array.from(node.childNodes);
       for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+    if (args.mode === "block") {
+      // Admission guard: any visible dialog that says capture is on blocks, whatever else it contains.
+      const allText = normalize(strayText.map((t) => t.textContent || "").join(" "));
+      if (args.blockingTexts.some((t) => allText.includes(t))) return true;
+      continue;
     }
     if (unknown || controls.length !== 2) continue;
     if (!controls.every((c) => c.matches(buttonSel) && shown(c))) continue;
@@ -181,10 +204,12 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
 
     return controls[labels.indexOf(args.continueLabel)];
   }
-  return null;
+  return args.mode === "block" ? false : null;
 }
 
-const scanArgs: GeminiNoticeScanArgs = {
+const scanArgs: Omit<GeminiNoticeScanArgs, "mode"> = {
+  blockingDialogSelectors: googleGeminiNoticeBlockingDialogSelectors,
+  blockingTexts: googleGeminiNoticeBlockingTexts,
   dialogSelectors: googleGeminiNoticeDialogSelectors,
   controlSelectors: googleGeminiNoticeControlSelectors,
   buttonSelectors: googleGeminiNoticeButtonSelectors,
@@ -197,7 +222,7 @@ const scanArgs: GeminiNoticeScanArgs = {
 /** Handle to the notice's "Join now" button, or null. The caller owns (and must dispose) the handle. */
 async function findContinueHandle(page: Page): Promise<ElementHandle<Element> | null> {
   try {
-    const handle = await page.evaluateHandle(findGeminiNoticeContinueButton, scanArgs);
+    const handle = await page.evaluateHandle(findGeminiNoticeContinueButton, { ...scanArgs, mode: "click" as const });
     const element = handle.asElement();
     if (!element) {
       await handle.dispose();
@@ -207,6 +232,20 @@ async function findContinueHandle(page: Page): Promise<ElementHandle<Element> | 
   } catch {
     // A page that cannot be evaluated (navigating, closed) is not evidence of a notice.
     return null;
+  }
+}
+
+/**
+ * True when ANY visible dialog anywhere in the tree (open shadow roots included) says the call is being
+ * recorded / transcribed / note-taken. Admission is declared only when this is false: a notice that is not
+ * exactly the clickable one (extra control, alertdialog, shadow-hosted variant) still means the guest may be
+ * held outside the call, and must never read as admitted.
+ */
+export async function hasBlockingNoticeDialog(page: Page): Promise<boolean> {
+  try {
+    return (await page.evaluate(findGeminiNoticeContinueButton, { ...scanArgs, mode: "block" as const })) === true;
+  } catch {
+    return false;
   }
 }
 

@@ -12,8 +12,8 @@ import {
 // AdmissionError + AdmissionOutcome moved to ../shared/admission so every platform (jitsi/zoom/
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { AdmissionError } from "../shared/admission";
-import { detectGeminiNotice, handleGeminiNotice } from "./gemini-notice";
-export { detectGeminiNotice, handleGeminiNotice };
+import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog } from "./gemini-notice";
+export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog };
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -226,7 +226,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   // "Join now" is pressed, even though the call chrome and the host's tile are already rendered behind it.
   // Reporting admitted here would be the #429 "active, nobody in the call" failure. The wait loops press
   // "Join now" (handleGeminiNotice); until the dialog is gone this stays false.
-  if ((await detectGeminiNotice(page)).present) {
+  if ((await detectGeminiNotice(page)).present || (await hasBlockingNoticeDialog(page))) {
     log(`⚠️ Gemini notice dialog visible — suppressing admission (guest is held outside the call until it is dismissed)`);
     return false;
   }
@@ -358,7 +358,7 @@ async function escalateUnresolvedExit(page: Page, botConfig: BotConfig): Promise
   const lobbyVisible = await attempt(() => checkForWaitingRoomIndicators(page), false);
   let reason: string;
   if (await attempt(() => hasConsentPrompt(page), false)) reason = "consent_required";
-  else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present) reason = "gemini_notice";
+  else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present || (await attempt(() => hasBlockingNoticeDialog(page), false))) reason = "gemini_notice";
   else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
   try {
     await triggerEscalation(botConfig, reason);

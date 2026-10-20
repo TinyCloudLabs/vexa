@@ -64,18 +64,34 @@ function mount(html: string, dismissOnJoin = true): Dom {
   return { dom, doc: dom.window.document, clicks: [], dismissOnJoin };
 }
 
+/** Every document/open-shadow-root under the page, so fixtures can live in either. */
+function allRoots(d: Dom): ParentNode[] {
+  const roots: ParentNode[] = [d.doc];
+  for (let i = 0; i < roots.length; i++) {
+    for (const el of Array.from(roots[i].querySelectorAll('*'))) if (el.shadowRoot) roots.push(el.shadowRoot);
+  }
+  return roots;
+}
+
 /** Record every click on a dialog button; "Join now" also dismisses the dialog, as Meet does. */
 function wireDialogButtons(d: Dom): void {
-  for (const button of Array.from(d.doc.querySelectorAll('[role="dialog"] button, [role="alertdialog"] button'))) {
-    button.addEventListener('click', () => {
-      const label = (button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      d.clicks.push(label);
-      if (label === 'join now' && d.dismissOnJoin) {
-        let root: Element = button;
-        while (root.parentElement && root.parentElement !== d.doc.body) root = root.parentElement;
-        root.remove();
-      }
-    });
+  for (const root of allRoots(d)) {
+    for (const button of Array.from(root.querySelectorAll('[role="dialog"] button, [role="alertdialog"] button'))) {
+      button.addEventListener('click', () => {
+        const label = (button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        d.clicks.push(label);
+        if (label === 'join now' && d.dismissOnJoin) {
+          // Climb to the top-level element under <body>, crossing shadow boundaries via the host.
+          let top: Element = button;
+          for (;;) {
+            const parent: Element | null = top.parentElement ?? ((top.getRootNode() as ShadowRoot).host ?? null);
+            if (!parent || parent === d.doc.body) break;
+            top = parent;
+          }
+          top.remove();
+        }
+      });
+    }
   }
 }
 
@@ -224,7 +240,10 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     dom.window.Element.prototype.getBoundingClientRect = () =>
       ({ width: 120, height: 40, top: 0, left: 0, right: 120, bottom: 40, x: 0, y: 0, toJSON() {} }) as DOMRect;
     const args = {
+      mode: 'click',
       dialogSelectors: selectors.googleGeminiNoticeDialogSelectors,
+      blockingDialogSelectors: selectors.googleGeminiNoticeBlockingDialogSelectors,
+      blockingTexts: selectors.googleGeminiNoticeBlockingTexts,
       controlSelectors: selectors.googleGeminiNoticeControlSelectors,
       buttonSelectors: selectors.googleGeminiNoticeButtonSelectors,
       sentences: selectors.googleGeminiNoticeSentences,
@@ -321,6 +340,63 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     const outside = mount(callWith(`<div id="host"></div>${NOTICE_HTML}`)); wireDialogButtons(outside);
     shadowShare(outside, 'open', '<button>Share</button>');
     check('open shadow root outside the dialog does not disqualify the real notice', (await detectGeminiNotice(domPage(outside))).present, true);
+  }
+
+  console.log('\n=== a notice hosted in an open shadow root: found, clicked, and never reported admitted before dismissal ===');
+  {
+    const inShadow = (html: string) => {
+      const d = mount(callWith('<div id="host"></div>'));
+      (d.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = html;
+      wireDialogButtons(d);
+      return d;
+    };
+    check('shadow-hosted recording notice → detected', (await detectGeminiNotice(domPage(inShadow(RECORDING_HTML)))).present, true);
+    check('shadow-hosted recording notice + real tile → NOT admitted before dismissal',
+      await checkForGoogleAdmissionIndicators(domPage(inShadow(RECORDING_HTML))), false);
+    const d = inShadow(RECORDING_HTML);
+    check('shadow-hosted recording notice → handleGeminiNotice presses Join now', await handleGeminiNotice(domPage(d), BOT), 'clicked');
+    check('shadow-hosted recording notice → pressed once, never Leave', d.clicks.join(','), 'join now');
+    check('shadow-hosted recording notice → admitted AFTER dismissal', await checkForGoogleAdmissionIndicators(domPage(d)), true);
+    const w = inShadow(RECORDING_HTML);
+    const run = await runWait(w);
+    check('shadow-hosted recording notice → wait resolves admitted only after the click', run.result === true && w.clicks.join(',') === 'join now', true);
+    const g = inShadow(NOTICE_HTML);
+    check('shadow-hosted Gemini notice + real tile → NOT admitted before dismissal',
+      await checkForGoogleAdmissionIndicators(domPage(g)), false);
+  }
+
+  console.log('\n=== blocking guard: a capture notice that is NOT the clickable one still blocks admission and escalates ===');
+  const blockers: [string, (() => Dom)][] = [
+    ['notice + extra checkbox (light DOM)', () => withDialog(`<div role="dialog"><h2>${REC}</h2><label><input type="checkbox"> Share transcript</label><button>Leave</button><button>Join now</button></div>`)],
+    ['notice as role=alertdialog', () => withDialog(`<div role="alertdialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div>`)],
+    ['notice as <dialog open>', () => withDialog(`<dialog open><h2>${REC}</h2><button>Leave</button><button>Join now</button></dialog>`)],
+    ['shadow-hosted notice with an extra Share button', () => {
+      const d = mount(callWith('<div id="host"></div>'));
+      (d.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = `<div role="dialog"><h2>${REC}</h2><button>Share</button><button>Leave</button><button>Join now</button></div>`;
+      wireDialogButtons(d);
+      return d;
+    }],
+    ['"Gemini is taking notes" dialog with other buttons', () => withDialog('<div role="dialog"><h2>Gemini is taking notes.</h2><button>Stop</button></div>')],
+  ];
+  for (const [name, build] of blockers) {
+    check(`${name} → NOT admitted`, await checkForGoogleAdmissionIndicators(domPage(build())), false);
+    const d = build();
+    const run = await runWait(d, undefined, 1_000);
+    check(`${name} → wait never resolves admitted`, run.result === true, false);
+    check(`${name} → no click beyond the approved notice`, d.clicks.filter((c) => c !== 'join now').length, 0);
+  }
+  {
+    const d = withDialog(`<div role="alertdialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div>`);
+    const run = await runWait(d, undefined, 1_000);
+    check('alertdialog notice → zero clicks and escalated gemini_notice', d.clicks.length === 0 && run.helpReasons.join(',') === 'gemini_notice', true);
+  }
+  {
+    const pill = `<div role="status">Gemini is taking notes</div>`;
+    check('persistent in-call "Gemini is taking notes" pill (not a dialog) + real tile → still admitted',
+      await checkForGoogleAdmissionIndicators(domPage(mount(callWith(pill)))), true);
+    const toast = mount(callWith('<div id="host"></div>'));
+    (toast.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = '<div role="dialog"><h2>Microphone not found</h2><button>Close</button></div>';
+    check('unrelated shadow-hosted dialog + real tile → still admitted', await checkForGoogleAdmissionIndicators(domPage(toast)), true);
   }
 
   console.log('\n=== positive control: a non-focusable (tabindex=-1) wrapper does not disqualify the real notice ===');

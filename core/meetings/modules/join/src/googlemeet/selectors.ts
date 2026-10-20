@@ -104,6 +104,20 @@ export const googleConsentPromptIndicators: string[] = [
 export const googleGeminiNoticeDialogSelectors: string[] = [
   '[role="dialog"]',
 ];
+// Wider net for the ADMISSION guard only (never for clicking): any dialog-like container, including
+// alertdialog and <dialog>, whose text names recording / transcription / notes blocks an "admitted" verdict,
+// whether or not it is exactly the notice the bot may click.
+export const googleGeminiNoticeBlockingDialogSelectors: string[] = [
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+  'dialog',
+];
+// Lower-cased substrings of dialog text that say capture is on (see the guard above).
+export const googleGeminiNoticeBlockingTexts: string[] = [
+  'is being recorded',
+  'is being transcribed',
+  'taking notes',
+];
 // Every focusable or interactive element: the notice must contain EXACTLY two of these, and both must be
 // real buttons (googleGeminiNoticeButtonSelectors). An extra link, checkbox, switch, input, combobox,
 // focusable div (`tabindex` >= 0), contenteditable region or any other control means "not the notice".
@@ -558,6 +572,7 @@ export const browserContextSelectorArrays: string[] = [
   'googleLeaveButtonMatchers',
   'googleLobbyIconGlyphSelectors',
   'googleGeminiNoticeDialogSelectors',
+  'googleGeminiNoticeBlockingDialogSelectors',
   'googleGeminiNoticeControlSelectors',
   'googleGeminiNoticeButtonSelectors',
 ];

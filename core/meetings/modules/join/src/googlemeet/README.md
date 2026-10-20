@@ -24,6 +24,9 @@ aria-label, then text) == exactly "Leave" / "Join now"; (4) all other text is on
 call is being recorded", "...transcribed", "Gemini is taking notes"). "Join now" is pressed at most 3 times, then the
 bot escalates (`gemini_notice`). Anything else (an extra element, a name that differs from the text, the
 `take notes for me` consent prompt) is not the notice and is never clicked.
+Dialogs are found recursively through open shadow roots. Admission is declared only when no dialog anywhere in
+that tree says the call is being recorded / transcribed / note-taken (clickable or not: an `alertdialog`, a
+`<dialog>`, a notice with an extra control still blocks `admitted` and escalates instead).
 Every unresolved exit of the admission wait escalates to `needs_human_help` with a reason, independent of loop
 timing and of failing diagnostics (a failing screenshot cannot skip it), so a stall is never silent.
 Each attempt emits the JSON event `join.gemini_notice_handled` (`success`, `attempt`), which survives the bot's
