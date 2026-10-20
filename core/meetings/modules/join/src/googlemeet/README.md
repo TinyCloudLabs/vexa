@@ -27,6 +27,14 @@ bot escalates (`gemini_notice`). Anything else (an extra element, a name that di
 Dialogs are found recursively through open shadow roots. Admission is declared only when no dialog anywhere in
 that tree says the call is being recorded / transcribed / note-taken (clickable or not: an `alertdialog`, a
 `<dialog>`, a notice with an extra control still blocks `admitted` and escalates instead).
+Fail-safe for notices we cannot read (reworded, localized, new): once the bot is in the call, ANY modal dialog
+(`aria-modal="true"`, an open `<dialog>`, or a dialog covering the middle of the viewport; open shadow roots
+included) blocks `admitted` unless it is the exact known notice above, which is clicked and then disappears. An
+unknown modal is never clicked; the bot escalates once (`unknown_blocking_dialog`, event
+`join.unknown_blocking_dialog`). Non-modal toasts and pills (e.g. "Microphone not found", the "Gemini is taking
+notes" pill) do not block. The click itself is exactly the known English copy: the bot's UI is pinned to English
+(`--lang`, `--accept-lang`, `?hl=en`, context locale; see `browser-args.ts`) and the lobby asserts it, emitting
+`join.ui_locale_not_english` if Meet did not render English.
 Every unresolved exit of the admission wait escalates to `needs_human_help` with a reason, independent of loop
 timing and of failing diagnostics (a failing screenshot cannot skip it), so a stall is never silent.
 Each attempt emits the JSON event `join.gemini_notice_handled` (`success`, `attempt`), which survives the bot's

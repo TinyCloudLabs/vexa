@@ -12,8 +12,8 @@ import {
 // AdmissionError + AdmissionOutcome moved to ../shared/admission so every platform (jitsi/zoom/
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { AdmissionError } from "../shared/admission";
-import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog } from "./gemini-notice";
-export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog };
+import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog } from "./gemini-notice";
+export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog };
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -226,7 +226,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   // "Join now" is pressed, even though the call chrome and the host's tile are already rendered behind it.
   // Reporting admitted here would be the #429 "active, nobody in the call" failure. The wait loops press
   // "Join now" (handleGeminiNotice); until the dialog is gone this stays false.
-  if ((await detectGeminiNotice(page)).present || (await hasBlockingNoticeDialog(page))) {
+  if ((await detectGeminiNotice(page)).present || (await hasBlockingNoticeDialog(page)) || (await hasModalDialog(page))) {
     log(`⚠️ Gemini notice dialog visible — suppressing admission (guest is held outside the call until it is dismissed)`);
     return false;
   }
@@ -359,6 +359,7 @@ async function escalateUnresolvedExit(page: Page, botConfig: BotConfig): Promise
   let reason: string;
   if (await attempt(() => hasConsentPrompt(page), false)) reason = "consent_required";
   else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present || (await attempt(() => hasBlockingNoticeDialog(page), false))) reason = "gemini_notice";
+  else if (await attempt(() => hasModalDialog(page), false)) reason = "unknown_blocking_dialog";
   else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
   try {
     await triggerEscalation(botConfig, reason);
@@ -375,8 +376,20 @@ async function handleNoticeIfInCall(page: Page, botConfig: BotConfig): Promise<v
   if (await checkForWaitingRoomIndicators(page)) return;
   const inCall = (await countRealParticipantTiles(page)) > 0 || (await page.locator("[data-self-name]").count()) > 0;
   if (!inCall) return;
-  await handleGeminiNotice(page, botConfig);
+  if ((await detectGeminiNotice(page)).present) {
+    await handleGeminiNotice(page, botConfig);
+    return;
+  }
+  // FAIL-SAFE: a modal dialog that is not the exact known notice (reworded, localized, new) is never clicked.
+  // Admission stays false (checkForGoogleAdmissionIndicators) and a human is summoned once. A pre-admission
+  // consent prompt keeps its own consent_required handling.
+  if (!(await hasConsentPrompt(page)) && (await hasModalDialog(page)) && !unknownModalReported.has(page)) {
+    unknownModalReported.add(page);
+    logJSON({ level: "warn", event: "join.unknown_blocking_dialog", platform: "google_meet" });
+    await triggerEscalation(botConfig, "unknown_blocking_dialog");
+  }
 }
+const unknownModalReported = new WeakSet<object>();
 
 // Terminal admission verdicts carry an honest reason: a host denial says so, and an
 // unsolved captcha says THAT — both map to AdmissionError("denial") (PERMANENT, no

@@ -197,7 +197,8 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
       catch (e) { return e instanceof AdmissionError ? `AdmissionError:${e.outcome}` : `Error:${(e as Error).message}`; }
     });
     const handled = lines.filter((l) => l.event === 'join.gemini_notice_handled');
-    return { result, handled, helpReasons };
+    const unknownDialogEvents = lines.filter((l) => l.event === 'join.unknown_blocking_dialog').length;
+    return { result, handled, helpReasons, unknownDialogEvents };
   } finally {
     Date.now = realNow;
     resetEscalation();
@@ -243,6 +244,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
       mode: 'click',
       dialogSelectors: selectors.googleGeminiNoticeDialogSelectors,
       blockingDialogSelectors: selectors.googleGeminiNoticeBlockingDialogSelectors,
+      modalSelectors: selectors.googleGeminiNoticeModalSelectors,
       blockingTexts: selectors.googleGeminiNoticeBlockingTexts,
       controlSelectors: selectors.googleGeminiNoticeControlSelectors,
       buttonSelectors: selectors.googleGeminiNoticeButtonSelectors,
@@ -397,6 +399,54 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     const toast = mount(callWith('<div id="host"></div>'));
     (toast.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = '<div role="dialog"><h2>Microphone not found</h2><button>Close</button></div>';
     check('unrelated shadow-hosted dialog + real tile → still admitted', await checkForGoogleAdmissionIndicators(domPage(toast)), true);
+  }
+
+  console.log('\n=== fail-safe: ANY unknown modal blocks admission, is never clicked, and escalates (review round 5) ===');
+  // The real tile is rendered behind each of these (the false-admitted shape). None of them is the exact known
+  // English notice, so none may be clicked; each must keep admission false and summon a human.
+  const modalCases: [string, string, ((d: Dom) => void) | undefined][] = [
+    ['reworded notice ("This video call is recorded", aria-modal)', '<div role="dialog" aria-modal="true"><h2>This video call is recorded</h2><button>Leave</button><button>Join now</button></div>', undefined],
+    ['reworded notice ("This meeting is being recorded")', '<div role="dialog" aria-modal="true"><h2>This meeting is being recorded</h2><button>Leave</button><button>Join now</button></div>', undefined],
+    ['non-English notice (Finnish)', '<div role="dialog" aria-modal="true"><h2>Tämä videopuhelu tallennetaan</h2><button>Poistu</button><button>Liity nyt</button></div>', undefined],
+    ['non-English notice (German)', '<div role="dialog" aria-modal="true"><h2>Dieser Videoanruf wird aufgezeichnet</h2><button>Verlassen</button><button>Jetzt teilnehmen</button></div>', undefined],
+    ['unknown modal with an OK button', '<div role="dialog" aria-modal="true"><h2>Something unexpected</h2><button>OK</button></div>', undefined],
+    ['unknown alertdialog modal', '<div role="alertdialog" aria-modal="true"><h2>Something unexpected</h2><button>OK</button></div>', undefined],
+    ['open <dialog> with unknown copy', '<dialog open><h2>Something unexpected</h2><button>OK</button></dialog>', undefined],
+    ['shadow-hosted unknown modal', '<div id="host"></div>', (d) => { (d.doc.getElementById('host') as Element).attachShadow({ mode: 'open' }).innerHTML = '<div role="dialog" aria-modal="true"><h2>Something unexpected</h2><button>OK</button></div>'; }],
+    ['role=dialog WITHOUT aria-modal that covers the middle of the viewport', '<div role="dialog" id="cover"><h2>Something unexpected</h2><button>OK</button></div>', (d) => {
+      const cover = d.doc.getElementById('cover') as Element;
+      (d.doc as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => cover.querySelector('h2') as Element;
+    }],
+  ];
+  for (const [name, html, mutate] of modalCases) {
+    const mk = () => { const d = mount(callWith(html)); mutate?.(d); wireDialogButtons(d); return d; };
+    check(`${name} → NOT admitted`, await checkForGoogleAdmissionIndicators(domPage(mk())), false);
+    const d = mk();
+    const run = await runWait(d);
+    check(`${name} → wait never resolves admitted`, run.result === true, false);
+    check(`${name} → never clicked`, d.clicks.length, 0);
+    check(`${name} → escalated once as unknown_blocking_dialog`, run.helpReasons.join(','), 'unknown_blocking_dialog');
+    check(`${name} → emits join.unknown_blocking_dialog event once`, run.unknownDialogEvents, 1);
+  }
+  console.log('\n  -- non-modal toasts and pills must NOT block (controls) --');
+  {
+    const toast = '<div role="dialog"><h2>Microphone not found</h2><button>Close</button></div>';
+    const tc = mount(callWith(toast));
+    check('non-modal role=dialog toast (not covering the middle) + real tile → still admitted',
+      await checkForGoogleAdmissionIndicators(domPage(tc)), true);
+    check('closed <dialog> (not open) + real tile → still admitted',
+      await checkForGoogleAdmissionIndicators(domPage(mount(callWith('<dialog><h2>Hidden</h2><button>OK</button></dialog>')))), true);
+    check('Gemini pill (role=status) + real tile → still admitted',
+      await checkForGoogleAdmissionIndicators(domPage(mount(callWith('<div role="status">Gemini is taking notes</div>')))), true);
+    const run = await runWait(mount(callWith(toast)));
+    check('non-modal toast → wait resolves admitted, no escalation', run.result === true && run.helpReasons.length === 0, true);
+  }
+  {
+    // The exact known notice is modal too, but it is the one we click, and it disappears: admitted afterwards.
+    const d = withDialog(RECORDING_HTML);
+    const run = await runWait(d);
+    check('known recording notice (aria-modal) → clicked once, then admitted, no unknown_blocking_dialog',
+      run.result === true && d.clicks.join(',') === 'join now' && run.helpReasons.length === 0 && run.unknownDialogEvents === 0, true);
   }
 
   console.log('\n=== positive control: a non-focusable (tabindex=-1) wrapper does not disqualify the real notice ===');

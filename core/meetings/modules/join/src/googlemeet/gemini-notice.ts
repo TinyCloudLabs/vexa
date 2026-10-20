@@ -5,6 +5,7 @@ import { triggerEscalation } from "../shared/escalation";
 import {
   googleGeminiNoticeDialogSelectors,
   googleGeminiNoticeBlockingDialogSelectors,
+  googleGeminiNoticeModalSelectors,
   googleGeminiNoticeBlockingTexts,
   googleGeminiNoticeControlSelectors,
   googleGeminiNoticeButtonSelectors,
@@ -43,10 +44,13 @@ const SETTLE_AFTER_CLICK_MS = 1000;
 
 export interface GeminiNoticeScanArgs {
   /** "click": return the Join now button of exactly the notice (or null). "block": return true when ANY dialog
-   *  in the tree (open shadow roots included) says capture is on, clickable or not. Same walk for both. */
-  mode: "click" | "block";
+   *  in the tree (open shadow roots included) says capture is on, clickable or not. "modal": return true when ANY
+   *  modal dialog is present (aria-modal, open <dialog>, or a dialog covering the middle of the viewport), whatever
+   *  it says — the fail-safe for notices we cannot read. Same walk for all three. */
+  mode: "click" | "block" | "modal";
   dialogSelectors: string[];
   blockingDialogSelectors: string[];
+  modalSelectors: string[];
   blockingTexts: string[];
   controlSelectors: string[];
   buttonSelectors: string[];
@@ -137,7 +141,10 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
 
   // Candidate dialogs: found recursively through every OPEN shadow root, not just the light DOM, so a notice
   // hosted in a shadow root is seen by the click check and by the admission guard alike.
-  const candidateSel = args.mode === "block" ? args.blockingDialogSelectors.join(",") : dialogSel;
+  const modalSel = args.modalSelectors.join(",");
+  const candidateSel = args.mode === "block" ? args.blockingDialogSelectors.join(",")
+    : args.mode === "modal" ? args.blockingDialogSelectors.concat(args.modalSelectors).join(",")
+      : dialogSel;
   const dialogs: Element[] = [];
   const roots: ParentNode[] = [document];
   for (let r = 0; r < roots.length; r++) {
@@ -145,6 +152,18 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
       if (el.matches(candidateSel) && shown(el)) dialogs.push(el);
       if (el.shadowRoot) roots.push(el.shadowRoot);
     }
+  }
+  if (args.mode === "modal") {
+    // A candidate is modal if it says so, or if it covers the middle of the viewport (the call UI is covered).
+    const cx = Math.floor((window.innerWidth || 0) / 2);
+    const cy = Math.floor((window.innerHeight || 0) / 2);
+    let hit: Element | null = null;
+    try { hit = document.elementFromPoint(cx, cy); } catch { hit = null; }
+    for (const dialog of dialogs) {
+      if (dialog.matches(modalSel)) return true;
+      for (let p: Element | null = hit; p; p = parentOf(p)) if (p === dialog) return true;
+    }
+    return false;
   }
   for (const dialog of dialogs) {
     // 1. the dialog itself: not hidden from the accessibility tree, not nested in another dialog.
@@ -209,6 +228,7 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
 
 const scanArgs: Omit<GeminiNoticeScanArgs, "mode"> = {
   blockingDialogSelectors: googleGeminiNoticeBlockingDialogSelectors,
+  modalSelectors: googleGeminiNoticeModalSelectors,
   blockingTexts: googleGeminiNoticeBlockingTexts,
   dialogSelectors: googleGeminiNoticeDialogSelectors,
   controlSelectors: googleGeminiNoticeControlSelectors,
@@ -244,6 +264,20 @@ async function findContinueHandle(page: Page): Promise<ElementHandle<Element> | 
 export async function hasBlockingNoticeDialog(page: Page): Promise<boolean> {
   try {
     return (await page.evaluate(findGeminiNoticeContinueButton, { ...scanArgs, mode: "block" as const })) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when ANY modal dialog is on screen (aria-modal, open <dialog>, or a dialog covering the middle of the
+ * viewport), open shadow roots included, whatever it says. Admission is declared only when this is false:
+ * an unreadable notice (reworded, localized, new) behind which the tile is already rendered must never read as
+ * admitted. Non-modal toasts and pills do not count.
+ */
+export async function hasModalDialog(page: Page): Promise<boolean> {
+  try {
+    return (await page.evaluate(findGeminiNoticeContinueButton, { ...scanArgs, mode: "modal" as const })) === true;
   } catch {
     return false;
   }

@@ -112,6 +112,14 @@ export const googleGeminiNoticeBlockingDialogSelectors: string[] = [
   '[role="alertdialog"]',
   'dialog',
 ];
+// FAIL-SAFE for notices we cannot read (reworded, localized, new): any MODAL dialog on the page blocks an
+// "admitted" verdict unless it is exactly the known notice we click and which then disappears. A dialog is
+// modal when it is `aria-modal="true"`, an open <dialog>, or a role=dialog/alertdialog that covers the middle
+// of the viewport (it makes the call UI covered). Non-modal toasts and pills do not block.
+export const googleGeminiNoticeModalSelectors: string[] = [
+  '[aria-modal="true"]',
+  'dialog[open]',
+];
 // Lower-cased substrings of dialog text that say capture is on (see the guard above).
 export const googleGeminiNoticeBlockingTexts: string[] = [
   'is being recorded',
@@ -573,6 +581,7 @@ export const browserContextSelectorArrays: string[] = [
   'googleLobbyIconGlyphSelectors',
   'googleGeminiNoticeDialogSelectors',
   'googleGeminiNoticeBlockingDialogSelectors',
+  'googleGeminiNoticeModalSelectors',
   'googleGeminiNoticeControlSelectors',
   'googleGeminiNoticeButtonSelectors',
 ];
