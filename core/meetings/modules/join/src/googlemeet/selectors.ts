@@ -83,6 +83,38 @@ export const googleConsentPromptIndicators: string[] = [
   '[role="alertdialog"]:has-text("taking notes")',
 ];
 
+// ── Gemini / transcription / recording NOTICE (TC-1606) ─────────────────────────────────────────────
+// OBSERVED live (anonymous guest, host admits into a meeting with Gemini notes, transcription or
+// recording on): ~4 s after admission Meet shows the guest a modal `role=dialog` — "This video call is
+// being transcribed. Gemini is taking notes." or "This video call is being recorded" — with exactly two
+// buttons, [Leave] [Join now], and the guest is NOT in the call until "Join now" is pressed.
+// That is a different state from the pre-admission "take notes for me" consent prompt above: the host
+// already turned capture on and the dialog only announces it. It is recognised by SHAPE, not classes:
+// a visible dialog whose text is about the call being recorded / transcribed / note-taken AND whose
+// visible buttons are exactly {Leave, Join now}. Anything else (extra buttons, no "Join now") is NOT
+// the notice and keeps its previous handling; the bot never clicks it.
+// Exception to "never auto-click consent" (Sam, 2026-10-20, card tc1606-join-now-click): see
+// gemini-notice.ts and README.md in this directory.
+// BROWSER CONTEXT: consumed inside page.evaluate (see gemini-notice.ts) via document.querySelector —
+// declared in browserContextSelectorArrays below so the validity gate CSS-parses the selector arrays.
+export const googleGeminiNoticeDialogSelectors: string[] = [
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+];
+export const googleGeminiNoticeButtonSelectors: string[] = [
+  'button',
+  '[role="button"]',
+];
+// Lower-cased substrings of the dialog text.
+export const googleGeminiNoticeTexts: string[] = [
+  'is being transcribed',
+  'taking notes',
+  'is being recorded',
+];
+// Lower-cased, whitespace-normalized button labels. The dialog must offer EXACTLY these two buttons.
+export const googleGeminiNoticeLeaveLabel = 'leave';
+export const googleGeminiNoticeContinueLabel = 'join now';
+
 export const googleRejectionIndicators: string[] = [
   // Waiting-room denial patterns. Google Meet can leave some lobby text in
   // the DOM after a host rejects the bot, so these must be checked before
@@ -484,5 +516,7 @@ export const googlePeopleButtonSelectors: string[] = [
 export const browserContextSelectorArrays: string[] = [
   'googleLeaveButtonMatchers',
   'googleLobbyIconGlyphSelectors',
+  'googleGeminiNoticeDialogSelectors',
+  'googleGeminiNoticeButtonSelectors',
 ];
 

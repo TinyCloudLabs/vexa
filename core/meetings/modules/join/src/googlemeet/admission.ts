@@ -12,6 +12,8 @@ import {
 // AdmissionError + AdmissionOutcome moved to ../shared/admission so every platform (jitsi/zoom/
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { AdmissionError } from "../shared/admission";
+import { detectGeminiNotice, handleGeminiNotice } from "./gemini-notice";
+export { detectGeminiNotice, handleGeminiNotice };
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -218,6 +220,17 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
     return false;
   }
 
+  // 1c. NEGATIVE GUARD: the post-admission Gemini / transcription / recording NOTICE (TC-1606). Observed
+  // live: Meet shows an admitted anonymous guest a modal ("This video call is being transcribed. Gemini is
+  // taking notes." / "...is being recorded", [Leave] [Join now]) and the guest is NOT in the call until
+  // "Join now" is pressed, even though the call chrome and the host's tile are already rendered behind it.
+  // Reporting admitted here would be the #429 "active, nobody in the call" failure. The wait loops press
+  // "Join now" (handleGeminiNotice); until the dialog is gone this stays false.
+  if ((await detectGeminiNotice(page)).present) {
+    log(`⚠️ Gemini notice dialog visible — suppressing admission (guest is held outside the call until it is dismissed)`);
+    return false;
+  }
+
   // Wake the UI before probing. Google Meet auto-hides the in-call toolbar
   // (mic/camera/present/leave) after a few seconds of no pointer activity — and the
   // bot never moves a real mouse. Once admitted (especially when a participant is
@@ -305,8 +318,16 @@ export async function checkForWaitingRoomIndicators(page: Page): Promise<boolean
 // (Vexa-ai/vexa#429). Mirrors checkForWaitingRoomIndicators: a pre-admission
 // state that suppresses the "admitted" signal. Consent must be a human decision,
 // so callers escalate to needs_human_help rather than auto-clicking it.
+// The ONE sanctioned exception is the post-admission notice handled by handleGeminiNotice
+// (gemini-notice.ts, README.md): it is not this prompt, and this prompt is never clicked.
 export async function hasConsentPrompt(page: Page): Promise<boolean> {
+  // The post-admission notice is a dialog that says "Gemini is taking notes." — the dialog-scoped
+  // "taking notes" selectors would read it as pending consent. It is not (see detectGeminiNotice), so
+  // those two selectors are skipped while the notice is what is on screen. Everything else, including a
+  // "taking notes" dialog that is NOT exactly the notice shape, still holds as consent and is never clicked.
+  const noticeOnScreen = (await detectGeminiNotice(page)).present;
   for (const selector of googleConsentPromptIndicators) {
+    if (noticeOnScreen && NOTICE_SCOPED_CONSENT_SELECTORS[selector]) continue;
     try {
       const element = await page.locator(selector).first();
       if (await element.isVisible()) {
@@ -318,6 +339,14 @@ export async function hasConsentPrompt(page: Page): Promise<boolean> {
   }
   return false;
 }
+
+const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
+  '[role="dialog"]:has-text("taking notes")': true,
+  '[role="alertdialog"]:has-text("taking notes")': true,
+};
+
+// The post-admission notice is handled (clicked) by handleGeminiNotice, called at the top of every
+// admission poll below. Exception policy and its scope: gemini-notice.ts.
 
 // Terminal admission verdicts carry an honest reason: a host denial says so, and an
 // unsolved captcha says THAT — both map to AdmissionError("denial") (PERMANENT, no
@@ -354,6 +383,7 @@ export async function waitForGoogleMeetingAdmission(
     
     // Check for any visible admission indicator (multiple selectors for robustness)
     // If meeting controls are visible, the bot is admitted — lobby indicators are unreliable
+    await handleGeminiNotice(page, botConfig);
     const initialAdmissionFound = await checkForGoogleAdmissionIndicators(page);
 
     if (initialAdmissionFound) {
@@ -377,7 +407,8 @@ export async function waitForGoogleMeetingAdmission(
 
     // Consent gate: if Google's Gemini "take notes" consent prompt is present,
     // the bot is held behind a human decision (accept/decline) — not admitted.
-    // Do NOT auto-click it; consent is the user's choice (Vexa-ai/vexa#429).
+    // Do NOT auto-click it; consent is the user's choice (Vexa-ai/vexa#429). (The only auto-click exception
+    // is the post-admission notice, a different dialog: see gemini-notice.ts.)
     // Summon a human via needs_human_help and keep polling, so admission
     // proceeds once consent is granted (mirrors the reCAPTCHA "stay for human
     // solve" handling).
@@ -422,6 +453,7 @@ export async function waitForGoogleMeetingAdmission(
 
       while (Date.now() - startTime < effectiveTimeout()) {
         botConfig.signal?.throwIfAborted();
+        await handleGeminiNotice(page, botConfig);
         // Host denial can leave stale waiting-room text in the DOM. Check the
         // terminal rejection state before treating the page as still waiting.
         await throwIfGoogleAdmissionRejected(page, "waiting-room polling");
@@ -473,6 +505,7 @@ export async function waitForGoogleMeetingAdmission(
       const effectiveTimeout2 = () => timeout + getEscalationExtensionMs();
       while (Date.now() - startTime < effectiveTimeout2()) {
         botConfig.signal?.throwIfAborted();
+        await handleGeminiNotice(page, botConfig);
         // #444 — the `blocked` state is wired (callBlockedCallback), but NOT emitted yet.
         // hasRecaptchaChallenge() detects a VISIBLE, challenge-sized widget, which is the
         // narrow half of the signal; the blank block page half needs a run that actually
@@ -526,6 +559,7 @@ export async function waitForGoogleMeetingAdmission(
         const startTime2 = Date.now();
         while (Date.now() - startTime2 < timeout) {
           botConfig.signal?.throwIfAborted();
+          await handleGeminiNotice(page, botConfig);
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
           const stillWaiting = await checkForWaitingRoomIndicators(page);
