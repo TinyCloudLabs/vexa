@@ -5,6 +5,7 @@ import { triggerEscalation } from "../shared/escalation";
 import {
   googleGeminiNoticeDialogSelectors,
   googleGeminiNoticeControlSelectors,
+  googleGeminiNoticeButtonSelectors,
   googleGeminiNoticeSentences,
   googleGeminiNoticeCaptureSentenceCount,
   googleGeminiNoticeLeaveLabel,
@@ -28,7 +29,7 @@ import { resolveUiInteractionMode } from "./join";
 //
 // The click is scoped to EXACTLY this shape: a visible `role="dialog"` (never `alertdialog`) whose text, minus
 // the two control labels, consists only of the known notice sentences (recorded / transcribed / "Gemini is
-// taking notes"), containing EXACTLY two interactive controls of any kind, named Leave and Join now. Any other
+// taking notes"), containing EXACTLY two focusable/interactive elements of any kind, both real buttons, named Leave and Join now. Any other
 // dialog — the pre-admission "take notes for me" consent prompt, one with an extra button/link/checkbox/input
 // (e.g. a share or allow control), one without "Join now" — is not the notice and is never clicked.
 // admission.ts additionally calls it only once the bot is in the call (lobby gone, a real tile present).
@@ -41,6 +42,7 @@ const SETTLE_AFTER_CLICK_MS = 1000;
 export interface GeminiNoticeScanArgs {
   dialogSelectors: string[];
   controlSelectors: string[];
+  buttonSelectors: string[];
   sentences: string[];
   captureSentenceCount: number;
   leaveLabel: string;
@@ -64,10 +66,13 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
   };
   const dialogs = Array.from(document.querySelectorAll(args.dialogSelectors.join(","))).filter(isVisible);
   for (const dialog of dialogs) {
-    // EXACTLY two interactive controls, of any kind (hidden ones count: a conservative scope), named
-    // exactly Leave and Join now. A checkbox, link, share/allow control or a third button disqualifies.
+    // EXACTLY two focusable/interactive elements of any kind (hidden ones count: a conservative scope), both
+    // real buttons, named exactly Leave and Join now. A checkbox, link, focusable div, share/allow control or
+    // a third button disqualifies.
     const controls = Array.from(dialog.querySelectorAll(args.controlSelectors.join(",")));
     if (controls.length !== 2) continue;
+    // Both must be real buttons: a link or any other element named "Join now" is never clicked.
+    if (!controls.every((c) => c.matches(args.buttonSelectors.join(",")))) continue;
     const labels = controls.map((c) => normalize(c.textContent || ""));
     if (!labels.includes(args.leaveLabel) || !labels.includes(args.continueLabel)) continue;
     if (!controls.every(isVisible)) continue;
@@ -85,6 +90,7 @@ export function findGeminiNoticeContinueButton(args: GeminiNoticeScanArgs): Elem
 const scanArgs: GeminiNoticeScanArgs = {
   dialogSelectors: googleGeminiNoticeDialogSelectors,
   controlSelectors: googleGeminiNoticeControlSelectors,
+  buttonSelectors: googleGeminiNoticeButtonSelectors,
   sentences: googleGeminiNoticeSentences,
   captureSentenceCount: googleGeminiNoticeCaptureSentenceCount,
   leaveLabel: googleGeminiNoticeLeaveLabel,

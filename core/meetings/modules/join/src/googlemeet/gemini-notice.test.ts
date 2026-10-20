@@ -165,7 +165,7 @@ const BOT = { platform: 'google_meet', botName: 'x', uiInteractionMode: 'synthet
  * run on Date.now(), which advances only when the loop waits — no real sleeping). `onWait(n)` mutates the page
  * on the n-th wait. Returns the verdict plus everything the bot emitted.
  */
-async function runWait(d: Dom, onWait?: (n: number) => void) {
+async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000) {
   resetEscalation();
   const helpReasons: string[] = [];
   setHooks({ onState: (st, detail) => { if (st === 'needs_human_help') helpReasons.push(String(detail?.reason)); } });
@@ -176,7 +176,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
   const page = domPage(d, (ms) => { clock += ms; waits++; onWait?.(waits); });
   try {
     const { result, lines } = await captureLogs(async () => {
-      try { return await waitForGoogleMeetingAdmission(page, 60_000, BOT); }
+      try { return await waitForGoogleMeetingAdmission(page, budgetMs, BOT); }
       catch (e) { return e instanceof AdmissionError ? `AdmissionError:${e.outcome}` : `Error:${(e as Error).message}`; }
     });
     const handled = lines.filter((l) => l.event === 'join.gemini_notice_handled');
@@ -225,6 +225,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     const args = {
       dialogSelectors: selectors.googleGeminiNoticeDialogSelectors,
       controlSelectors: selectors.googleGeminiNoticeControlSelectors,
+      buttonSelectors: selectors.googleGeminiNoticeButtonSelectors,
       sentences: selectors.googleGeminiNoticeSentences,
       captureSentenceCount: selectors.googleGeminiNoticeCaptureSentenceCount,
       leaveLabel: selectors.googleGeminiNoticeLeaveLabel,
@@ -259,6 +260,16 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     ['pre-admission consent that also says "taking notes" with [Leave] [Join now]', '<div role="dialog"><h2>Gemini is taking notes. Take notes for me?</h2><button>Leave</button><button>Join now</button></div>'],
     ['"taking notes" alone ([Leave] [Join now], no recording/transcription sentence)', '<div role="dialog"><h2>Gemini is taking notes.</h2><button>Leave</button><button>Join now</button></div>'],
     ['notice text plus extra prose (a data-sharing sentence)', '<div role="dialog"><h2>This video call is being recorded</h2><p>Your name and email will be shared with the organizer.</p><button>Leave</button><button>Join now</button></div>'],
+    ['"Leave" and "Join now" are anchors, not buttons', '<div role="dialog" aria-modal="true"><h2>This video call is being recorded</h2><a href="/leave">Leave</a><a href="/share">Join now</a></div>'],
+    ['"Join now" is a role=link, "Leave" a button', '<div role="dialog"><h2>This video call is being recorded</h2><button>Leave</button><span role="link" tabindex="0">Join now</span></div>'],
+    ['"Join now" is a plain focusable div (tabindex=0), not a button', '<div role="dialog"><h2>This video call is being recorded</h2><button>Leave</button><div tabindex="0">Join now</div></div>'],
+    ['"Join now" is an input[type=button]', '<div role="dialog"><h2>This video call is being recorded</h2><button>Leave</button><input type="button" value="Join now"></div>'],
+    ['third focusable div (aria-label "Share transcript", tabindex=0)', '<div role="dialog"><h2>This video call is being recorded</h2><div tabindex="0" aria-label="Share transcript"></div><button>Leave</button><button>Join now</button></div>'],
+    ['third element: contenteditable region', '<div role="dialog"><h2>This video call is being recorded</h2><div contenteditable="true"></div><button>Leave</button><button>Join now</button></div>'],
+    ['third element: role=switch', '<div role="dialog"><h2>This video call is being recorded</h2><div role="switch" aria-checked="false"></div><button>Leave</button><button>Join now</button></div>'],
+    ['third element: role=combobox', '<div role="dialog"><h2>This video call is being recorded</h2><div role="combobox"></div><button>Leave</button><button>Join now</button></div>'],
+    ['third element: select', '<div role="dialog"><h2>This video call is being recorded</h2><select><option>Share with everyone</option></select><button>Leave</button><button>Join now</button></div>'],
+    ['third element: <details>/<summary>', '<div role="dialog"><h2>This video call is being recorded</h2><details><summary>More</summary></details><button>Leave</button><button>Join now</button></div>'],
     ['share-data style dialog', '<div role="dialog"><h2>Allow Gemini to share meeting content?</h2><button>Leave</button><button>Allow</button></div>'],
   ];
   for (const [name, html] of negatives) {
@@ -266,6 +277,13 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     check(`${name} → not the notice`, (await detectGeminiNotice(domPage(d))).present, false);
     check(`${name} → handleGeminiNotice clicks nothing`, await handleGeminiNotice(domPage(d), BOT), 'absent');
     check(`${name} → zero clicks`, d.clicks.length, 0);
+  }
+
+  console.log('\n=== positive control: a non-focusable (tabindex=-1) wrapper does not disqualify the real notice ===');
+  {
+    const html = '<div role="dialog" aria-modal="true" tabindex="-1"><div tabindex="-1"><h2>This video call is being recorded</h2></div><button>Leave</button><button role="button">Join now</button></div>';
+    check('tabindex=-1 wrapper + <button> Leave / Join now → still the notice',
+      (await detectGeminiNotice(domPage(withDialog(html)))).present, true);
   }
 
   console.log('\n=== the deliberate pre-admission consent hold is intact ===');
@@ -329,6 +347,39 @@ async function runWait(d: Dom, onWait?: (n: number) => void) {
     check('late lobby, then an unknown blocking dialog → escalates with a reason (not silent)',
       run.helpReasons.length === 1 && run.helpReasons[0].length > 0, true);
     check('late lobby, then an unknown blocking dialog → reason is unknown_blocking_state', run.helpReasons.join(','), 'unknown_blocking_state');
+  }
+
+  console.log('\n=== short budgets: every unresolved exit escalates, whatever the loop timing (review round 2 P2) ===');
+  // Valid budgets shorter than the escalation thresholds (>80% of budget at a 2 s poll boundary, >10 s unknown).
+  // The lobby appears after the first poll, then is replaced by a page that never resolves.
+  for (const budget of [1_000, 2_500, 3_999, 4_000]) {
+    const blockers: [string, string, string][] = [
+      ['unknown dialog', `${TOOLBAR}<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>`, 'unknown_blocking_state'],
+      ['unmatched "taking notes" consent dialog', callWith(negatives[1][1]), 'consent_required'],
+    ];
+    for (const [name, page, expected] of blockers) {
+      // First poll sees no lobby; the lobby shows up after the first 2 s wait; the blocker replaces it after
+      // the second wait (the reviewer's deterministic probe shape).
+      const d = mount('<div></div>');
+      const run = await runWait(d, (n) => {
+        if (n === 1) d.doc.body.innerHTML = LOBBY;
+        if (n === 2) { d.doc.body.innerHTML = page; wireDialogButtons(d); }
+      }, budget);
+      check(`budget ${budget} ms, late lobby → ${name}: not admitted`, run.result === true, false);
+      check(`budget ${budget} ms, late lobby → ${name}: escalated exactly once with a reason`,
+        run.helpReasons.length === 1 && run.helpReasons[0].length > 0 && run.helpReasons[0] !== 'undefined', true);
+      if (budget === 2_500) {
+        check(`budget 2500 ms, late lobby → ${name}: reason ${expected}`, run.helpReasons.join(','), expected);
+      }
+      check(`budget ${budget} ms, late lobby → ${name}: nothing clicked`, d.clicks.length, 0);
+    }
+  }
+  {
+    // Lobby never goes away and the budget is shorter than a poll: the legit lobby timeout also surfaces help.
+    const d = mount(LOBBY);
+    const run = await runWait(d, undefined, 1_000);
+    check('budget 1000 ms, lobby only → lobby_timeout', run.result, 'AdmissionError:lobby_timeout');
+    check('budget 1000 ms, lobby only → escalated waiting_room_timeout_approaching', run.helpReasons.join(','), 'waiting_room_timeout_approaching');
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

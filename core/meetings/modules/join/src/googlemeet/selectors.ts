@@ -94,8 +94,9 @@ export const googleConsentPromptIndicators: string[] = [
 //   - the element is a visible `role="dialog"` (NOT `alertdialog`);
 //   - its text, with the two button labels removed, consists ONLY of the sentences in
 //     googleGeminiNoticeSentences (at least one of them about recording/transcription);
-//   - it contains EXACTLY two interactive controls (any button, link, checkbox, switch, radio, input,
-//     select, textarea ...) and they are named exactly "Leave" and "Join now".
+//   - it contains EXACTLY two focusable/interactive elements (any button, link, checkbox, switch, radio,
+//     input, select, textarea, `tabindex` >= 0, contenteditable ...), both real buttons (`<button>` or
+//     `role=button`), named exactly "Leave" and "Join now".
 // Exception to "never auto-click consent" (Sam, 2026-10-20, card tc1606-join-now-click): see
 // gemini-notice.ts and README.md in this directory.
 // BROWSER CONTEXT: consumed inside page.evaluate (see gemini-notice.ts) via document.querySelector —
@@ -103,7 +104,9 @@ export const googleConsentPromptIndicators: string[] = [
 export const googleGeminiNoticeDialogSelectors: string[] = [
   '[role="dialog"]',
 ];
-// Every element that could be a decision control. The notice must contain exactly two of these.
+// Every focusable or interactive element: the notice must contain EXACTLY two of these, and both must be
+// real buttons (googleGeminiNoticeButtonSelectors). An extra link, checkbox, switch, input, combobox,
+// focusable div (`tabindex` >= 0), contenteditable region or any other control means "not the notice".
 export const googleGeminiNoticeControlSelectors: string[] = [
   'button',
   'a',
@@ -111,15 +114,33 @@ export const googleGeminiNoticeControlSelectors: string[] = [
   'select',
   'textarea',
   'summary',
+  'details',
+  'audio[controls]',
+  'video[controls]',
+  '[tabindex]:not([tabindex^="-"])',
+  '[contenteditable]:not([contenteditable="false"])',
   '[role="button"]',
   '[role="link"]',
   '[role="checkbox"]',
   '[role="switch"]',
   '[role="radio"]',
   '[role="menuitem"]',
+  '[role="menuitemcheckbox"]',
+  '[role="menuitemradio"]',
   '[role="combobox"]',
+  '[role="listbox"]',
   '[role="option"]',
-  '[contenteditable="true"]',
+  '[role="tab"]',
+  '[role="slider"]',
+  '[role="spinbutton"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="treeitem"]',
+];
+// The only things that may be clicked: a real button.
+export const googleGeminiNoticeButtonSelectors: string[] = [
+  'button',
+  '[role="button"]',
 ];
 // Lower-cased sentences (no trailing period) the notice may consist of. Observed: the first and third alone,
 // the second then third together. The first two are the recording/transcription sentences; "gemini is taking
@@ -538,5 +559,6 @@ export const browserContextSelectorArrays: string[] = [
   'googleLobbyIconGlyphSelectors',
   'googleGeminiNoticeDialogSelectors',
   'googleGeminiNoticeControlSelectors',
+  'googleGeminiNoticeButtonSelectors',
 ];
 

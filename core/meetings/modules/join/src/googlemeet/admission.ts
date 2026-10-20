@@ -345,6 +345,18 @@ const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
   '[role="alertdialog"]:has-text("taking notes")': true,
 };
 
+// Every unresolved exit of the admission wait summons a human, whatever the loop timing: a short budget can
+// end a loop before checkEscalation's poll-boundary thresholds (>80% of budget, >10 s unknown) are crossed,
+// and the bot would then fail with only `awaiting_admission` on record (TC-1606 review). triggerEscalation is
+// idempotent, so a loop that already escalated is not repeated. The reason names what the page is showing.
+async function escalateUnresolvedExit(page: Page, botConfig: BotConfig, lobbyVisible: boolean): Promise<void> {
+  let reason: string;
+  if (await hasConsentPrompt(page)) reason = "consent_required";
+  else if ((await detectGeminiNotice(page)).present) reason = "gemini_notice";
+  else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
+  await triggerEscalation(botConfig, reason);
+}
+
 // The post-admission notice is handled (clicked) by handleGeminiNotice, called at the top of every
 // admission poll below. Exception policy and its scope: gemini-notice.ts.
 // It is only ever attempted once there is evidence the bot was admitted: no lobby text on screen and a real
@@ -502,6 +514,7 @@ export async function waitForGoogleMeetingAdmission(
       const finalWaitingCheck = await checkForWaitingRoomIndicators(page);
       
       if (finalWaitingCheck) {
+        await escalateUnresolvedExit(page, botConfig, true);
         throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout - not admitted to the meeting");
       }
     } else {
@@ -611,6 +624,9 @@ export async function waitForGoogleMeetingAdmission(
     const lobbyStillVisible = await checkForWaitingRoomIndicators(page);
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-3-no-indicators.png', fullPage: true });
     log("📸 Screenshot taken: No meeting indicators found after timeout");
+    // Every unresolved exit escalates, independent of loop timing (a short budget can end the loop before
+    // checkEscalation's poll-boundary thresholds are ever crossed).
+    await escalateUnresolvedExit(page, botConfig, lobbyStillVisible);
     if (lobbyStillVisible) {
       throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout — host did not admit");
     }
