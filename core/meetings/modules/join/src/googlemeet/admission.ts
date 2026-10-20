@@ -12,6 +12,8 @@ import {
 // AdmissionError + AdmissionOutcome moved to ../shared/admission so every platform (jitsi/zoom/
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { AdmissionError } from "../shared/admission";
+import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog } from "./gemini-notice";
+export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog };
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -218,6 +220,17 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
     return false;
   }
 
+  // 1c. NEGATIVE GUARD: the post-admission Gemini / transcription / recording NOTICE (TC-1606). Observed
+  // live: Meet shows an admitted anonymous guest a modal ("This video call is being transcribed. Gemini is
+  // taking notes." / "...is being recorded", [Leave] [Join now]) and the guest is NOT in the call until
+  // "Join now" is pressed, even though the call chrome and the host's tile are already rendered behind it.
+  // Reporting admitted here would be the #429 "active, nobody in the call" failure. The wait loops press
+  // "Join now" (handleGeminiNotice); until the dialog is gone this stays false.
+  if ((await detectGeminiNotice(page)).present || (await hasBlockingNoticeDialog(page)) || (await hasModalDialog(page))) {
+    log(`⚠️ Gemini notice dialog visible — suppressing admission (guest is held outside the call until it is dismissed)`);
+    return false;
+  }
+
   // Wake the UI before probing. Google Meet auto-hides the in-call toolbar
   // (mic/camera/present/leave) after a few seconds of no pointer activity — and the
   // bot never moves a real mouse. Once admitted (especially when a participant is
@@ -305,8 +318,16 @@ export async function checkForWaitingRoomIndicators(page: Page): Promise<boolean
 // (Vexa-ai/vexa#429). Mirrors checkForWaitingRoomIndicators: a pre-admission
 // state that suppresses the "admitted" signal. Consent must be a human decision,
 // so callers escalate to needs_human_help rather than auto-clicking it.
+// The ONE sanctioned exception is the post-admission notice handled by handleGeminiNotice
+// (gemini-notice.ts, README.md): it is not this prompt, and this prompt is never clicked.
 export async function hasConsentPrompt(page: Page): Promise<boolean> {
+  // The post-admission notice is a dialog that says "Gemini is taking notes." — the dialog-scoped
+  // "taking notes" selectors would read it as pending consent. It is not (see detectGeminiNotice), so
+  // those two selectors are skipped while the notice is what is on screen. Everything else, including a
+  // "taking notes" dialog that is NOT exactly the notice shape, still holds as consent and is never clicked.
+  const noticeOnScreen = (await detectGeminiNotice(page)).present;
   for (const selector of googleConsentPromptIndicators) {
+    if (noticeOnScreen && NOTICE_SCOPED_CONSENT_SELECTORS[selector]) continue;
     try {
       const element = await page.locator(selector).first();
       if (await element.isVisible()) {
@@ -318,6 +339,57 @@ export async function hasConsentPrompt(page: Page): Promise<boolean> {
   }
   return false;
 }
+
+const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
+  '[role="dialog"]:has-text("taking notes")': true,
+  '[role="alertdialog"]:has-text("taking notes")': true,
+};
+
+// Every unresolved exit of the admission wait summons a human, whatever the loop timing and whatever else
+// fails on the way out: a short budget can end a loop before checkEscalation's poll-boundary thresholds
+// (>80% of budget, >10 s unknown) are crossed, and a failing diagnostic screenshot, log or page query must
+// not skip it (TC-1606 review). triggerEscalation is idempotent, so a loop that already escalated is not
+// repeated. The reason names what the page is showing; every page query is best-effort, and the escalation
+// itself is always attempted. A failing escalation is logged, never allowed to replace the join verdict.
+async function escalateUnresolvedExit(page: Page, botConfig: BotConfig): Promise<void> {
+  const attempt = async <T>(probe: () => Promise<T>, fallback: T): Promise<T> => {
+    try { return await probe(); } catch { return fallback; }
+  };
+  const lobbyVisible = await attempt(() => checkForWaitingRoomIndicators(page), false);
+  let reason: string;
+  if (await attempt(() => hasConsentPrompt(page), false)) reason = "consent_required";
+  else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present || (await attempt(() => hasBlockingNoticeDialog(page), false))) reason = "gemini_notice";
+  else if (await attempt(() => hasModalDialog(page), false)) reason = "unknown_blocking_dialog";
+  else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
+  try {
+    await triggerEscalation(botConfig, reason);
+  } catch {
+    log("Escalation failed while leaving the admission wait; continuing with the join verdict");
+  }
+}
+
+// The post-admission notice is handled (clicked) by handleGeminiNotice, called at the top of every
+// admission poll below. Exception policy and its scope: gemini-notice.ts.
+// It is only ever attempted once there is evidence the bot was admitted: no lobby text on screen and a real
+// participant tile (or the self tile) rendered behind the dialog. Without that evidence nothing is clicked.
+async function handleNoticeIfInCall(page: Page, botConfig: BotConfig): Promise<void> {
+  if (await checkForWaitingRoomIndicators(page)) return;
+  const inCall = (await countRealParticipantTiles(page)) > 0 || (await page.locator("[data-self-name]").count()) > 0;
+  if (!inCall) return;
+  if ((await detectGeminiNotice(page)).present) {
+    await handleGeminiNotice(page, botConfig);
+    return;
+  }
+  // FAIL-SAFE: a modal dialog that is not the exact known notice (reworded, localized, new) is never clicked.
+  // Admission stays false (checkForGoogleAdmissionIndicators) and a human is summoned once. A pre-admission
+  // consent prompt keeps its own consent_required handling.
+  if (!(await hasConsentPrompt(page)) && (await hasModalDialog(page)) && !unknownModalReported.has(page)) {
+    unknownModalReported.add(page);
+    logJSON({ level: "warn", event: "join.unknown_blocking_dialog", platform: "google_meet" });
+    await triggerEscalation(botConfig, "unknown_blocking_dialog");
+  }
+}
+const unknownModalReported = new WeakSet<object>();
 
 // Terminal admission verdicts carry an honest reason: a host denial says so, and an
 // unsolved captcha says THAT — both map to AdmissionError("denial") (PERMANENT, no
@@ -354,6 +426,7 @@ export async function waitForGoogleMeetingAdmission(
     
     // Check for any visible admission indicator (multiple selectors for robustness)
     // If meeting controls are visible, the bot is admitted — lobby indicators are unreliable
+    await handleNoticeIfInCall(page, botConfig);
     const initialAdmissionFound = await checkForGoogleAdmissionIndicators(page);
 
     if (initialAdmissionFound) {
@@ -377,7 +450,8 @@ export async function waitForGoogleMeetingAdmission(
 
     // Consent gate: if Google's Gemini "take notes" consent prompt is present,
     // the bot is held behind a human decision (accept/decline) — not admitted.
-    // Do NOT auto-click it; consent is the user's choice (Vexa-ai/vexa#429).
+    // Do NOT auto-click it; consent is the user's choice (Vexa-ai/vexa#429). (The only auto-click exception
+    // is the post-admission notice, a different dialog: see gemini-notice.ts.)
     // Summon a human via needs_human_help and keep polling, so admission
     // proceeds once consent is granted (mirrors the reCAPTCHA "stay for human
     // solve" handling).
@@ -422,6 +496,7 @@ export async function waitForGoogleMeetingAdmission(
 
       while (Date.now() - startTime < effectiveTimeout()) {
         botConfig.signal?.throwIfAborted();
+        await handleNoticeIfInCall(page, botConfig);
         // Host denial can leave stale waiting-room text in the DOM. Check the
         // terminal rejection state before treating the page as still waiting.
         await throwIfGoogleAdmissionRejected(page, "waiting-room polling");
@@ -462,6 +537,7 @@ export async function waitForGoogleMeetingAdmission(
       const finalWaitingCheck = await checkForWaitingRoomIndicators(page);
       
       if (finalWaitingCheck) {
+        await escalateUnresolvedExit(page, botConfig);
         throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout - not admitted to the meeting");
       }
     } else {
@@ -473,6 +549,7 @@ export async function waitForGoogleMeetingAdmission(
       const effectiveTimeout2 = () => timeout + getEscalationExtensionMs();
       while (Date.now() - startTime < effectiveTimeout2()) {
         botConfig.signal?.throwIfAborted();
+        await handleNoticeIfInCall(page, botConfig);
         // #444 — the `blocked` state is wired (callBlockedCallback), but NOT emitted yet.
         // hasRecaptchaChallenge() detects a VISIBLE, challenge-sized widget, which is the
         // narrow half of the signal; the blank block page half needs a run that actually
@@ -521,17 +598,30 @@ export async function waitForGoogleMeetingAdmission(
       }
 
       if (stillInWaitingRoom) {
-        // Re-run the waiting room loop with the remaining time
+        // Re-run the waiting room loop with the remaining time. Like the two loops above, it MUST escalate:
+        // a bot held behind a dialog we do not recognise would otherwise sit in `awaiting_admission` until
+        // the deadline and fail with no needs_human_help (TC-1606 review P2).
         const checkInterval = 2000;
         const startTime2 = Date.now();
-        while (Date.now() - startTime2 < timeout) {
+        let unknownStateDuration3 = 0;
+        while (Date.now() - startTime2 < timeout + getEscalationExtensionMs()) {
           botConfig.signal?.throwIfAborted();
+          await handleNoticeIfInCall(page, botConfig);
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
           const stillWaiting = await checkForWaitingRoomIndicators(page);
           if (!stillWaiting) {
+            unknownStateDuration3 += checkInterval;
             const admissionFound2 = await checkForGoogleAdmissionIndicators(page);
             if (admissionFound2) return true;
+            // Pre-admission consent held behind a dialog: say so (consent_required), like the entry check.
+            if (await hasConsentPrompt(page)) await triggerEscalation(botConfig, "consent_required");
+          } else {
+            unknownStateDuration3 = 0;
+          }
+          const escalation3 = checkEscalation(Date.now() - startTime2, timeout, unknownStateDuration3);
+          if (escalation3) {
+            await triggerEscalation(botConfig, escalation3.reason);
           }
           await page.waitForTimeout(checkInterval);
         }
@@ -555,8 +645,16 @@ export async function waitForGoogleMeetingAdmission(
 
     // Distinguish lobby-timeout from join-failure by checking waiting-room state
     const lobbyStillVisible = await checkForWaitingRoomIndicators(page);
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-3-no-indicators.png', fullPage: true });
-    log("📸 Screenshot taken: No meeting indicators found after timeout");
+    // Every unresolved exit escalates, independent of loop timing and of the diagnostics below (a short
+    // budget can end the loop before checkEscalation's thresholds are crossed; a failing screenshot must not
+    // skip the escalation or change the lobby_timeout / join_failure verdict).
+    await escalateUnresolvedExit(page, botConfig);
+    try {
+      await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-3-no-indicators.png', fullPage: true });
+      log("📸 Screenshot taken: No meeting indicators found after timeout");
+    } catch {
+      log("Diagnostic screenshot failed at the no-indicators checkpoint; continuing");
+    }
     if (lobbyStillVisible) {
       throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout — host did not admit");
     }
@@ -565,8 +663,14 @@ export async function waitForGoogleMeetingAdmission(
   } catch (error: any) {
     // A cancelled join is the embedder's decision, not a platform verdict: surface the abort itself.
     if (botConfig.signal?.aborted) throw botConfig.signal.reason;
-    // Re-throw AdmissionError instances unchanged so callers can inspect outcome.
-    if (error instanceof AdmissionError) throw error;
+    // Re-throw AdmissionError instances unchanged so callers can inspect outcome. Any unresolved failure
+    // (not a host denial, not a cancelled join) escalates here too, so no exit — including an unexpected error
+    // from a step above — can leave the bot silent in `awaiting_admission`.
+    if (error instanceof AdmissionError) {
+      if (error.outcome === "lobby_timeout" || error.outcome === "join_failure") await escalateUnresolvedExit(page, botConfig);
+      throw error;
+    }
+    await escalateUnresolvedExit(page, botConfig);
     throw new AdmissionError("join_failure",
       `Bot was not admitted into the Google Meet meeting within the timeout period: ${error.message}`
     );

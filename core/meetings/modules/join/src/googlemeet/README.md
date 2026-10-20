@@ -5,3 +5,37 @@ or synthetic input), `admission.ts` (the lobby→admitted/rejected oracle, incl.
 detection), `leave.ts`, `removal.ts` (kicked-out monitor), `selectors.ts` (DOM selectors).
 `humanized/` holds the X11 mocap-driven input. Imports host symbols from `../_host`,
 `playwright`, and Node builtins only.
+
+## Consent policy: a human decides; one sanctioned exception
+
+The bot never auto-clicks consent. A pre-admission Gemini "take notes for me" prompt (or any dialog that
+asks for a decision) holds admission and summons a human (`needs_human_help`); see `hasConsentPrompt` in
+`admission.ts`.
+
+Exception (Sam, 2026-10-20, card tc1606-join-now-click: 'Yes, for this notice only'): the bot may press 'Join now' on Google Meet's post-admission notice that the call is being recorded, transcribed or note-taken by Gemini. It is the capturing party and has already been admitted by the host. Never auto-click anything that grants consent on behalf of others or shares data.
+
+Scope, enforced in `gemini-notice.ts` by one accessible-tree check (and called from `admission.ts` only once the
+lobby text is gone and a real participant tile is rendered). The bot presses "Join now" only if the dialog is a
+visible `role="dialog"` (not `alertdialog`, not aria-hidden/inert, not nested in another dialog) and, walking its
+whole tree including open shadow roots: (1) nothing is unknown (an iframe/object/embed, or a custom element without
+an open shadow root, means no click); (2) there are exactly two focusable or interactive elements of any kind, both
+real buttons (`<button>` or `role=button`); (3) for each, visible text == accessible name (aria-labelledby, then
+aria-label, then text) == exactly "Leave" / "Join now"; (4) all other text is only the notice sentences ("This video
+call is being recorded", "...transcribed", "Gemini is taking notes"). "Join now" is pressed at most 3 times, then the
+bot escalates (`gemini_notice`). Anything else (an extra element, a name that differs from the text, the
+`take notes for me` consent prompt) is not the notice and is never clicked.
+Dialogs are found recursively through open shadow roots. Admission is declared only when no dialog anywhere in
+that tree says the call is being recorded / transcribed / note-taken (clickable or not: an `alertdialog`, a
+`<dialog>`, a notice with an extra control still blocks `admitted` and escalates instead).
+Fail-safe for notices we cannot read (reworded, localized, new): once the bot is in the call, ANY modal dialog
+(`aria-modal="true"`, an open `<dialog>`, or a dialog covering the middle of the viewport; open shadow roots
+included) blocks `admitted` unless it is the exact known notice above, which is clicked and then disappears. An
+unknown modal is never clicked; the bot escalates once (`unknown_blocking_dialog`, event
+`join.unknown_blocking_dialog`). Non-modal toasts and pills (e.g. "Microphone not found", the "Gemini is taking
+notes" pill) do not block. The click itself is exactly the known English copy: the bot's UI is pinned to English
+(`--lang`, `--accept-lang`, `?hl=en`, context locale; see `browser-args.ts`) and the lobby asserts it, emitting
+`join.ui_locale_not_english` if Meet did not render English.
+Every unresolved exit of the admission wait escalates to `needs_human_help` with a reason, independent of loop
+timing and of failing diagnostics (a failing screenshot cannot skip it), so a stall is never silent.
+Each attempt emits the JSON event `join.gemini_notice_handled` (`success`, `attempt`), which survives the bot's
+log sanitizer. Captured copies live in `fixtures/` (Gemini/transcription and recording-only).

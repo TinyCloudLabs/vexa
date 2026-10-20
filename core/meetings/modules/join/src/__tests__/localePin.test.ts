@@ -2,7 +2,7 @@
 // Pure unit checks, no browser: the launch flags carry --lang / --accept-lang for
 // the resolved BOT_UI_LOCALE knob, and the constructed Meet URL carries ?hl=.
 import { getJoinBrowserArgs, getLocaleBrowserArgs, resolveBotUiLocale } from "../browser-args";
-import { withPinnedMeetLocale } from "../googlemeet/join";
+import { withPinnedMeetLocale, isEnglishUiLocale } from "../googlemeet/join";
 
 let passed = 0, failed = 0;
 function assert(cond: boolean, msg: string): void {
@@ -42,6 +42,15 @@ console.log("\n=== 3. ?hl= on the constructed Meet URL (BOT_AUTHENTICATED lever)
 
   const bad = withPinnedMeetLocale("not a url", "en-US");
   assert(bad === "not a url", "a malformed URL is returned unchanged (no throw)");
+}
+
+console.log("\n=== 4. Startup assertion: the notice handling is English-only, so a non-English UI must be flagged ===");
+{
+  assert(isEnglishUiLocale({ html_lang: "en", navigator_language: "en-US" }), "html lang=en + navigator en-US → English UI (no warning)");
+  assert(isEnglishUiLocale({ html_lang: "en-US", navigator_language: "en-US" }), "html lang=en-US + navigator en-US → English UI");
+  assert(!isEnglishUiLocale({ html_lang: "fi", navigator_language: "en-US" }), "Meet rendered in Finnish despite the pin → flagged");
+  assert(!isEnglishUiLocale({ html_lang: "en", navigator_language: "hu-HU" }), "navigator.language not en-US → flagged");
+  assert(!isEnglishUiLocale({ html_lang: "unknown", navigator_language: "unknown" }), "unreadable locale → flagged");
 }
 
 console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);

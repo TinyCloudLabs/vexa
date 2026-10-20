@@ -158,6 +158,11 @@ async function firstVisibleSelector(
   return null;
 }
 
+/** True when the page really is in the pinned English UI: navigator.language en-US and <html lang> English. */
+export function isEnglishUiLocale(ctx: { html_lang: string; navigator_language: string }): boolean {
+  return ctx.navigator_language === "en-US" && /^en(-|$)/.test(ctx.html_lang);
+}
+
 /**
  * Observed page context for a selector miss. Recorded INTO the thrown error so
  * the failure is diagnosable from `meeting.data.last_error` alone — the pods
@@ -343,6 +348,11 @@ export async function joinGoogleMeeting(
   // and <html lang> — with the pin in place these should read en-US / en.
   const locale = await observedPageContext(page);
   logJSON({ level: "info", event: "join.lobby_locale", platform: "google_meet", ...locale });
+  // The notice handling is English-only by design (the click is scoped to the known English copy). The pin
+  // above should make Meet render the bot's UI in English whatever the host's language; assert it, loudly.
+  if (!isEnglishUiLocale(locale)) {
+    logJSON({ level: "warn", event: "join.ui_locale_not_english", platform: "google_meet", ...locale });
+  }
 
   // --- Humanized input layer (defeats Google Meet input-authenticity detection) ---
   const uiMode = resolveUiInteractionMode(botConfig);

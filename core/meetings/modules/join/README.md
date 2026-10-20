@@ -22,6 +22,10 @@ test-only (real CSS engine for the no-browser fixtures + the selector-validity g
 Verified by `pnpm --filter @vexa/join check:isolation` (gate:isolation, P2). CommonJS by
 design — see `tsconfig.json`; ESM consumers import it via Node interop.
 
+## Consent
+The brick never auto-clicks consent; the one sanctioned exception (Meet's post-admission "Join now" notice) and its
+scope are written in `src/googlemeet/README.md` ("Consent policy").
+
 ## Selector conventions
 Selector validity is **per execution context**, not per engine: Playwright engines
 (`text=`, `:has-text()`) exist only on the locator side; anything shipped into

@@ -5,7 +5,7 @@ const EVENTS: Record<string, true> = {
   'capture_signal.tape_uploaded': true, 'capture_signal.tape_upload_failed': true,
   'capture_signal.tape_upload_skipped': true, 'capture_signal.cap_invalid': true,
   transcription_retry: true, transcription_failed: true, transcript_publish_drain_timeout: true,
-  'join.lobby_locale': true, 'join.selector_miss': true, 'join.name_entry': true,
+  'join.lobby_locale': true, 'join.selector_miss': true, 'join.name_entry': true, 'join.gemini_notice_handled': true, 'join.unknown_blocking_dialog': true, 'join.ui_locale_not_english': true,
   'admission.waiting': true, 'admission.admitted': true, 'admission.rejected': true,
   'leave.completed': true, 'leave.failed': true, 'removal.detected': true, 'removal.monitor_stopped': true,
   'process.fatal': true,

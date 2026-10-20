@@ -83,6 +83,101 @@ export const googleConsentPromptIndicators: string[] = [
   '[role="alertdialog"]:has-text("taking notes")',
 ];
 
+// ── Gemini / transcription / recording NOTICE (TC-1606) ─────────────────────────────────────────────
+// OBSERVED live (anonymous guest, host admits into a meeting with Gemini notes, transcription or
+// recording on): ~4 s after admission Meet shows the guest a modal `role=dialog` — "This video call is
+// being transcribed. Gemini is taking notes." or "This video call is being recorded" — with exactly two
+// controls, [Leave] [Join now], and the guest is NOT in the call until "Join now" is pressed.
+// That is a different state from the pre-admission "take notes for me" consent prompt above: the host
+// already turned capture on and the dialog only announces it. The bot presses "Join now" ONLY when ALL of
+// these hold (gemini-notice.ts enforces them; anything else is never clicked):
+//   - the element is a visible `role="dialog"` (NOT `alertdialog`);
+//   - its text, with the two button labels removed, consists ONLY of the sentences in
+//     googleGeminiNoticeSentences (at least one of them about recording/transcription);
+//   - it contains EXACTLY two focusable/interactive elements (any button, link, checkbox, switch, radio,
+//     input, select, textarea, `tabindex` >= 0, contenteditable ...), both real buttons (`<button>` or
+//     `role=button`), named exactly "Leave" and "Join now".
+// Exception to "never auto-click consent" (Sam, 2026-10-20, card tc1606-join-now-click): see
+// gemini-notice.ts and README.md in this directory.
+// BROWSER CONTEXT: consumed inside page.evaluate (see gemini-notice.ts) via document.querySelector —
+// declared in browserContextSelectorArrays below so the validity gate CSS-parses the selector arrays.
+export const googleGeminiNoticeDialogSelectors: string[] = [
+  '[role="dialog"]',
+];
+// Wider net for the ADMISSION guard only (never for clicking): any dialog-like container, including
+// alertdialog and <dialog>, whose text names recording / transcription / notes blocks an "admitted" verdict,
+// whether or not it is exactly the notice the bot may click.
+export const googleGeminiNoticeBlockingDialogSelectors: string[] = [
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+  'dialog',
+];
+// FAIL-SAFE for notices we cannot read (reworded, localized, new): any MODAL dialog on the page blocks an
+// "admitted" verdict unless it is exactly the known notice we click and which then disappears. A dialog is
+// modal when it is `aria-modal="true"`, an open <dialog>, or a role=dialog/alertdialog that covers the middle
+// of the viewport (it makes the call UI covered). Non-modal toasts and pills do not block.
+export const googleGeminiNoticeModalSelectors: string[] = [
+  '[aria-modal="true"]',
+  'dialog[open]',
+];
+// Lower-cased substrings of dialog text that say capture is on (see the guard above).
+export const googleGeminiNoticeBlockingTexts: string[] = [
+  'is being recorded',
+  'is being transcribed',
+  'taking notes',
+];
+// Every focusable or interactive element: the notice must contain EXACTLY two of these, and both must be
+// real buttons (googleGeminiNoticeButtonSelectors). An extra link, checkbox, switch, input, combobox,
+// focusable div (`tabindex` >= 0), contenteditable region or any other control means "not the notice".
+export const googleGeminiNoticeControlSelectors: string[] = [
+  'button',
+  'a',
+  'input',
+  'select',
+  'textarea',
+  'summary',
+  'details',
+  'audio[controls]',
+  'video[controls]',
+  '[tabindex]:not([tabindex^="-"])',
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="checkbox"]',
+  '[role="switch"]',
+  '[role="radio"]',
+  '[role="menuitem"]',
+  '[role="menuitemcheckbox"]',
+  '[role="menuitemradio"]',
+  '[role="combobox"]',
+  '[role="listbox"]',
+  '[role="option"]',
+  '[role="tab"]',
+  '[role="slider"]',
+  '[role="spinbutton"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="treeitem"]',
+];
+// The only things that may be clicked: a real button.
+export const googleGeminiNoticeButtonSelectors: string[] = [
+  'button',
+  '[role="button"]',
+];
+// Lower-cased sentences (no trailing period) the notice may consist of. Observed: the first and third alone,
+// the second then third together. The first two are the recording/transcription sentences; "gemini is taking
+// notes" alone is never enough.
+export const googleGeminiNoticeSentences: string[] = [
+  'this video call is being recorded',
+  'this video call is being transcribed',
+  'this video call is being recorded and transcribed',
+  'gemini is taking notes',
+];
+export const googleGeminiNoticeCaptureSentenceCount = 3;
+// Lower-cased, whitespace-normalized control names. The dialog must offer EXACTLY these two controls.
+export const googleGeminiNoticeLeaveLabel = 'leave';
+export const googleGeminiNoticeContinueLabel = 'join now';
+
 export const googleRejectionIndicators: string[] = [
   // Waiting-room denial patterns. Google Meet can leave some lobby text in
   // the DOM after a host rejects the bot, so these must be checked before
@@ -484,5 +579,10 @@ export const googlePeopleButtonSelectors: string[] = [
 export const browserContextSelectorArrays: string[] = [
   'googleLeaveButtonMatchers',
   'googleLobbyIconGlyphSelectors',
+  'googleGeminiNoticeDialogSelectors',
+  'googleGeminiNoticeBlockingDialogSelectors',
+  'googleGeminiNoticeModalSelectors',
+  'googleGeminiNoticeControlSelectors',
+  'googleGeminiNoticeButtonSelectors',
 ];
 

@@ -158,6 +158,13 @@ audio — audio only; there is no video recording path. See [Configuration](/con
 On Meet and Teams the bot may wait in the lobby until a host admits it; a Jitsi room with the
 lobby enabled behaves the same way.
 
+On Google Meet, when the host has Gemini notes, transcription or recording on, Meet shows an admitted
+guest a notice ("This video call is being recorded" / "…is being transcribed. Gemini is taking notes.")
+with **Leave** and **Join now**, and the guest is not in the call until it presses **Join now**. The bot
+presses it, for that one notice only; it never auto-clicks any other consent prompt. Each press logs the
+`join.gemini_notice_handled` event, and if three presses do not take the bot asks for human help
+(`needs_help`) instead of waiting silently.
+
 <Note>
 You often don't need this call at all: a [**planned** meeting](/how-to/plan-a-meeting) with a time
 and a link **auto-joins** at start, and [calendar sync](/how-to/calendar-sync) plans them for you.
