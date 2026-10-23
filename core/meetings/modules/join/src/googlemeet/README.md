@@ -22,7 +22,7 @@ an open shadow root, means no click); (2) there are exactly two focusable or int
 real buttons (`<button>` or `role=button`); (3) for each, visible text == accessible name (aria-labelledby, then
 aria-label, then text) == exactly "Leave" / "Join now"; (4) all other text is only the notice sentences ("This video
 call is being recorded", "...transcribed", "Gemini is taking notes"). "Join now" is pressed at most 3 times, then the
-bot escalates (`gemini_notice`). Anything else (an extra element, a name that differs from the text, the
+bot escalates (`modal_dialog`). Anything else (an extra element, a name that differs from the text, the
 `take notes for me` consent prompt) is not the notice and is never clicked.
 Dialogs are found recursively through open shadow roots. Admission is declared only when no dialog anywhere in
 that tree says the call is being recorded / transcribed / note-taken (clickable or not: an `alertdialog`, a
@@ -30,7 +30,7 @@ that tree says the call is being recorded / transcribed / note-taken (clickable 
 Fail-safe for notices we cannot read (reworded, localized, new): once the bot is in the call, ANY modal dialog
 (`aria-modal="true"`, an open `<dialog>`, or a dialog covering the middle of the viewport; open shadow roots
 included) blocks `admitted` unless it is the exact known notice above, which is clicked and then disappears. An
-unknown modal is never clicked; the bot escalates once (`unknown_blocking_dialog`, event
+unknown modal is never clicked; the bot escalates once (`modal_dialog`, event
 `join.unknown_blocking_dialog`). Non-modal toasts and pills (e.g. "Microphone not found", the "Gemini is taking
 notes" pill) do not block. The click itself is exactly the known English copy: the bot's UI is pinned to English
 (`--lang`, `--accept-lang`, `?hl=en`, context locale; see `browser-args.ts`) and the lobby asserts it, emitting

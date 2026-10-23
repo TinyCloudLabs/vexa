@@ -28,12 +28,11 @@ export async function getAppJoinedState(page: Page): Promise<"joined" | "not-joi
 }
 
 /** A fresh meet.jit.si room is members-only until a moderator arrives: the conference join fails
- *  with MEMBERS_ONLY, which jitsi reliably emits to the page console (`conference.connectionError.
- *  membersOnly … <room>@lobby.<host>`) — observed on every run. We latch that host-side (below)
- *  because it fires even when the DOM renders NO lobby affordances (a blank/error page) and the
- *  redux store isn't wired up yet pre-admission — the exact state that made a real lobby look like
- *  "unknown" and drove the illegal `joining → needs_help` escalation (#592). Attach BEFORE
- *  navigation (from join.ts) so the event is never missed; the flag lives on the page object. */
+ *  with MEMBERS_ONLY, which jitsi emits to the page console (`conference.connectionError.
+ *  membersOnly … <room>@lobby.<host>`). We latch that host-side (below) because it fires even when
+ *  the DOM renders no lobby affordances and the redux store is not yet wired up pre-admission.
+ *  Attach BEFORE navigation (from join.ts) so the event is never missed; the flag lives on the page
+ *  object. */
 const MEMBERS_ONLY_RE = /conference\.connectionError\.membersOnly|MEMBERS_ONLY/i;
 
 export function attachMembersOnlyWatch(page: Page): void {

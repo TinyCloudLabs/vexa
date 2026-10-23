@@ -6,7 +6,7 @@ const EVENTS: Record<string, true> = {
   'capture_signal.tape_upload_skipped': true, 'capture_signal.cap_invalid': true,
   transcription_retry: true, transcription_failed: true, transcript_publish_drain_timeout: true,
   'join.lobby_locale': true, 'join.selector_miss': true, 'join.name_entry': true, 'join.gemini_notice_handled': true, 'join.unknown_blocking_dialog': true, 'join.ui_locale_not_english': true,
-  'admission.waiting': true, 'admission.admitted': true, 'admission.rejected': true,
+  'admission.waiting': true, 'admission.admitted': true, 'admission.rejected': true, 'admission.blocked': true,
   'leave.completed': true, 'leave.failed': true, 'removal.detected': true, 'removal.monitor_stopped': true,
   'process.fatal': true,
 };
@@ -25,6 +25,7 @@ const NUMBERS: Record<string, true> = {
   max_bytes: true, max_tape_bytes: true, file_size_bytes: true, chunk_size_bytes: true,
   sample_rate: true, channels: true, timeout_ms: true, pending_count: true, selector_count: true,
   candidate_count: true, participant_tiles: true, self_name_count: true, real_tiles: true, recaptcha_frames: true,
+  count: true, ts_ms: true,
 };
 const BOOLEANS: Record<string, true> = {
   ok: true, success: true, confirmed: true, leave_result: true, truncated: true, capped: true,
@@ -36,6 +37,9 @@ const ERROR_CODES: Record<string, true> = {
   missing_config: true,
   anti_bot_wall: true, admission_denied: true, lobby_timeout: true,
   host_denial: true, captcha_pending: true, captcha_unsolved: true, error_page: true,
+};
+const ADMISSION_BLOCK_REASONS: Record<string, true> = {
+  modal_dialog: true, consent_text: true, notes_text: true, waiting_room_indicator: true, no_positive_evidence: true,
 };
 
 function safeRecord(value: unknown): Record<string, unknown> | null {
@@ -55,6 +59,8 @@ function safeRecord(value: unknown): Record<string, unknown> | null {
       result[key] = field;
     } else if (key === 'error_code' && typeof field === 'string' && Object.hasOwn(ERROR_CODES, field)) {
       result.error_code = field;
+    } else if (key === 'reason' && typeof field === 'string' && Object.hasOwn(ADMISSION_BLOCK_REASONS, field)) {
+      result.reason = field;
     } else if (Object.hasOwn(NUMBERS, key) && typeof field === 'number' && Number.isFinite(field)) {
       result[key] = field;
     } else if (Object.hasOwn(BOOLEANS, key) && typeof field === 'boolean') {

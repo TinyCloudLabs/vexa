@@ -14,6 +14,12 @@ import {
 import { AdmissionError } from "../shared/admission";
 import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog } from "./gemini-notice";
 export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog };
+import { createAdmissionBlockedReporter, type AdmissionBlockReason } from "./admission-blocked";
+
+const admissionBlocked = createAdmissionBlockedReporter({
+  now: Date.now,
+  emit: (event) => logJSON({ level: "info", ...event }),
+});
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -207,6 +213,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   const inWaitingRoom = await checkForWaitingRoomIndicators(page);
   if (inWaitingRoom) {
     log(`⚠️ Waiting room indicator visible — suppressing admission (lobby buttons are false positives)`);
+    admissionBlocked.suppressed("waiting_room_indicator");
     return false;
   }
 
@@ -214,9 +221,10 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   // consent gate. Meeting controls can be visible behind it, but the bot is not
   // truly participating until a human accepts/declines — reporting admitted here
   // yields "status active, 0 transcriptions" (Vexa-ai/vexa#429). Suppress admission.
-  const consentPending = await hasConsentPrompt(page);
-  if (consentPending) {
+  const consentReason = await consentPromptReason(page);
+  if (consentReason) {
     log(`⚠️ Gemini consent prompt visible — suppressing admission (consent pending; bot not truly in the call)`);
+    admissionBlocked.suppressed(consentReason);
     return false;
   }
 
@@ -228,6 +236,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   // "Join now" (handleGeminiNotice); until the dialog is gone this stays false.
   if ((await detectGeminiNotice(page)).present || (await hasBlockingNoticeDialog(page)) || (await hasModalDialog(page))) {
     log(`⚠️ Gemini notice dialog visible — suppressing admission (guest is held outside the call until it is dismissed)`);
+    admissionBlocked.suppressed("modal_dialog");
     return false;
   }
 
@@ -236,7 +245,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
   // bot never moves a real mouse. Once admitted (especially when a participant is
   // *presenting*, which restyles the chrome), every toolbar selector reads
   // isVisible:false, so the bot wrongly concludes "not admitted", keeps polling, and
-  // false-escalates to unknown_blocking_state / needs_human_help while actually sitting
+  // false-escalates to a blocking-state escalation / needs_human_help while actually sitting
   // in the call (observed live: meeting in-progress, "X (Presenting)" visible, 0
   // transcripts). A synthetic pointer move re-reveals the toolbar so isVisible() is
   // meaningful again. Best-effort; ignore failures.
@@ -290,6 +299,7 @@ export async function checkForGoogleAdmissionIndicators(page: Page): Promise<boo
       continue;
     }
   }
+  admissionBlocked.suppressed("no_positive_evidence");
   return false;
 }
 
@@ -320,7 +330,7 @@ export async function checkForWaitingRoomIndicators(page: Page): Promise<boolean
 // so callers escalate to needs_human_help rather than auto-clicking it.
 // The ONE sanctioned exception is the post-admission notice handled by handleGeminiNotice
 // (gemini-notice.ts, README.md): it is not this prompt, and this prompt is never clicked.
-export async function hasConsentPrompt(page: Page): Promise<boolean> {
+export async function consentPromptReason(page: Page): Promise<AdmissionBlockReason | null> {
   // The post-admission notice is a dialog that says "Gemini is taking notes." — the dialog-scoped
   // "taking notes" selectors would read it as pending consent. It is not (see detectGeminiNotice), so
   // those two selectors are skipped while the notice is what is on screen. Everything else, including a
@@ -331,13 +341,17 @@ export async function hasConsentPrompt(page: Page): Promise<boolean> {
     try {
       const element = await page.locator(selector).first();
       if (await element.isVisible()) {
-        return true;
+        return selector.includes("take notes for me") ? "notes_text" : "consent_text";
       }
     } catch {
       continue;
     }
   }
-  return false;
+  return null;
+}
+
+export async function hasConsentPrompt(page: Page): Promise<boolean> {
+  return (await consentPromptReason(page)) !== null;
 }
 
 const NOTICE_SCOPED_CONSENT_SELECTORS: Record<string, true> = {
@@ -357,9 +371,13 @@ async function escalateUnresolvedExit(page: Page, botConfig: BotConfig): Promise
   };
   const lobbyVisible = await attempt(() => checkForWaitingRoomIndicators(page), false);
   let reason: string;
-  if (await attempt(() => hasConsentPrompt(page), false)) reason = "consent_required";
-  else if ((await attempt(() => detectGeminiNotice(page), { present: false })).present || (await attempt(() => hasBlockingNoticeDialog(page), false))) reason = "gemini_notice";
-  else if (await attempt(() => hasModalDialog(page), false)) reason = "unknown_blocking_dialog";
+  const consent = await attempt<AdmissionBlockReason | null>(() => consentPromptReason(page), null);
+  if (consent) reason = consent;
+  else if (
+    (await attempt(() => detectGeminiNotice(page), { present: false })).present ||
+    (await attempt(() => hasBlockingNoticeDialog(page), false)) ||
+    (await attempt(() => hasModalDialog(page), false))
+  ) reason = "modal_dialog";
   else reason = lobbyVisible ? "waiting_room_timeout_approaching" : "unknown_blocking_state";
   try {
     await triggerEscalation(botConfig, reason);
@@ -382,11 +400,11 @@ async function handleNoticeIfInCall(page: Page, botConfig: BotConfig): Promise<v
   }
   // FAIL-SAFE: a modal dialog that is not the exact known notice (reworded, localized, new) is never clicked.
   // Admission stays false (checkForGoogleAdmissionIndicators) and a human is summoned once. A pre-admission
-  // consent prompt keeps its own consent_required handling.
+  // consent prompt keeps its own consent handling.
   if (!(await hasConsentPrompt(page)) && (await hasModalDialog(page)) && !unknownModalReported.has(page)) {
     unknownModalReported.add(page);
     logJSON({ level: "warn", event: "join.unknown_blocking_dialog", platform: "google_meet" });
-    await triggerEscalation(botConfig, "unknown_blocking_dialog");
+    await triggerEscalation(botConfig, "modal_dialog");
   }
 }
 const unknownModalReported = new WeakSet<object>();
@@ -455,9 +473,10 @@ export async function waitForGoogleMeetingAdmission(
     // Summon a human via needs_human_help and keep polling, so admission
     // proceeds once consent is granted (mirrors the reCAPTCHA "stay for human
     // solve" handling).
-    if (await hasConsentPrompt(page)) {
+    const consentReason = await consentPromptReason(page);
+    if (consentReason) {
       log("🧑‍⚖️ Gemini consent prompt detected — bot is behind a consent gate (not admitted). Escalating to needs_human_help; not auto-consenting.");
-      await triggerEscalation(botConfig, "consent_required");
+      await triggerEscalation(botConfig, consentReason);
     }
 
     log("Bot not yet admitted - checking for Google Meet waiting room indicators...");
@@ -614,8 +633,9 @@ export async function waitForGoogleMeetingAdmission(
             unknownStateDuration3 += checkInterval;
             const admissionFound2 = await checkForGoogleAdmissionIndicators(page);
             if (admissionFound2) return true;
-            // Pre-admission consent held behind a dialog: say so (consent_required), like the entry check.
-            if (await hasConsentPrompt(page)) await triggerEscalation(botConfig, "consent_required");
+            // Pre-admission consent held behind a dialog: report the reason the consent probe returns.
+            const consentLate = await consentPromptReason(page);
+            if (consentLate) await triggerEscalation(botConfig, consentLate);
           } else {
             unknownStateDuration3 = 0;
           }

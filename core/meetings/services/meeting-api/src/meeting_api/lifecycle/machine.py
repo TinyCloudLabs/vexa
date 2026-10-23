@@ -174,7 +174,7 @@ class TransitionSource(str, Enum):
 LEGAL_TRANSITIONS: Dict[Optional[BotStatus], frozenset[BotStatus]] = {
     None: frozenset({BotStatus.JOINING}),  # initial: a record's first event must be `joining`
     BotStatus.JOINING: frozenset(
-        {BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE, BotStatus.FAILED}
+        {BotStatus.AWAITING_ADMISSION, BotStatus.NEEDS_HELP, BotStatus.ACTIVE, BotStatus.FAILED}
     ),
     BotStatus.AWAITING_ADMISSION: frozenset(
         {BotStatus.ACTIVE, BotStatus.NEEDS_HELP, BotStatus.FAILED}
@@ -186,6 +186,20 @@ LEGAL_TRANSITIONS: Dict[Optional[BotStatus], frozenset[BotStatus]] = {
 }
 
 _TERMINAL = frozenset({BotStatus.COMPLETED, BotStatus.FAILED})
+
+# The enumerated reasons a bot may attach to a `needs_help` transition. Mirrors the bot's
+# `ESCALATION_REASON_CODES`. Any other value is stored as `unknown`.
+ESCALATION_REASON_CODES = frozenset({
+    "waiting_room_timeout_approaching",
+    "unknown_blocking_state",
+    "join_error_page_alive",
+    "modal_dialog",
+    "consent_text",
+    "notes_text",
+    "waiting_room_indicator",
+    "no_positive_evidence",
+    "unknown",
+})
 
 # The persisted (DB) meeting status string → the in-memory FSM BotStatus, used to REHYDRATE a
 # record after a meeting-api restart (LIFECYCLE-409 fix). The DB carries the SERVER-SIDE meeting
@@ -272,14 +286,11 @@ def _capture_join_evidence(
     non-admitted verdict). Same discipline as `failure_stage`: derive server-side, never trust a
     stale payload field (FM-003).
 
-    `needs_help` is deliberately NOT proof of a lobby on its own. It implies one only while
-    `LEGAL_TRANSITIONS` permits reaching it from `awaiting_admission` alone — and #1251 adds
-    `joining -> needs_help` precisely so a PRE-lobby blocker (a consent gate, a captcha) can
-    escalate. The day that lands, a bot that never saw a waiting room would be stamped
-    `reached_lobby` -> `awaiting_admission_timeout` -> `host_action`: filed as *the host did not let us in*,
-    and excluded from `system_failure_rate` — the metric under-reporting our own defects in exactly
-    the cohort #1251 exists to investigate. So the test is how `needs_help` was ENTERED, not that it
-    occurred.
+    `needs_help` is deliberately NOT proof of a lobby on its own. `LEGAL_TRANSITIONS` permits
+    `joining -> needs_help` so a PRE-lobby blocker (a consent gate, a captcha) can escalate. A bot
+    that escalated before any waiting room must not be stamped `reached_lobby`, or it is filed as
+    `awaiting_admission_timeout` -> `host_action` and excluded from `system_failure_rate`. So the
+    test is how `needs_help` was ENTERED, not that it occurred.
     """
     try:
         from .join_evidence import evidence_from_event
@@ -340,6 +351,7 @@ class MeetingRecord:
     completion_reason: Optional[CompletionReason] = None
     failure_stage: Optional[FailureStage] = None
     reason: Optional[str] = None
+    escalation_reason: Optional[str] = None
     error_details: Optional[str] = None
     exit_code: Optional[int] = None
     history: list[BotStatus] = field(default_factory=list)
@@ -396,6 +408,8 @@ class MeetingRecord:
         # missing projection. Hoisting it costs nothing and makes the failure decomposable by query.
         if self.reason is not None:
             d["reason"] = self.reason
+        if self.escalation_reason is not None:
+            d["escalation_reason"] = self.escalation_reason
         if self.join_evidence is not None:
             d["join_evidence"] = _sanitize_diagnostic(self.join_evidence)
         if self.error_details is not None:
@@ -616,6 +630,9 @@ class LifecycleSink:
             rec.container_id = event["container_id"]
         if event.get("reason") is not None:
             rec.reason = _safe_diagnostic_text(event["reason"])
+        if event.get("escalation_reason") is not None and to is BotStatus.NEEDS_HELP:
+            code = event["escalation_reason"]
+            rec.escalation_reason = code if code in ESCALATION_REASON_CODES else "unknown"
         if event.get("exit_code") is not None:
             rec.exit_code = event["exit_code"]
         if event.get("error_details") is not None:

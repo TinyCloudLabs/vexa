@@ -44,6 +44,8 @@ export interface LifecycleEvent {
    *  admission/departure clock: delivery may be delayed or retried. */
   timestamp?: string;
   reason?: string;
+  /** Enumerated reason an escalation (needs_help) was raised. Anything unrecognised is `unknown`. */
+  escalation_reason?: EscalationReasonCode;
   exit_code?: number;
   completion_reason?: CompletionReason;
   failure_stage?: FailureStage;
@@ -83,13 +85,34 @@ export interface LifecycleEvent {
 
 /** The legal transitions — the machine the bot MUST obey (lifecycle.v1/README.md). */
 export const LIFECYCLE_TRANSITIONS: Record<BotStatus, readonly BotStatus[]> = {
-  joining: ['awaiting_admission', 'active', 'failed'],
+  joining: ['awaiting_admission', 'needs_help', 'active', 'failed'],
   awaiting_admission: ['active', 'needs_help', 'failed'],
   needs_help: ['active', 'failed'],
   active: ['completed', 'failed'],
   completed: [],
   failed: [],
 };
+
+/** Enumerated escalation reasons carried on a needs_help event. */
+export const ESCALATION_REASON_CODES = [
+  'waiting_room_timeout_approaching',
+  'unknown_blocking_state',
+  'join_error_page_alive',
+  'modal_dialog',
+  'consent_text',
+  'notes_text',
+  'waiting_room_indicator',
+  'no_positive_evidence',
+  'unknown',
+] as const;
+export type EscalationReasonCode = (typeof ESCALATION_REASON_CODES)[number];
+
+/** Maps a raw escalation reason onto the enumerated code; anything outside the set is `unknown`. */
+export function toEscalationReasonCode(raw: unknown): EscalationReasonCode {
+  return (ESCALATION_REASON_CODES as readonly string[]).includes(raw as string)
+    ? (raw as EscalationReasonCode)
+    : 'unknown';
+}
 
 export const TERMINAL_STATUSES: readonly BotStatus[] = ['completed', 'failed'];
 

@@ -331,6 +331,27 @@ for (const canary of ['SYNTH_PAGE_TEXT_623', 'NATIVE_MEETING_624', 'SYNTH_ZOOM_T
 assert.match(removalAdmissionOutput, /"event":"admission\.rejected"/);
 assert.match(removalAdmissionOutput, /"event":"removal\.detected"/);
 assert.match(removalAdmissionOutput, /"removed":true/);
+const blockedScript = `
+import { sanitizeLogText } from ${JSON.stringify(sanitizer)};
+const lines = [
+  { event: 'admission.blocked', platform: 'google_meet', reason: 'modal_dialog', count: 3, ts_ms: 1700000000000, msg: 'SYNTH_BLOCK_TEXT_660', url: 'https://SYNTH_HOST_660.invalid/x' },
+  { event: 'admission.blocked', platform: 'google_meet', reason: 'SYNTH_REASON_661', count: 1, ts_ms: 1 },
+  { event: 'admission.unlisted', count: 2 },
+];
+for (const line of lines) console.log(sanitizeLogText(JSON.stringify(line)));
+`;
+const blockedResult = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', blockedScript], { encoding: 'utf8' });
+assert.equal(blockedResult.status, 0, blockedResult.stderr);
+const [blockedLine, unknownReasonLine, unlistedLine] = blockedResult.stdout.trimEnd().split('\n').map((line) => JSON.parse(line));
+assert.deepEqual(Object.keys(blockedLine).sort(), ['count', 'event', 'platform', 'reason', 'ts_ms']);
+assert.equal(blockedLine.reason, 'modal_dialog');
+assert.equal(blockedLine.count, 3);
+assert.equal(blockedLine.ts_ms, 1700000000000);
+assert.equal(Object.hasOwn(unknownReasonLine, 'reason'), false, 'a reason outside the admission enum is dropped');
+assert.equal(unknownReasonLine.event, 'admission.blocked');
+assert.equal(Object.hasOwn(unlistedLine, 'event'), false, 'an event outside the allowlist is dropped');
+assert.equal(unlistedLine.count, 2);
+assert.equal(blockedResult.stdout.includes('SYNTH_BLOCK_TEXT_660') || blockedResult.stdout.includes('SYNTH_HOST_660'), false, 'free text and URLs are stripped');
 console.log('PASS process log sanitizer: real stdout/stderr sinks retain counts/status and redact canaries');
 const fatalHandlers = fileURLToPath(new URL('./install-process-fatal-handlers.ts', import.meta.url));
 for (const kind of ['uncaught_exception', 'unhandled_rejection'] as const) {

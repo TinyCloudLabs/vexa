@@ -25,6 +25,10 @@
         "container_id": { "type": "string" },
         "status": { "$ref": "#/$defs/BotStatus" },
         "reason": { "type": "string" },
+        "escalation_reason": {
+          "type": "string",
+          "description": "needs_help only: enumerated reason; unrecognised values are stored as unknown by the control plane"
+        },
         "exit_code": { "type": "integer", "description": "terminal only" },
         "completion_reason": { "$ref": "#/$defs/CompletionReason" },
         "failure_stage": { "$ref": "#/$defs/FailureStage" },

@@ -119,3 +119,35 @@ def test_first_event_must_be_joining(goldens):
         sink.apply(goldens["active"])  # None → active
     assert exc.value.frm is None
     assert exc.value.to is BotStatus.ACTIVE
+
+
+# --- joining -> needs_help and the escalation reason -------------------------------------
+
+def test_joining_may_escalate_to_needs_help_but_not_back():
+    assert can_transition(BotStatus.JOINING, BotStatus.NEEDS_HELP)
+    assert not can_transition(BotStatus.NEEDS_HELP, BotStatus.JOINING)
+
+
+def test_needs_help_from_joining_is_applied_with_its_reason():
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-esc-1", "status": "joining"})
+    rec = sink.apply({
+        "connection_id": "c-esc-1",
+        "status": "needs_help",
+        "escalation_reason": "consent_text",
+    })
+    assert rec.status is BotStatus.NEEDS_HELP
+    assert rec.escalation_reason == "consent_text"
+    assert rec.data["escalation_reason"] == "consent_text"
+
+
+def test_unrecognised_escalation_reason_is_stored_as_unknown():
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-esc-2", "status": "joining"})
+    rec = sink.apply({
+        "connection_id": "c-esc-2",
+        "status": "needs_help",
+        "escalation_reason": "free text describing the page",
+    })
+    assert rec.escalation_reason == "unknown"
+    assert rec.data["escalation_reason"] == "unknown"

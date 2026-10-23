@@ -1,13 +1,11 @@
 /**
- * #592 — authoritative members-only/lobby detection + typed timeout attribution.
+ * Authoritative members-only/lobby detection and typed timeout attribution.
  *
  * A fresh meet.jit.si room is members-only until a moderator arrives; the conference fails with
- * MEMBERS_ONLY and redux records the lobby room JID in features/base/conference.membersOnly. The
- * witnessed silent loop happened when DOM/text scraping missed that state (blank/error render) —
- * so the bot mislabelled a real lobby as "unknown" and escalated down the illegal joining→needs_help
- * path. getLobbyState reads the app's own verdict instead. And a give-up must throw a TYPED
- * AdmissionError('lobby_timeout') so the driver reports awaiting_admission_timeout, not a generic
- * silently-retried join_failure.
+ * MEMBERS_ONLY and redux records the lobby room JID in features/base/conference.membersOnly.
+ * Lobby state is read from the app's own verdict rather than DOM text, which can miss the lobby on
+ * blank or error renders. A give-up throws a typed AdmissionError('lobby_timeout') so the driver
+ * reports awaiting_admission_timeout rather than a generic join_failure.
  *
  * Drives the SHIPPED getLobbyState + waitForJitsiMeetingAdmission over a fabricated Page/APP stub
  * (same no-browser pattern as the other jitsi tests).
