@@ -45,7 +45,7 @@ export type JoinState =
   | "blocked" | "leaving" | "needs_human_help";
 
 export interface Hooks {
-  onState: (state: JoinState, detail?: any) => void | Promise<void>;
+  onState: (state: JoinState, detail?: Record<string, unknown>) => void | boolean | Promise<void | boolean>;
   /** recording is a HOST concern — the join layer never records. */
   onStopRecording: (page: any, botConfig: BotConfig) => void | Promise<void>;
 }
@@ -79,8 +79,8 @@ export async function callBlockedCallback(
 }
 export async function callNeedsHumanHelpCallback(
   _botConfig: BotConfig, reason?: string, screenshotPath?: string,
-): Promise<void> {
-  await hooks.onState("needs_human_help", { reason, screenshotPath });
+): Promise<boolean> {
+  return (await hooks.onState("needs_human_help", { reason, screenshotPath })) !== false;
 }
 export async function stopGoogleRecording(page?: any, botConfig?: BotConfig): Promise<void> {
   await hooks.onStopRecording(page, botConfig as BotConfig);

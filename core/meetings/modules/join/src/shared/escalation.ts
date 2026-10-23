@@ -4,6 +4,7 @@ import { log, callNeedsHumanHelpCallback } from '../_host';
 
 let escalationTriggered = false;
 let vncStarted = false;
+let escalationInFlight = false;
 
 export interface EscalationResult {
   reason: string;
@@ -41,12 +42,18 @@ export function checkEscalation(
  * Idempotent — only fires once per admission attempt.
  */
 export async function triggerEscalation(botConfig: any, reason: string): Promise<void> {
-  if (escalationTriggered) return;
-  escalationTriggered = true;
-
-  log(`[Escalation] Triggered: ${reason}`);
-  await startVncStack();
-  await callNeedsHumanHelpCallback(botConfig, reason);
+  if (escalationTriggered || escalationInFlight) return;
+  escalationInFlight = true;
+  try {
+    log(`[Escalation] Triggered: ${reason}`);
+    await startVncStack();
+    const accepted = await callNeedsHumanHelpCallback(botConfig, reason);
+    // Only an accepted escalation is one-shot. A refused one stays retryable on the next check.
+    if (accepted) escalationTriggered = true;
+    else log(`[Escalation] Refused by host; will retry on next check: ${reason}`);
+  } finally {
+    escalationInFlight = false;
+  }
 }
 
 /**

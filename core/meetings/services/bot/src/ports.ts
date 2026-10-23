@@ -69,7 +69,7 @@ export interface JoinDriver {
   /** Join + await admission. `report` fires on each intermediate lifecycle state
    *  (awaiting_admission / needs_help / active). Resolves with the verdict — a bare `JoinOutcome`
    *  or a `JoinResult` that also carries the failure's human reason text (#926). */
-  join(report: (s: BotStatus, extra?: Pick<LifecycleEvent, 'escalation_reason'>) => void | Promise<void>, options?: { signal?: AbortSignal }): Promise<JoinOutcome | JoinResult>;
+  join(report: (s: BotStatus, extra?: Pick<LifecycleEvent, 'escalation_reason'>) => void | Promise<void | boolean>, options?: { signal?: AbortSignal }): Promise<JoinOutcome | JoinResult>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
   /** Unexpected loss of the meeting page; detach before deliberately closing it. */

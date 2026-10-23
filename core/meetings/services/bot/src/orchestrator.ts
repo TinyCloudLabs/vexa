@@ -494,7 +494,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // when the driver fire-and-forgets, and SURFACE a contract-illegal transition (log) rather
     // than silently dropping it.
     let reportChain: Promise<void> = Promise.resolve();
-    const report = (s: BotStatus, extra: Pick<LifecycleEvent, 'escalation_reason'> = {}): Promise<void> => {
+    const report = (s: BotStatus, extra: Pick<LifecycleEvent, 'escalation_reason'> = {}): Promise<boolean> => {
       // A joining-state escalation is held until the gate, so a transient early block does not reach the
       // control plane as needs_help. A held report is delivered at the gate if the bot is still pre-active.
       if (s === 'needs_help' && cur === 'joining' && joinStartedAt !== undefined) {
@@ -505,13 +505,20 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
             pendingNeedsHelp = undefined;
             if (cur === 'joining' || cur === 'awaiting_admission') void report('needs_help', extra);
           }, waitMs);
-          return reportChain;
+          return reportChain.then(() => true);
         }
       }
-      reportChain = reportChain.then(() => emit(s, extra)).catch((e) => {
-        console.error(`[bot] lifecycle report '${s}' rejected`);
-      });
-      return reportChain;
+      // Resolves true when the control plane accepted the event, false when it refused it. The refusal is
+      // logged here; the caller decides whether a refused one-shot may be retried.
+      const sent = reportChain.then(() => emit(s, extra)).then(
+        () => true,
+        () => {
+          console.error(`[bot] lifecycle report '${s}' rejected`);
+          return false;
+        },
+      );
+      reportChain = sent.then(() => undefined);
+      return sent;
     };
     // Subscribe to the command bus BEFORE the join race (#889). A user Stop is delivered as a `leave`
     // command on the bot's channel; when it arrives while the bot is still knocking in the lobby, the

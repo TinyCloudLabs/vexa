@@ -157,7 +157,12 @@ export function createBrowserJoinDriver(
               // never interfere with the state report it accompanies.
               try { if (s === 'awaiting_admission') timer.markLobby(); } catch { /* fail-open */ }
               const rep = stateReport(s, detail);
-              if (rep) void report(rep.status, rep.extra);
+              if (!rep) return undefined;
+              // needs_human_help is the one-shot escalation: its acceptance decides whether the join layer
+              // may consider it recorded, so the report is returned instead of fire-and-forgotten.
+              if (s === 'needs_human_help') return report(rep.status, rep.extra);
+              void report(rep.status, rep.extra);
+              return undefined;
             },
           },
         });
