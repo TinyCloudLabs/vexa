@@ -951,6 +951,71 @@ async function main(): Promise<void> {
       JSON.stringify(seq(lc.events)));
     check('lobby escalation: reason carried', lc.events.find((e) => e.status === 'needs_help')?.escalation_reason === 'waiting_room_timeout_approaching');
   }
+  // ── needs_help delivery result: a refused POST is not counted as delivered; a delivered one latches ──
+  {
+    const events: LifecycleEvent[] = [];
+    let refusals = 1; // the control plane refuses the first needs_help POST, then accepts
+    const lc = {
+      events,
+      async emit(e: LifecycleEvent): Promise<boolean> {
+        events.push(e);
+        if (e.status !== 'needs_help') return true;
+        if (refusals > 0) { refusals -= 1; return false; }
+        return true;
+      },
+    };
+    const outcomes: boolean[] = [];
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          await report('awaiting_admission');
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 60_000,
+    });
+    await o.run();
+    check('needs_help refused: first report resolves false (one-shot stays unset)', outcomes[0] === false, JSON.stringify(outcomes));
+    check('needs_help refused: retry resolves true once accepted', outcomes[1] === true, JSON.stringify(outcomes));
+    check('needs_help delivered: repeat report is a no-op true', outcomes[2] === true, JSON.stringify(outcomes));
+    check('needs_help delivered: exactly two needs_help POSTs (refused, then accepted; no third)',
+      events.filter((e) => e.status === 'needs_help').length === 2,
+      JSON.stringify(seq(events)));
+  }
+  // ── a held joining escalation is not yet delivered: its report resolves false ──
+  {
+    const lc = recordingSink();
+    let held: boolean | undefined;
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          held = await report('needs_help', { escalation_reason: 'consent_text' });
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 60_000,
+    });
+    await o.run();
+    check('held joining escalation: report resolves false (not delivered yet)', held === false, String(held));
+    check('held joining escalation: no needs_help POST before the gate', !seq(lc.events).includes('needs_help'), JSON.stringify(seq(lc.events)));
+  }
   // ── escalation reason set: closed, with unknown as the fallback ──
   {
     check('escalation reason: unknown is part of the closed set', ESCALATION_REASON_CODES.includes('unknown'));

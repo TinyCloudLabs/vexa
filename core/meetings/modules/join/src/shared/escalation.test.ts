@@ -24,6 +24,15 @@ setHooks({
   },
 });
 
+// A run that never settles must fail, not exit 0 with the event loop empty.
+let finished = false;
+process.on('exit', (code) => {
+  if (!finished && code === 0) {
+    console.error('escalation tests: did not complete');
+    process.exit(1);
+  }
+});
+
 async function main(): Promise<void> {
   resetEscalation();
   calls = 0;
@@ -58,9 +67,8 @@ async function main(): Promise<void> {
   respond = () => gate.promise;
   const first = triggerEscalation({}, 'concurrent');
   const second = triggerEscalation({}, 'concurrent');
-  await second;
   gate.resolve(false);
-  await first;
+  await Promise.all([first, second]);
   check('trigger while in flight is not re-sent', calls === 1, `calls=${calls}`);
   check('in-flight refusal leaves the flag unset', !wasEscalationTriggered());
   respond = () => true;
@@ -70,6 +78,7 @@ async function main(): Promise<void> {
 
 main().then(
   () => {
+    finished = true;
     if (failures > 0) {
       console.log(`${failures} check(s) failed`);
       process.exit(1);
@@ -77,6 +86,7 @@ main().then(
     console.log('escalation tests: all checks passed');
   },
   (e: unknown) => {
+    finished = true;
     console.error(e);
     process.exit(1);
   },

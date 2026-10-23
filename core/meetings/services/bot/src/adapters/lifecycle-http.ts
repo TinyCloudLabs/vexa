@@ -76,7 +76,9 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
   const attempts = Math.max(1, retries);
   const reachAttempts = Math.max(1, reachRetries);
 
-  async function emit(event: LifecycleEvent): Promise<void> {
+  // Resolves true once a 2xx is received, false when the event was not delivered (every attempt
+  // failed or the deadline passed). Never throws: a failed POST must not crash the bot.
+  async function emit(event: LifecycleEvent): Promise<boolean> {
     const body = JSON.stringify(event);
     const deadline = Date.now() + Math.max(1, emitTimeoutMs);
     let lastCode: 'http_error' | 'network_error' | 'timeout' = 'timeout';
@@ -89,7 +91,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
       const timeout = setTimeout(() => controller.abort(), remainingMs);
       try {
         const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
-        if (res.ok) return; // 2xx — delivered
+        if (res.ok) return true; // 2xx — delivered
         lastCode = 'http_error';
       } catch {
         lastCode = 'network_error';
@@ -106,6 +108,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     console.error(
       `[bot] lifecycle.v1 ${event.status} POST failed code=${lastCode} attempts=${attempted} timeout_ms=${emitTimeoutMs}`,
     );
+    return false;
   }
 
   // The reachability gate's first-emit probe (#530). Emits the (joining) event AND reports whether

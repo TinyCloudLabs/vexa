@@ -234,9 +234,11 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   let joinStartedAt: number | undefined;
   let reachedLobby = false;
   let pendingNeedsHelp: NodeJS.Timeout | undefined;
+  // Set once the control plane has accepted needs_help; a later report is a no-op success.
+  let needsHelpDelivered = false;
   const eventTime = (): string => deps.now?.() ?? new Date().toISOString();
 
-  const emit = async (status: BotStatus, extra: Partial<LifecycleEvent> = {}): Promise<void> => {
+  const emit = async (status: BotStatus, extra: Partial<LifecycleEvent> = {}): Promise<boolean> => {
     if (status !== cur && !canTransition(cur, status)) {
       throw new Error(`lifecycle.v1: illegal transition ${cur} → ${status}`);
     }
@@ -257,7 +259,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (isTerminal(status) && deps.degraded) {
       try { degraded = deps.degraded(); } catch { degraded = undefined; }
     }
-    await deps.lifecycle.emit({
+    const delivered = await deps.lifecycle.emit({
       ...base,
       status,
       timestamp: extra.timestamp ?? eventTime(),
@@ -265,6 +267,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       ...(degraded ?? {}),
       ...(resources ? { bot_resources: resources } : {}),
     });
+    return delivered !== false;
   };
 
   // The load-bearing FIRST emit (#530). `cur` is already `joining` (the initial state), so this
@@ -495,8 +498,10 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // than silently dropping it.
     let reportChain: Promise<void> = Promise.resolve();
     const report = (s: BotStatus, extra: Pick<LifecycleEvent, 'escalation_reason'> = {}): Promise<boolean> => {
+      if (s === 'needs_help' && needsHelpDelivered) return Promise.resolve(true);
       // A joining-state escalation is held until the gate, so a transient early block does not reach the
-      // control plane as needs_help. A held report is delivered at the gate if the bot is still pre-active.
+      // control plane as needs_help. Held means not yet delivered (false): the caller keeps its one-shot
+      // unset, and the gate timer delivers it if the bot is still pre-active.
       if (s === 'needs_help' && cur === 'joining' && joinStartedAt !== undefined) {
         const gateMs = deps.needsHelpGateMs ?? NEEDS_HELP_EARLIEST_WHILE_JOINING_MS;
         const waitMs = joinStartedAt + gateMs - Date.now();
@@ -505,13 +510,17 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
             pendingNeedsHelp = undefined;
             if (cur === 'joining' || cur === 'awaiting_admission') void report('needs_help', extra);
           }, waitMs);
-          return reportChain.then(() => true);
+          return Promise.resolve(false);
         }
       }
-      // Resolves true when the control plane accepted the event, false when it refused it. The refusal is
-      // logged here; the caller decides whether a refused one-shot may be retried.
+      // Resolves true only when the control plane accepted the event. A refused, rejected, or undelivered
+      // event resolves false, and the caller keeps any one-shot unset so the next check retries it.
       const sent = reportChain.then(() => emit(s, extra)).then(
-        () => true,
+        (delivered) => {
+          if (!delivered) console.error(`[bot] lifecycle report '${s}' not delivered`);
+          if (s === 'needs_help' && delivered) needsHelpDelivered = true;
+          return delivered;
+        },
         () => {
           console.error(`[bot] lifecycle report '${s}' rejected`);
           return false;

@@ -241,9 +241,23 @@ _STATUS_TO_FAILURE_STAGE: Dict[Optional[BotStatus], FailureStage] = {
     None: FailureStage.REQUESTED,
     BotStatus.JOINING: FailureStage.JOINING,
     BotStatus.AWAITING_ADMISSION: FailureStage.AWAITING_ADMISSION,
-    BotStatus.NEEDS_HELP: FailureStage.AWAITING_ADMISSION,
     BotStatus.ACTIVE: FailureStage.ACTIVE,
 }
+
+
+def _failure_stage_for(frm: Optional[BotStatus], history: List[BotStatus]) -> FailureStage:
+    """The FailureStage a record in state `frm` terminates `failed` with.
+
+    `needs_help` has no stage of its own: it keeps the stage it was ENTERED from. A
+    `joining -> needs_help` escalation is still a join failure (the bot never reached the
+    waiting room); `awaiting_admission -> needs_help` stays `awaiting_admission`. The entry
+    state is read from the record's own history, not the payload (FM-003).
+    """
+    if frm is BotStatus.NEEDS_HELP:
+        if BotStatus.AWAITING_ADMISSION in history:
+            return FailureStage.AWAITING_ADMISSION
+        return FailureStage.JOINING
+    return _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
 
 
 def can_transition(frm: Optional[BotStatus], to: BotStatus) -> bool:
@@ -656,7 +670,7 @@ class LifecycleSink:
             rec.completion_reason = self._terminal_reason(rec, event)
         elif to is BotStatus.FAILED:
             # FM-003: derive failure_stage from the stage we were IN, not the payload.
-            rec.failure_stage = _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
+            rec.failure_stage = _failure_stage_for(frm, rec.history)
             rec.completion_reason = self._terminal_reason(rec, event)
             # The parent builds an `error_details` string on a failed exit when none supplied.
             if rec.error_details is None and (rec.exit_code is not None or rec.reason):

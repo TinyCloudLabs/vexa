@@ -34,7 +34,8 @@ async function main(): Promise<void> {
     const calls: Recorded[] = [];
     const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: true, status: 200 }; };
     const sink = createHttpLifecycleSink({ callbackUrl: 'http://meeting-api:8080/runtime/callback', internalSecret: 'SECRET', fetchImpl, sleep: noSleep });
-    await sink.emit(EVENT);
+    const delivered = await sink.emit(EVENT);
+    check('happy: 2xx resolves delivered=true', delivered === true, String(delivered));
     check('happy: exactly one POST', calls.length === 1, String(calls.length));
     check('happy: hits callbackUrl', calls[0]?.url === 'http://meeting-api:8080/runtime/callback', calls[0]?.url);
     check('happy: method POST', calls[0]?.method === 'POST', calls[0]?.method);
@@ -78,8 +79,10 @@ async function main(): Promise<void> {
     const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); throw new Error('network down'); };
     const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 3, sleep: noSleep });
     let threw = false;
-    try { await sink.emit(EVENT); } catch { threw = true; }
+    let delivered: boolean | void | undefined;
+    try { delivered = await sink.emit(EVENT); } catch { threw = true; }
     check('permanent: emit did NOT throw (bot does not crash)', threw === false);
+    check('permanent: undelivered resolves false', delivered === false, String(delivered));
     check('permanent: gave up after exactly `retries` attempts', calls.length === 3, String(calls.length));
   }
 
@@ -107,8 +110,10 @@ async function main(): Promise<void> {
     const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 503 }; };
     const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 2, sleep: noSleep });
     let threw = false;
-    try { await sink.emit(EVENT); } catch { threw = true; }
+    let delivered: boolean | void | undefined;
+    try { delivered = await sink.emit(EVENT); } catch { threw = true; }
     check('permanent-5xx: emit did NOT throw', threw === false);
+    check('permanent-5xx: undelivered resolves false', delivered === false, String(delivered));
     check('permanent-5xx: bounded to `retries` attempts', calls.length === 2, String(calls.length));
   }
 

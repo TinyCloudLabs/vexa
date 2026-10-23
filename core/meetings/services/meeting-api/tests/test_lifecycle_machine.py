@@ -151,3 +151,37 @@ def test_unrecognised_escalation_reason_is_stored_as_unknown():
     })
     assert rec.escalation_reason == "unknown"
     assert rec.data["escalation_reason"] == "unknown"
+
+
+def test_needs_help_from_joining_fails_as_join_not_admission():
+    """joining -> needs_help -> failed, through the real receiver: the join stage is kept.
+
+    A pre-lobby escalation that later fails must not be filed under awaiting_admission, or the
+    evidence reads as a host who never admitted the bot (awaiting_admission_timeout -> host_action).
+    """
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-attr-1", "status": "joining"})
+    sink.apply({"connection_id": "c-attr-1", "status": "needs_help", "escalation_reason": "consent_text"})
+    rec = sink.apply({"connection_id": "c-attr-1", "status": "failed", "reason": "escalation_expired"})
+
+    assert rec.status is BotStatus.FAILED
+    assert rec.failure_stage is FailureStage.JOINING
+    evidence = rec.join_evidence
+    assert evidence is not None
+    assert evidence["stage"] == "joining"
+    assert evidence["reason"] != "awaiting_admission_timeout"
+    assert evidence["attribution"] != "host_action"
+
+
+def test_needs_help_from_awaiting_admission_keeps_admission_stage():
+    """joining -> awaiting_admission -> needs_help -> failed keeps AWAITING_ADMISSION."""
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-attr-2", "status": "joining"})
+    sink.apply({"connection_id": "c-attr-2", "status": "awaiting_admission"})
+    sink.apply({"connection_id": "c-attr-2", "status": "needs_help", "escalation_reason": "modal_dialog"})
+    rec = sink.apply({"connection_id": "c-attr-2", "status": "failed", "reason": "escalation_expired"})
+
+    assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
+    assert rec.join_evidence is not None
+    assert rec.join_evidence["stage"] == "awaiting_admission"
+    assert rec.join_evidence["reason"] == "awaiting_admission_timeout"

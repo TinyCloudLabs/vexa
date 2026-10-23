@@ -126,7 +126,9 @@ export type PrimaryReachability = 'reachable' | 'unreachable';
 /** lifecycle.v1 egress — the orchestrator emits one status report per transition. The real
  *  adapter POSTs to meeting-api's callback; the L2 fake records the sequence to assert. */
 export interface LifecycleSink {
-  emit(event: LifecycleEvent): Promise<void>;
+  /** Resolves `false` when the event was not delivered to the control plane. Void-returning sinks
+   *  (self-host, test fakes) count as delivered. */
+  emit(event: LifecycleEvent): Promise<void | boolean>;
   /** Emit the LOAD-BEARING first `joining` event AND report whether the primary control-plane
    *  channel is reachable — the reachability gate (#530, P18). Reachable ⇒ the orchestrator
    *  proceeds with ZERO added latency (the secondary channel is never probed). OPTIONAL: sinks
