@@ -8,7 +8,7 @@
  * Run: tsx src/join-driver.test.ts
  */
 import { AdmissionError, AuthSessionError, TeamsJoinRedirectError, TEAMS_AUTH_REDIRECT } from '@vexa/join';
-import { admissionOutcomeToJoinOutcome, createBrowserJoinDriver } from './join-driver.js';
+import { admissionOutcomeToJoinOutcome, createBrowserJoinDriver, stateReport } from './join-driver.js';
 import { EventEmitter } from 'node:events';
 import type { Page } from '@vexa/remote-browser';
 import type { Invocation } from './config.js';
@@ -84,6 +84,18 @@ for (const event of ['crash', 'close'] as const) {
   const err = await driver.join(() => {}, { signal: AbortSignal.abort() }).then(() => null, (e: unknown) => e);
   check('an aborted join signal reaches the brick: rejects', (err as Error | null)?.name === 'AbortError');
   check('…without navigating', gotos === 0);
+}
+
+// ── a needs_help state report carries its escalation reason as an enumerated code ──
+{
+  const enumerated = stateReport('needs_human_help', { reason: 'consent_text' });
+  check('needs_help: an enumerated reason passes through', enumerated?.status === 'needs_help' && enumerated.extra?.escalation_reason === 'consent_text');
+  const freeText = stateReport('needs_human_help', { reason: 'Some free text describing the page' });
+  check('needs_help: free-text reason is sent as unknown', freeText?.status === 'needs_help' && freeText.extra?.escalation_reason === 'unknown');
+  const missing = stateReport('blocked', undefined);
+  check('needs_help: a blocked state with no reason is sent as unknown', missing?.status === 'needs_help' && missing.extra?.escalation_reason === 'unknown');
+  check('awaiting_admission carries no escalation field', stateReport('awaiting_admission')?.extra === undefined);
+  check('joining is not a bot-status transition', stateReport('joining') === null);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

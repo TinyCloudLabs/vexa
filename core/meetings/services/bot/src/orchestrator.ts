@@ -7,6 +7,7 @@
  * lifecycle.v1 sequence conforms to the schema + state machine.
  *
  *   joining ─► [join driver: awaiting_admission ─(needs_help)─► active] ─► pipeline.start
+ *   needs_help is also legal from joining; an early one is held until NEEDS_HELP_EARLIEST_WHILE_JOINING_MS.
  *           ─► subscribe acts ─► await end ─► leave ─► completed
  *
  * End signals while active: an acts.v1 `leave` (→ stopped), host removal (→ evicted), or a
@@ -70,6 +71,9 @@ export interface OrchestratorDeps {
   now?: () => string;
   /** Container resource evidence sampled at terminal emission, before browser cleanup. */
   resources?: () => LifecycleEvent['bot_resources'];
+  /** Window after join start during which a joining-state `needs_help` is held. Tests shorten it;
+   *  production uses NEEDS_HELP_EARLIEST_WHILE_JOINING_MS. */
+  needsHelpGateMs?: number;
 }
 
 /** The dedicated non-zero exit code for a pre-join control-plane-unreachable abort (#530). On
@@ -198,6 +202,10 @@ export function pipelineStopBudgetMs(fromSignal: boolean, override?: number): nu
   return override ?? (fromSignal ? DEFAULT_PIPELINE_STOP_MS : DEFAULT_TRANSCRIPT_DRAIN_MS);
 }
 
+/** The earliest point (from join start) at which a `needs_help` raised while still `joining` is sent.
+ *  An earlier joining-state escalation is held, not dropped, until this point. */
+export const NEEDS_HELP_EARLIEST_WHILE_JOINING_MS = 240_000;
+
 /** Required ports — missing any of these used to surface as a raw TypeError deep in `run()`. */
 const REQUIRED_PORTS = ['lifecycle', 'join', 'pipeline', 'acts', 'aloneness'] as const;
 
@@ -222,13 +230,24 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   const recordingKey = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
 
   let cur: BotStatus = 'joining';
+  /** Stamped when the join begins; a joining-state escalation is held until the gate after it. */
+  let joinStartedAt: number | undefined;
+  let reachedLobby = false;
+  let pendingNeedsHelp: NodeJS.Timeout | undefined;
+  // Set once the control plane has accepted needs_help; a later report is a no-op success.
+  let needsHelpDelivered = false;
   const eventTime = (): string => deps.now?.() ?? new Date().toISOString();
 
-  const emit = async (status: BotStatus, extra: Partial<LifecycleEvent> = {}): Promise<void> => {
+  const emit = async (status: BotStatus, extra: Partial<LifecycleEvent> = {}): Promise<boolean> => {
     if (status !== cur && !canTransition(cur, status)) {
       throw new Error(`lifecycle.v1: illegal transition ${cur} → ${status}`);
     }
     cur = status;
+    if (status === 'awaiting_admission') reachedLobby = true;
+    if (pendingNeedsHelp && (status === 'active' || isTerminal(status))) {
+      clearTimeout(pendingNeedsHelp);
+      pendingNeedsHelp = undefined;
+    }
     // A terminal event is the LAST thing anyone hears from this bot — if the meeting was degraded,
     // it says so here or the reason dies with the container. A reporter fault must never change the
     // exit path (P18: report, but never at the cost of the report itself).
@@ -240,7 +259,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (isTerminal(status) && deps.degraded) {
       try { degraded = deps.degraded(); } catch { degraded = undefined; }
     }
-    await deps.lifecycle.emit({
+    const delivered = await deps.lifecycle.emit({
       ...base,
       status,
       timestamp: extra.timestamp ?? eventTime(),
@@ -248,6 +267,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       ...(degraded ?? {}),
       ...(resources ? { bot_resources: resources } : {}),
     });
+    return delivered !== false;
   };
 
   // The load-bearing FIRST emit (#530). `cur` is already `joining` (the initial state), so this
@@ -477,11 +497,37 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // when the driver fire-and-forgets, and SURFACE a contract-illegal transition (log) rather
     // than silently dropping it.
     let reportChain: Promise<void> = Promise.resolve();
-    const report = (s: BotStatus): Promise<void> => {
-      reportChain = reportChain.then(() => emit(s)).catch((e) => {
-        console.error(`[bot] lifecycle report '${s}' rejected`);
-      });
-      return reportChain;
+    const report = (s: BotStatus, extra: Pick<LifecycleEvent, 'escalation_reason'> = {}): Promise<boolean> => {
+      if (s === 'needs_help' && needsHelpDelivered) return Promise.resolve(true);
+      // A joining-state escalation is held until the gate, so a transient early block does not reach the
+      // control plane as needs_help. Held means not yet delivered (false): the caller keeps its one-shot
+      // unset, and the gate timer delivers it if the bot is still pre-active.
+      if (s === 'needs_help' && cur === 'joining' && joinStartedAt !== undefined) {
+        const gateMs = deps.needsHelpGateMs ?? NEEDS_HELP_EARLIEST_WHILE_JOINING_MS;
+        const waitMs = joinStartedAt + gateMs - Date.now();
+        if (waitMs > 0) {
+          pendingNeedsHelp ??= setTimeout(() => {
+            pendingNeedsHelp = undefined;
+            if (cur === 'joining' || cur === 'awaiting_admission') void report('needs_help', extra);
+          }, waitMs);
+          return Promise.resolve(false);
+        }
+      }
+      // Resolves true only when the control plane accepted the event. A refused, rejected, or undelivered
+      // event resolves false, and the caller keeps any one-shot unset so the next check retries it.
+      const sent = reportChain.then(() => emit(s, extra)).then(
+        (delivered) => {
+          if (!delivered) console.error(`[bot] lifecycle report '${s}' not delivered`);
+          if (s === 'needs_help' && delivered) needsHelpDelivered = true;
+          return delivered;
+        },
+        () => {
+          console.error(`[bot] lifecycle report '${s}' rejected`);
+          return false;
+        },
+      );
+      reportChain = sent.then(() => undefined);
+      return sent;
     };
     // Subscribe to the command bus BEFORE the join race (#889). A user Stop is delivered as a `leave`
     // command on the bot's channel; when it arrives while the bot is still knocking in the lobby, the
@@ -493,6 +539,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     let outcome: JoinOutcome;
     let joinSignals: JoinSignals | undefined;
     try {
+      joinStartedAt = Date.now();
       // Race the (possibly long, lobby-blocked) join against a pre-active abort. A stop/SIGTERM in the
       // waiting room resolves `aborted` → we stop waiting, WITHDRAW the join request, and terminate —
       // rather than SIGKILLing a bot that is still asking to join (the waiting-room orphan). The race
@@ -546,13 +593,13 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       unsubscribe();
       // ALWAYS stamp a terminal reason, but only from the closed stage/code vocabulary. A driver's
       // message may contain arbitrary platform text and must not become durable meeting state.
-      const reasonText = terminalDetail(cur === 'awaiting_admission' || cur === 'needs_help' ? 'awaiting_admission' : 'joining', `join_${outcome}`);
+      const reasonText = terminalDetail(reachedLobby ? 'awaiting_admission' : 'joining', `join_${outcome}`);
       // The stage is DERIVED from where the bot actually got to, not stamped `awaiting_admission`
       // regardless (which it used to be, and which claims a lobby the bot may never have seen). The
       // control plane re-derives it server-side anyway (FM-003), so a truthful payload simply stops
       // the two from disagreeing — and it is the field the taxonomy reads to tell a lobby expiry
       // from a bot that never got there, the exact conflation #1058 measured.
-      const stage = cur === 'awaiting_admission' || cur === 'needs_help' ? 'awaiting_admission' : 'joining';
+      const stage = reachedLobby ? 'awaiting_admission' : 'joining';
       await emit('failed', {
         failure_stage: stage, completion_reason: reason, reason: reasonText, exit_code: 1,
         ...joinEvidenceFor(outcome, stage, joinSignals, reasonText),

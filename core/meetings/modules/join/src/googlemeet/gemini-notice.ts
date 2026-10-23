@@ -329,7 +329,7 @@ export type GeminiNoticeOutcome = "absent" | "clicked" | "exhausted";
  * If the page shows the post-admission notice, press its "Join now" (the sanctioned exception above).
  * Emits `join.gemini_notice_handled` per click attempt (sanitizer-allowlisted JSON; `success` = the click
  * was delivered, `attempt` = 1-based). After GEMINI_NOTICE_MAX_CLICKS attempts with the notice still up,
- * escalates once to needs_human_help (reason `gemini_notice`) instead of clicking forever.
+ * escalates once to needs_human_help (reason `modal_dialog`) instead of clicking forever.
  * The caller re-checks admission afterwards; this never decides admission itself.
  */
 export async function handleGeminiNotice(page: Page, botConfig: BotConfig): Promise<GeminiNoticeOutcome> {
@@ -341,7 +341,7 @@ export async function handleGeminiNotice(page: Page, botConfig: BotConfig): Prom
     if (state.attempts >= GEMINI_NOTICE_MAX_CLICKS) {
       if (!state.escalated) {
         state.escalated = true;
-        await triggerEscalation(botConfig, "gemini_notice");
+        await triggerEscalation(botConfig, "modal_dialog");
       }
       return "exhausted";
     }

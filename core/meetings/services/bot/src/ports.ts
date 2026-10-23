@@ -69,7 +69,7 @@ export interface JoinDriver {
   /** Join + await admission. `report` fires on each intermediate lifecycle state
    *  (awaiting_admission / needs_help / active). Resolves with the verdict — a bare `JoinOutcome`
    *  or a `JoinResult` that also carries the failure's human reason text (#926). */
-  join(report: (s: BotStatus) => void | Promise<void>, options?: { signal?: AbortSignal }): Promise<JoinOutcome | JoinResult>;
+  join(report: (s: BotStatus, extra?: Pick<LifecycleEvent, 'escalation_reason'>) => void | Promise<void | boolean>, options?: { signal?: AbortSignal }): Promise<JoinOutcome | JoinResult>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
   /** Unexpected loss of the meeting page; detach before deliberately closing it. */
@@ -126,7 +126,9 @@ export type PrimaryReachability = 'reachable' | 'unreachable';
 /** lifecycle.v1 egress — the orchestrator emits one status report per transition. The real
  *  adapter POSTs to meeting-api's callback; the L2 fake records the sequence to assert. */
 export interface LifecycleSink {
-  emit(event: LifecycleEvent): Promise<void>;
+  /** Resolves `false` when the event was not delivered to the control plane. Void-returning sinks
+   *  (self-host, test fakes) count as delivered. */
+  emit(event: LifecycleEvent): Promise<void | boolean>;
   /** Emit the LOAD-BEARING first `joining` event AND report whether the primary control-plane
    *  channel is reachable — the reachability gate (#530, P18). Reachable ⇒ the orchestrator
    *  proceeds with ZERO added latency (the secondary channel is never probed). OPTIONAL: sinks

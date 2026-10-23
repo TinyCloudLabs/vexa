@@ -119,3 +119,118 @@ def test_first_event_must_be_joining(goldens):
         sink.apply(goldens["active"])  # None → active
     assert exc.value.frm is None
     assert exc.value.to is BotStatus.ACTIVE
+
+
+# --- joining -> needs_help and the escalation reason -------------------------------------
+
+def test_joining_may_escalate_to_needs_help_but_not_back():
+    assert can_transition(BotStatus.JOINING, BotStatus.NEEDS_HELP)
+    assert not can_transition(BotStatus.NEEDS_HELP, BotStatus.JOINING)
+
+
+def test_needs_help_from_joining_is_applied_with_its_reason():
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-esc-1", "status": "joining"})
+    rec = sink.apply({
+        "connection_id": "c-esc-1",
+        "status": "needs_help",
+        "escalation_reason": "consent_text",
+    })
+    assert rec.status is BotStatus.NEEDS_HELP
+    assert rec.escalation_reason == "consent_text"
+    assert rec.data["escalation_reason"] == "consent_text"
+
+
+def test_unrecognised_escalation_reason_is_stored_as_unknown():
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-esc-2", "status": "joining"})
+    rec = sink.apply({
+        "connection_id": "c-esc-2",
+        "status": "needs_help",
+        "escalation_reason": "free text describing the page",
+    })
+    assert rec.escalation_reason == "unknown"
+    assert rec.data["escalation_reason"] == "unknown"
+
+
+def test_needs_help_from_joining_fails_as_join_not_admission():
+    """joining -> needs_help -> failed, through the real receiver: the join stage is kept.
+
+    A pre-lobby escalation that later fails must not be filed under awaiting_admission, or the
+    evidence reads as a host who never admitted the bot (awaiting_admission_timeout -> host_action).
+    """
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-attr-1", "status": "joining"})
+    sink.apply({"connection_id": "c-attr-1", "status": "needs_help", "escalation_reason": "consent_text"})
+    rec = sink.apply({"connection_id": "c-attr-1", "status": "failed", "reason": "escalation_expired"})
+
+    assert rec.status is BotStatus.FAILED
+    assert rec.failure_stage is FailureStage.JOINING
+    evidence = rec.join_evidence
+    assert evidence is not None
+    assert evidence["stage"] == "joining"
+    assert evidence["reason"] != "awaiting_admission_timeout"
+    assert evidence["attribution"] != "host_action"
+
+
+def test_needs_help_from_awaiting_admission_keeps_admission_stage():
+    """joining -> awaiting_admission -> needs_help -> failed keeps AWAITING_ADMISSION."""
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply({"connection_id": "c-attr-2", "status": "joining"})
+    sink.apply({"connection_id": "c-attr-2", "status": "awaiting_admission"})
+    sink.apply({"connection_id": "c-attr-2", "status": "needs_help", "escalation_reason": "modal_dialog"})
+    rec = sink.apply({"connection_id": "c-attr-2", "status": "failed", "reason": "escalation_expired"})
+
+    assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
+    assert rec.join_evidence is not None
+    assert rec.join_evidence["stage"] == "awaiting_admission"
+    assert rec.join_evidence["reason"] == "awaiting_admission_timeout"
+
+
+def _escalate_then_fail_after_restart(conn_id: str, entry: list[str]):
+    """Escalate on the live path, persist the record's data, then fail it on a FRESH store.
+
+    The fresh store stands in for a restarted API process: the record is rebuilt only from the
+    persisted DB status and `data`, exactly as `rehydrate` is called on the callback path.
+    """
+    live = LifecycleSink(store=MeetingStore())
+    for status in entry:
+        live.apply({"connection_id": conn_id, "status": status})
+    escalated = live.apply({"connection_id": conn_id, "status": "needs_help", "escalation_reason": "consent_text"})
+    persisted = dict(escalated.data)
+    expected = live.apply({"connection_id": conn_id, "status": "failed", "reason": "escalation_expired"})
+
+    restarted = MeetingStore()
+    restarted.rehydrate(conn_id, "needs_help", persisted)
+    rehydrated = LifecycleSink(store=restarted).apply(
+        {"connection_id": conn_id, "status": "failed", "reason": "escalation_expired"},
+    )
+    return expected, rehydrated
+
+
+def test_rehydrated_needs_help_from_joining_keeps_join_attribution():
+    expected, rehydrated = _escalate_then_fail_after_restart("c-rehy-1", ["joining"])
+
+    assert rehydrated.failure_stage is FailureStage.JOINING
+    assert rehydrated.failure_stage is expected.failure_stage
+    assert rehydrated.join_evidence == expected.join_evidence
+
+
+def test_rehydrated_needs_help_from_awaiting_admission_keeps_admission_attribution():
+    expected, rehydrated = _escalate_then_fail_after_restart("c-rehy-2", ["joining", "awaiting_admission"])
+
+    assert rehydrated.failure_stage is FailureStage.AWAITING_ADMISSION
+    assert rehydrated.failure_stage is expected.failure_stage
+    assert rehydrated.join_evidence is not None
+    assert rehydrated.join_evidence["stage"] == "awaiting_admission"
+    assert rehydrated.join_evidence == expected.join_evidence
+
+
+def test_rehydrated_needs_help_with_empty_trail_falls_back_to_base_admission_stage():
+    restarted = MeetingStore()
+    restarted.rehydrate("c-rehy-3", "needs_help", {"status_transition": []})
+    rehydrated = LifecycleSink(store=restarted).apply(
+        {"connection_id": "c-rehy-3", "status": "failed", "reason": "escalation_expired"},
+    )
+
+    assert rehydrated.failure_stage is FailureStage.AWAITING_ADMISSION

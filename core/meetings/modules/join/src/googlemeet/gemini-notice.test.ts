@@ -22,7 +22,7 @@
  *      pre-admission `take notes for me` consent text, or with unrelated text is NEVER clicked, and the
  *      pre-admission consent hold is intact.
  *   4. If the click does nothing the bot gives up after 3 attempts and escalates (needs_human_help
- *      `gemini_notice`) instead of clicking forever.
+ *      `modal_dialog`) instead of clicking forever.
  *
  * Fixture honesty: the dialog subtrees are captured; the call chrome around them (tile, toolbar) is a minimal
  * stand-in consistent with the captured page text. jsdom supplies the real CSS engine; the Page adapter below
@@ -390,7 +390,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
   {
     const d = withDialog(`<div role="alertdialog"><h2>${REC}</h2><button>Leave</button><button>Join now</button></div>`);
     const run = await runWait(d, undefined, 1_000);
-    check('alertdialog notice → zero clicks and escalated gemini_notice', d.clicks.length === 0 && run.helpReasons.join(',') === 'gemini_notice', true);
+    check('alertdialog notice → zero clicks and escalated modal_dialog', d.clicks.length === 0 && run.helpReasons.join(',') === 'modal_dialog', true);
   }
   {
     const pill = `<div role="status">Gemini is taking notes</div>`;
@@ -447,7 +447,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     const run = await runWait(d);
     check(`${name} → wait never resolves admitted`, run.result === true, false);
     check(`${name} → never clicked`, d.clicks.length, 0);
-    check(`${name} → escalated once as unknown_blocking_dialog`, run.helpReasons.join(','), 'unknown_blocking_dialog');
+    check(`${name} → escalated once as modal_dialog`, run.helpReasons.join(','), 'modal_dialog');
     check(`${name} → emits join.unknown_blocking_dialog event once`, run.unknownDialogEvents, 1);
   }
   console.log('\n  -- non-modal toasts and pills must NOT block (controls) --');
@@ -508,7 +508,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     check('never reports admitted', run.result === true, false);
     check('pressed "Join now" exactly 3 times', d.clicks.join(','), 'join now,join now,join now');
     check('3 handled events, attempts 1..3', JSON.stringify(run.handled.map((e) => e.attempt)), JSON.stringify([1, 2, 3]));
-    check('escalates to needs_human_help with reason gemini_notice, once', run.helpReasons.join(','), 'gemini_notice');
+    check('escalates to needs_human_help with reason modal_dialog, once', run.helpReasons.join(','), 'modal_dialog');
   }
 
   console.log('\n=== the notice is only clicked once the bot is in the call ===');
@@ -541,7 +541,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
     const run = await runWait(d, drive);
     check('late lobby, then an unmatched "taking notes" consent dialog → never clicked', d.clicks.length, 0);
     check('late lobby, then unmatched consent dialog → fails by timeout, not admitted', run.result === 'AdmissionError:join_failure' || run.result === 'AdmissionError:lobby_timeout', true);
-    check('late lobby, then unmatched consent dialog → needs_human_help with reason consent_required', run.helpReasons.join(','), 'consent_required');
+    check('late lobby, then unmatched consent dialog → needs_human_help with reason consent_text', run.helpReasons.join(','), 'consent_text');
   }
   {
     const { d, drive } = lateLobby(`${TOOLBAR}<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>`); // no tile: nothing says admitted
@@ -557,7 +557,7 @@ async function runWait(d: Dom, onWait?: (n: number) => void, budgetMs = 60_000, 
   for (const budget of [1_000, 2_500, 3_999, 4_000]) {
     const blockers: [string, string, string][] = [
       ['unknown dialog', `${TOOLBAR}<div role="dialog"><h2>Something unexpected</h2><button>OK</button></div>`, 'unknown_blocking_state'],
-      ['unmatched "taking notes" consent dialog', callWith(negatives[1][1]), 'consent_required'],
+      ['unmatched "taking notes" consent dialog', callWith(negatives[1][1]), 'consent_text'],
     ];
     for (const [name, page, expected] of blockers) {
       // First poll sees no lobby; the lobby shows up after the first 2 s wait; the blocker replaces it after

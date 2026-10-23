@@ -31,7 +31,7 @@ import { createLivePipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
 import { DEFAULT_LIFECYCLE_EMIT_TIMEOUT_MS } from './adapters/lifecycle-http.js';
 import { DEFAULT_SIGTERM_GRACE_MS } from './signals.js';
-import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
+import { canTransition, ESCALATION_REASON_CODES, toEscalationReasonCode, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, Pipeline, TranscriptSink, PrimaryReachability } from './ports.js';
 import type { Invocation } from './config.js';
 import { noopAloneness, controlledAloneness, noopPipeline, noopActs } from './test-doubles.js';
@@ -846,6 +846,182 @@ async function main(): Promise<void> {
     check('missing port: throws', threw instanceof Error, msg);
     check('missing port: names the port', /required port 'aloneness' is missing/.test(msg), msg);
     check('missing port: not a raw property TypeError', !/Cannot read properties of undefined/.test(msg), msg);
+  }
+  // ── needs_help while joining: held until the gate, then delivered with its enumerated reason ──
+  {
+    const delivered = Promise.withResolvers<void>();
+    const events: LifecycleEvent[] = [];
+    const lc = {
+      events,
+      async emit(e: LifecycleEvent) {
+        events.push(e);
+        if (e.status === 'needs_help') delivered.resolve();
+      },
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          await report('needs_help', { escalation_reason: 'consent_text' });
+          await delivered.promise;
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 40,
+    });
+    const res = await o.run();
+    const esc = events.find((e) => e.status === 'needs_help');
+    check('joining escalation: delivered once the gate passes', seq(events).includes('needs_help'), JSON.stringify(seq(events)));
+    check('joining escalation: event carries the enumerated reason', esc?.escalation_reason === 'consent_text', String(esc?.escalation_reason));
+    check('joining escalation: every transition legal', allLegal(seq(events)));
+    check('joining escalation: every event conforms to lifecycle.v1', allConform(events), ajv.errorsText(validateLifecycle.errors));
+    check('joining escalation: failure stays at the joining stage', last(events).failure_stage === 'joining', String(last(events).failure_stage));
+    check('joining escalation: exits failed', res.status === 'failed');
+  }
+  // ── a held joining escalation is dropped once the bot reaches active ──
+  {
+    const activeSeen = Promise.withResolvers<void>();
+    const events: LifecycleEvent[] = [];
+    let fireLeave: (a: { action: 'leave' }) => void = () => { /* */ };
+    const lc = {
+      events,
+      async emit(e: LifecycleEvent) {
+        events.push(e);
+        if (e.status === 'active') activeSeen.resolve();
+      },
+    };
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          await report('needs_help', { escalation_reason: 'modal_dialog' });
+          await report('awaiting_admission');
+          await report('active');
+          return 'admitted';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs((f) => { fireLeave = f; }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 40,
+    });
+    const runP = o.run();
+    await activeSeen.promise;
+    fireLeave({ action: 'leave' });
+    const res = await runP;
+    // Exception: the gate is a real production timer. Wait past its 40 ms window to prove no late needs_help is emitted.
+    await new Promise((r) => setTimeout(r, 120));
+    check('held escalation: dropped once the bot is active',
+      JSON.stringify(seq(events)) === JSON.stringify(['joining', 'awaiting_admission', 'active', 'completed']),
+      JSON.stringify(seq(events)));
+    check('held escalation: exits completed', res.status === 'completed');
+  }
+  // ── a lobby escalation is not held ──
+  {
+    const lc = recordingSink();
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          await report('awaiting_admission');
+          await report('needs_help', { escalation_reason: 'waiting_room_timeout_approaching' });
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 60_000,
+    });
+    await o.run();
+    check('lobby escalation: delivered immediately, not held',
+      seq(lc.events).includes('needs_help') && last(lc.events).failure_stage === 'awaiting_admission',
+      JSON.stringify(seq(lc.events)));
+    check('lobby escalation: reason carried', lc.events.find((e) => e.status === 'needs_help')?.escalation_reason === 'waiting_room_timeout_approaching');
+  }
+  // ── needs_help delivery result: a refused POST is not counted as delivered; a delivered one latches ──
+  {
+    const events: LifecycleEvent[] = [];
+    let refusals = 1; // the control plane refuses the first needs_help POST, then accepts
+    const lc = {
+      events,
+      async emit(e: LifecycleEvent): Promise<boolean> {
+        events.push(e);
+        if (e.status !== 'needs_help') return true;
+        if (refusals > 0) { refusals -= 1; return false; }
+        return true;
+      },
+    };
+    const outcomes: boolean[] = [];
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          await report('awaiting_admission');
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          outcomes.push(await report('needs_help', { escalation_reason: 'modal_dialog' }));
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 60_000,
+    });
+    await o.run();
+    check('needs_help refused: first report resolves false (one-shot stays unset)', outcomes[0] === false, JSON.stringify(outcomes));
+    check('needs_help refused: retry resolves true once accepted', outcomes[1] === true, JSON.stringify(outcomes));
+    check('needs_help delivered: repeat report is a no-op true', outcomes[2] === true, JSON.stringify(outcomes));
+    check('needs_help delivered: exactly two needs_help POSTs (refused, then accepted; no third)',
+      events.filter((e) => e.status === 'needs_help').length === 2,
+      JSON.stringify(seq(events)));
+  }
+  // ── a held joining escalation is not yet delivered: its report resolves false ──
+  {
+    const lc = recordingSink();
+    let held: boolean | undefined;
+    const o = createOrchestrator(inv(), {
+      lifecycle: lc,
+      join: {
+        async join(report) {
+          held = await report('needs_help', { escalation_reason: 'consent_text' });
+          return 'error';
+        },
+        onRemoval() { return () => { /* */ }; },
+        async leave() { /* */ },
+        async withdraw() { /* */ },
+      },
+      pipeline: noopPipeline(),
+      acts: noopActs(() => { /* */ }),
+      aloneness: noopAloneness(),
+      needsHelpGateMs: 60_000,
+    });
+    await o.run();
+    check('held joining escalation: report resolves false (not delivered yet)', held === false, String(held));
+    check('held joining escalation: no needs_help POST before the gate', !seq(lc.events).includes('needs_help'), JSON.stringify(seq(lc.events)));
+  }
+  // ── escalation reason set: closed, with unknown as the fallback ──
+  {
+    check('escalation reason: unknown is part of the closed set', ESCALATION_REASON_CODES.includes('unknown'));
+    check('escalation reason: enumerated value passes through unchanged', toEscalationReasonCode('consent_text') === 'consent_text');
+    check('escalation reason: free text becomes unknown', toEscalationReasonCode('free text outside the set') === 'unknown');
+    check('escalation reason: missing value becomes unknown', toEscalationReasonCode(undefined) === 'unknown');
   }
 
   if (failed) { console.error(`\n❌ orchestrator (L2): ${failed} check(s) FAILED.`); process.exit(1); }

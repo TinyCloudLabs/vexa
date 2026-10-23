@@ -10,9 +10,11 @@
  * The composition root builds the live adapter; the test injects a recording/failing fake.
  *
  * Robustness (P14): a lifecycle POST failure must NEVER crash the bot. `emit` retries with a
- * bounded backoff on a network error or a non-2xx response, then logs + gives up — it never
- * throws fatally out of `emit`. (A dropped status report is regrettable but must not strand a
- * seated bot or mask the terminal exit.)
+ * bounded backoff on a network error or a 5xx/409 response; any other 4xx refuses the payload
+ * (the same body cannot succeed), so it is sent once and not retried. `emit` then logs and gives up,
+ * returning `false` so the caller knows the event was not delivered. It never throws fatally out of
+ * `emit`. (A dropped status report is regrettable but must not strand a seated bot or mask the
+ * terminal exit.)
  */
 import type { LifecycleEvent } from '../contracts.js';
 import type { LifecycleSink, PrimaryReachability } from '../ports.js';
@@ -76,7 +78,9 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
   const attempts = Math.max(1, retries);
   const reachAttempts = Math.max(1, reachRetries);
 
-  async function emit(event: LifecycleEvent): Promise<void> {
+  // Resolves true once a 2xx is received, false when the event was not delivered (every attempt
+  // failed or the deadline passed). Never throws: a failed POST must not crash the bot.
+  async function emit(event: LifecycleEvent): Promise<boolean> {
     const body = JSON.stringify(event);
     const deadline = Date.now() + Math.max(1, emitTimeoutMs);
     let lastCode: 'http_error' | 'network_error' | 'timeout' = 'timeout';
@@ -89,8 +93,12 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
       const timeout = setTimeout(() => controller.abort(), remainingMs);
       try {
         const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
-        if (res.ok) return; // 2xx — delivered
+        if (res.ok) return true; // 2xx — delivered
         lastCode = 'http_error';
+        // A needs_help payload the host rejects as malformed (400/422) cannot succeed on resend;
+        // the escalation path's own cooldown governs when it is tried again. Every other failure
+        // (408/425/429/5xx/409, other 4xx) retries as for any lifecycle event.
+        if (event.status === 'needs_help' && (res.status === 400 || res.status === 422)) break;
       } catch {
         lastCode = 'network_error';
       } finally {
@@ -106,6 +114,7 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     console.error(
       `[bot] lifecycle.v1 ${event.status} POST failed code=${lastCode} attempts=${attempted} timeout_ms=${emitTimeoutMs}`,
     );
+    return false;
   }
 
   // The reachability gate's first-emit probe (#530). Emits the (joining) event AND reports whether

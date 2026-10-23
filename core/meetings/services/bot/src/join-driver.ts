@@ -13,7 +13,7 @@ import {
   startGoogleRemovalMonitor, startTeamsRemovalMonitor, startZoomRemovalMonitor, startJitsiRemovalMonitor,
   type JoinState, type Platform as JoinPlatform, type AdmissionOutcome,
 } from '@vexa/join';
-import type { BotStatus } from './contracts.js';
+import { toEscalationReasonCode, type BotStatus, type EscalationReasonCode } from './contracts.js';
 import type { Invocation } from './config.js';
 import type { JoinDriver, JoinOutcome, JoinResult, JoinSignals } from './ports.js';
 
@@ -40,13 +40,20 @@ export function admissionOutcomeToJoinOutcome(outcome: AdmissionOutcome): JoinOu
   }
 }
 
-/** @vexa/join JoinState → lifecycle.v1 BotStatus (null = not a bot-status transition). */
-function mapState(s: JoinState): BotStatus | null {
+/**
+ * @vexa/join JoinState → lifecycle.v1 report (null = not a bot-status transition).
+ * `needs_help` carries its escalation reason as an enumerated code; free text becomes `unknown`.
+ */
+export function stateReport(
+  s: JoinState,
+  detail?: { reason?: unknown },
+): { status: BotStatus; extra?: { escalation_reason: EscalationReasonCode } } | null {
   switch (s) {
-    case 'awaiting_admission': return 'awaiting_admission';
-    case 'admitted':           return 'active';
+    case 'awaiting_admission': return { status: 'awaiting_admission' };
+    case 'admitted':           return { status: 'active' };
     case 'blocked':
-    case 'needs_human_help':   return 'needs_help';
+    case 'needs_human_help':
+      return { status: 'needs_help', extra: { escalation_reason: toEscalationReasonCode(detail?.reason) } };
     default:                   return null;   // 'joining'/'leaving' — orchestrator owns those
   }
 }
@@ -143,14 +150,19 @@ export function createBrowserJoinDriver(
           // the abort re-raises below as a non-AdmissionError throw (TC-903).
           signal: options?.signal,
           hooks: {
-            onState: (s: JoinState) => {
+            onState: (s: JoinState, detail?: { reason?: unknown }) => {
               // Stamp the lobby arrival BEFORE reporting: `report` is fire-and-forget and may be
               // serialized behind an in-flight HTTP callback, so timing it would measure our own
               // callback latency rather than the platform's. Best-effort — a stopwatch fault must
               // never interfere with the state report it accompanies.
               try { if (s === 'awaiting_admission') timer.markLobby(); } catch { /* fail-open */ }
-              const bs = mapState(s);
-              if (bs) void report(bs);
+              const rep = stateReport(s, detail);
+              if (!rep) return undefined;
+              // needs_human_help is the one-shot escalation: its acceptance decides whether the join layer
+              // may consider it recorded, so the report is returned instead of fire-and-forgotten.
+              if (s === 'needs_human_help') return report(rep.status, rep.extra);
+              void report(rep.status, rep.extra);
+              return undefined;
             },
           },
         });
