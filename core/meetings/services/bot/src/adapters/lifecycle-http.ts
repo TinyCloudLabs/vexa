@@ -95,8 +95,10 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
         const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
         if (res.ok) return true; // 2xx — delivered
         lastCode = 'http_error';
-        // A 4xx other than 409 refuses this payload; resending the same body cannot succeed.
-        if (res.status >= 400 && res.status < 500 && res.status !== 409) break;
+        // A needs_help payload the host rejects as malformed (400/422) cannot succeed on resend;
+        // the escalation path's own cooldown governs when it is tried again. Every other failure
+        // (408/425/429/5xx/409, other 4xx) retries as for any lifecycle event.
+        if (event.status === 'needs_help' && (res.status === 400 || res.status === 422)) break;
       } catch {
         lastCode = 'network_error';
       } finally {

@@ -224,3 +224,13 @@ def test_rehydrated_needs_help_from_awaiting_admission_keeps_admission_attributi
     assert rehydrated.join_evidence is not None
     assert rehydrated.join_evidence["stage"] == "awaiting_admission"
     assert rehydrated.join_evidence == expected.join_evidence
+
+
+def test_rehydrated_needs_help_with_empty_trail_falls_back_to_base_admission_stage():
+    restarted = MeetingStore()
+    restarted.rehydrate("c-rehy-3", "needs_help", {"status_transition": []})
+    rehydrated = LifecycleSink(store=restarted).apply(
+        {"connection_id": "c-rehy-3", "status": "failed", "reason": "escalation_expired"},
+    )
+
+    assert rehydrated.failure_stage is FailureStage.AWAITING_ADMISSION

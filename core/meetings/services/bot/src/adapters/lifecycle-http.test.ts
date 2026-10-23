@@ -117,16 +117,55 @@ async function main(): Promise<void> {
     check('permanent-5xx: bounded to `retries` attempts', calls.length === 2, String(calls.length));
   }
 
-  // ── permanent 4xx refusal (422): the same body cannot succeed, so exactly one POST, no backoff ──
-  {
+  // ── needs_help payload rejected (400/422): the same body cannot succeed, so exactly one POST, no backoff ──
+  for (const status of [400, 422]) {
     const calls: Recorded[] = [];
     const sleeps: number[] = [];
-    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 422 }; };
+    const NEEDS_HELP: LifecycleEvent = { connection_id: 'sess-uid', status: 'needs_help', escalation_reason: 'consent_text' };
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status }; };
     const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 5, sleep: async (ms) => { sleeps.push(ms); } });
+    const delivered = await sink.emit(NEEDS_HELP);
+    check(`needs_help-${status}: undelivered resolves false`, delivered === false, String(delivered));
+    check(`needs_help-${status}: exactly one POST (not retried)`, calls.length === 1, String(calls.length));
+    check(`needs_help-${status}: no backoff sleep`, sleeps.length === 0, JSON.stringify(sleeps));
+  }
+
+  // ── transient 4xx on a terminal event stays retryable: 429 retries to `retries` attempts ──
+  {
+    const calls: Recorded[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 429 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 5, sleep: noSleep });
     const delivered = await sink.emit(EVENT);
-    check('refused-4xx: undelivered resolves false', delivered === false, String(delivered));
-    check('refused-4xx: exactly one POST (not retried)', calls.length === 1, String(calls.length));
-    check('refused-4xx: no backoff sleep', sleeps.length === 0, JSON.stringify(sleeps));
+    check('completed-429: undelivered resolves false', delivered === false, String(delivered));
+    check('completed-429: retried to 5 POSTs', calls.length === 5, String(calls.length));
+  }
+
+  // ── 408 and 425 are transient by RFC: retried to `retries` attempts on any event ──
+  for (const status of [408, 425]) {
+    const calls: Recorded[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 3, sleep: noSleep });
+    await sink.emit(EVENT);
+    check(`completed-${status}: retried to 3 POSTs`, calls.length === 3, String(calls.length));
+  }
+
+  // ── a 401/404 on a terminal event may be a deploy or secret rotation: retried like base ──
+  {
+    const calls: Recorded[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 404 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 3, sleep: noSleep });
+    await sink.emit(EVENT);
+    check('completed-404: retried to 3 POSTs', calls.length === 3, String(calls.length));
+  }
+
+  // ── 429 on needs_help is retried (transient); the 30 s escalation cooldown caps the storm ──
+  {
+    const calls: Recorded[] = [];
+    const NEEDS_HELP: LifecycleEvent = { connection_id: 'sess-uid', status: 'needs_help', escalation_reason: 'consent_text' };
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 429 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 5, sleep: noSleep });
+    await sink.emit(NEEDS_HELP);
+    check('needs_help-429: retried to 5 POSTs', calls.length === 5, String(calls.length));
   }
 
   // ── 409 is the one 4xx that stays retryable: all `retries` attempts are made ──

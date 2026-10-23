@@ -272,7 +272,10 @@ def _failure_stage_for(frm: Optional[BotStatus], history: List[BotStatus]) -> Fa
     if frm is BotStatus.NEEDS_HELP:
         if BotStatus.AWAITING_ADMISSION in history:
             return FailureStage.AWAITING_ADMISSION
-        return FailureStage.JOINING
+        if BotStatus.JOINING in history:
+            return FailureStage.JOINING
+        # No entry hop to read (empty or missing trail, e.g. a legacy record): base behaviour.
+        return FailureStage.AWAITING_ADMISSION
     return _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
 
 
