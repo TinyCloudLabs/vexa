@@ -117,6 +117,28 @@ async function main(): Promise<void> {
     check('permanent-5xx: bounded to `retries` attempts', calls.length === 2, String(calls.length));
   }
 
+  // ── permanent 4xx refusal (422): the same body cannot succeed, so exactly one POST, no backoff ──
+  {
+    const calls: Recorded[] = [];
+    const sleeps: number[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 422 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 5, sleep: async (ms) => { sleeps.push(ms); } });
+    const delivered = await sink.emit(EVENT);
+    check('refused-4xx: undelivered resolves false', delivered === false, String(delivered));
+    check('refused-4xx: exactly one POST (not retried)', calls.length === 1, String(calls.length));
+    check('refused-4xx: no backoff sleep', sleeps.length === 0, JSON.stringify(sleeps));
+  }
+
+  // ── 409 is the one 4xx that stays retryable: all `retries` attempts are made ──
+  {
+    const calls: Recorded[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 409 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, retries: 3, sleep: noSleep });
+    const delivered = await sink.emit(EVENT);
+    check('conflict-409: undelivered resolves false', delivered === false, String(delivered));
+    check('conflict-409: retried to `retries` attempts', calls.length === 3, String(calls.length));
+  }
+
   // ── default horizon: 5 attempts × 500ms exponential base (≈7.5s) — a >1s meeting-api blip
   //    must not lose the event (hosted 07-14→07-17: the old ~0.6s horizon dropped callbacks and
   //    the reaper failed seated bots) ──

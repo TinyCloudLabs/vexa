@@ -10,9 +10,11 @@
  * The composition root builds the live adapter; the test injects a recording/failing fake.
  *
  * Robustness (P14): a lifecycle POST failure must NEVER crash the bot. `emit` retries with a
- * bounded backoff on a network error or a non-2xx response, then logs + gives up — it never
- * throws fatally out of `emit`. (A dropped status report is regrettable but must not strand a
- * seated bot or mask the terminal exit.)
+ * bounded backoff on a network error or a 5xx/409 response; any other 4xx refuses the payload
+ * (the same body cannot succeed), so it is sent once and not retried. `emit` then logs and gives up,
+ * returning `false` so the caller knows the event was not delivered. It never throws fatally out of
+ * `emit`. (A dropped status report is regrettable but must not strand a seated bot or mask the
+ * terminal exit.)
  */
 import type { LifecycleEvent } from '../contracts.js';
 import type { LifecycleSink, PrimaryReachability } from '../ports.js';
@@ -93,6 +95,8 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
         const res = await fetchImpl(callbackUrl, { method: 'POST', headers, body, signal: controller.signal });
         if (res.ok) return true; // 2xx — delivered
         lastCode = 'http_error';
+        // A 4xx other than 409 refuses this payload; resending the same body cannot succeed.
+        if (res.status >= 400 && res.status < 500 && res.status !== 409) break;
       } catch {
         lastCode = 'network_error';
       } finally {

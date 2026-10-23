@@ -5,6 +5,11 @@ import { log, callNeedsHumanHelpCallback } from '../_host';
 let escalationTriggered = false;
 let vncStarted = false;
 let escalationInFlight = false;
+// Earliest virtual time (ms) of the next delivery attempt after a refused or failed one.
+let retryNotBefore = 0;
+
+/** Gap between delivery attempts while meeting-api keeps refusing the escalation. */
+export const ESCALATION_RETRY_COOLDOWN_MS = 30_000;
 
 export interface EscalationResult {
   reason: string;
@@ -39,19 +44,21 @@ export function checkEscalation(
 
 /**
  * Trigger escalation: start VNC stack and notify meeting-api.
- * Idempotent — only fires once per admission attempt.
+ * Idempotent — only fires once per admission attempt. A refused or failed attempt is retried
+ * no sooner than ESCALATION_RETRY_COOLDOWN_MS later. `now` is injectable so tests run on virtual time.
  */
-export async function triggerEscalation(botConfig: any, reason: string): Promise<void> {
-  if (escalationTriggered || escalationInFlight) return;
+export async function triggerEscalation(botConfig: any, reason: string, now: number = Date.now()): Promise<void> {
+  if (escalationTriggered || escalationInFlight || now < retryNotBefore) return;
   escalationInFlight = true;
   try {
     log(`[Escalation] Triggered: ${reason}`);
     await startVncStack();
     const accepted = await callNeedsHumanHelpCallback(botConfig, reason);
-    // Only an accepted escalation is one-shot. A refused one stays retryable on the next check.
+    // Only an accepted escalation is one-shot. A refused one is retried after the cooldown.
     if (accepted) escalationTriggered = true;
-    else log(`[Escalation] Not delivered; will retry on next check: ${reason}`);
+    else log(`[Escalation] Not delivered; retry after cooldown: ${reason}`);
   } finally {
+    if (!escalationTriggered) retryNotBefore = now + ESCALATION_RETRY_COOLDOWN_MS;
     escalationInFlight = false;
   }
 }
@@ -134,6 +141,7 @@ export function wasEscalationTriggered(): boolean {
 
 export function resetEscalation(): void {
   escalationTriggered = false;
+  retryNotBefore = 0;
 }
 
 // ---- internal helpers ----

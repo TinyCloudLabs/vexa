@@ -245,13 +245,29 @@ _STATUS_TO_FAILURE_STAGE: Dict[Optional[BotStatus], FailureStage] = {
 }
 
 
+def _history_from_trail(trail: List[Dict[str, Any]]) -> List[BotStatus]:
+    """The BotStatus hops of a persisted `status_transition` trail, in order.
+
+    `apply_change` appends the trail entry and `history` together, so the durable trail rebuilds
+    the same history a live record would hold. Entries with an unknown `to` are skipped.
+    """
+    history: List[BotStatus] = []
+    for entry in trail:
+        try:
+            history.append(BotStatus(entry.get("to")))
+        except ValueError:
+            continue
+    return history
+
+
 def _failure_stage_for(frm: Optional[BotStatus], history: List[BotStatus]) -> FailureStage:
     """The FailureStage a record in state `frm` terminates `failed` with.
 
     `needs_help` has no stage of its own: it keeps the stage it was ENTERED from. A
     `joining -> needs_help` escalation is still a join failure (the bot never reached the
     waiting room); `awaiting_admission -> needs_help` stays `awaiting_admission`. The entry
-    state is read from the record's own history, not the payload (FM-003).
+    state is read from the record's own history, which `rehydrate` restores from the durable
+    `status_transition` trail (FM-003).
     """
     if frm is BotStatus.NEEDS_HELP:
         if BotStatus.AWAITING_ADMISSION in history:
@@ -506,6 +522,7 @@ class MeetingStore:
                     rec.status_transition = [
                         dict(entry) for entry in trail if isinstance(entry, dict)
                     ]
+                    rec.history = _history_from_trail(rec.status_transition)
         return rec
 
     def __len__(self) -> int:  # pragma: no cover - trivial

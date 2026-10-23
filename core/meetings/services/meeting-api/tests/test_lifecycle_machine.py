@@ -185,3 +185,42 @@ def test_needs_help_from_awaiting_admission_keeps_admission_stage():
     assert rec.join_evidence is not None
     assert rec.join_evidence["stage"] == "awaiting_admission"
     assert rec.join_evidence["reason"] == "awaiting_admission_timeout"
+
+
+def _escalate_then_fail_after_restart(conn_id: str, entry: list[str]):
+    """Escalate on the live path, persist the record's data, then fail it on a FRESH store.
+
+    The fresh store stands in for a restarted API process: the record is rebuilt only from the
+    persisted DB status and `data`, exactly as `rehydrate` is called on the callback path.
+    """
+    live = LifecycleSink(store=MeetingStore())
+    for status in entry:
+        live.apply({"connection_id": conn_id, "status": status})
+    escalated = live.apply({"connection_id": conn_id, "status": "needs_help", "escalation_reason": "consent_text"})
+    persisted = dict(escalated.data)
+    expected = live.apply({"connection_id": conn_id, "status": "failed", "reason": "escalation_expired"})
+
+    restarted = MeetingStore()
+    restarted.rehydrate(conn_id, "needs_help", persisted)
+    rehydrated = LifecycleSink(store=restarted).apply(
+        {"connection_id": conn_id, "status": "failed", "reason": "escalation_expired"},
+    )
+    return expected, rehydrated
+
+
+def test_rehydrated_needs_help_from_joining_keeps_join_attribution():
+    expected, rehydrated = _escalate_then_fail_after_restart("c-rehy-1", ["joining"])
+
+    assert rehydrated.failure_stage is FailureStage.JOINING
+    assert rehydrated.failure_stage is expected.failure_stage
+    assert rehydrated.join_evidence == expected.join_evidence
+
+
+def test_rehydrated_needs_help_from_awaiting_admission_keeps_admission_attribution():
+    expected, rehydrated = _escalate_then_fail_after_restart("c-rehy-2", ["joining", "awaiting_admission"])
+
+    assert rehydrated.failure_stage is FailureStage.AWAITING_ADMISSION
+    assert rehydrated.failure_stage is expected.failure_stage
+    assert rehydrated.join_evidence is not None
+    assert rehydrated.join_evidence["stage"] == "awaiting_admission"
+    assert rehydrated.join_evidence == expected.join_evidence
