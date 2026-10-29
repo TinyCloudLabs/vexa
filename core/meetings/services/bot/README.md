@@ -87,6 +87,27 @@ Run `pnpm --filter @vexa/bot test:browser-failure` to inject a real Chromium cra
 This test requires Chromium and fails when it is unavailable. It does not reproduce OOM or
 replace a long Google Meet validation.
 
+### Checkpoint screenshots: off by default
+
+Bot-managed pages do not render or write `Page.screenshot` requests whose normalized output path is `/app/storage/screenshots` or a descendant unless the bot process explicitly sets `VEXA_CHECKPOINT_SCREENSHOTS=1` **before browser launch**. Keep this flag unset or `0` in production. Other values do not opt in. Disabled checkpoint calls resolve with an empty buffer so existing join/diagnostic callers continue without collecting page pixels.
+
+Explicit opt-in restores the existing, unsanitized checkpoint behavior. This flag does not change join selectors, admission decisions, diagnostic messages, recordings, audio capture, pathless screenshots, or screenshot paths outside the checkpoint directory. It applies to both initial and subsequently created pages in the bot browser context.
+
+The separate local-only `tools/bot-dom-capture` tool remains unchanged: its explicit operator mounts capture sanitized DOM and rendered PNGs to its private output, not to the checkpoint directory. It does not require enabling raw checkpoint screenshots.
+
+The regression `test:checkpoint-screenshots` exercises a real browser/filesystem with `NODE_ENV=production`, unset/disabled/non-opt-in values, explicit `1`, child pages, relative/normalized paths, and unrelated-path controls. Run it in a disposable, networkless bot container after the normal workspace build, from the repository root:
+
+```sh
+docker run --rm --network none \
+  -e NODE_ENV=production -e NODE_OPTIONS=--import=tsx \
+  -e BOT_WORKER_ENTRY=/app/core/meetings/services/bot/dist/checkpoint-screenshots.boundary.test.ts \
+  --mount "type=bind,source=$PWD/core/meetings/services/bot/dist/capture-bridge.js,target=/app/core/meetings/services/bot/dist/capture-bridge.js,readonly" \
+  --mount "type=bind,source=$PWD/core/meetings/services/bot/src/checkpoint-screenshots.boundary.test.ts,target=/app/core/meetings/services/bot/dist/checkpoint-screenshots.boundary.test.ts,readonly" \
+  ghcr.io/tinycloudlabs/vexa/bot@sha256:efa1e11d9fafc74fdf398a29905b96262ce91002d9d3fdac1159898017d9e8b7
+```
+
+This uses the existing image with read-only compiled-adapter/test overlays, not a new image build. Only synthetic pages are rendered; no Meet, account, production mount, or paid provider is used.
+
 **Owns:** none — the bot is a worker that implements published meetings contracts.
 **Consumes:** [`invocation.v1`](../../contracts/invocation.v1) (boot config),
 [`acts.v1`](../../contracts/acts.v1) (inbound commands),
