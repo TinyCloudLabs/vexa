@@ -7,7 +7,7 @@ import pytest
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.calendar_sync import parse_ics, sync_user
 from meeting_api.collector.fakes import InMemoryTranscriptStore
-from meeting_api.collector.meeting_link import parse_meeting_url
+from meeting_api.collector.meeting_link import find_meeting_link, parse_meeting_url
 from test_auto_join_sweep import _tick
 from test_bot_spawn import HEADERS, _client, _spawn_env
 from test_calendar_sync import NOW, USER, _event, _ics
@@ -85,10 +85,15 @@ async def test_calendar_lookup_preserves_key_and_honors_auto_join_policy(monkeyp
 
 
 @pytest.mark.parametrize("path", INVALID_LOOKUPS)
-async def test_malformed_lookup_calendar_event_is_linkless_and_not_dispatched(monkeypatch, path):
+@pytest.mark.parametrize("source", ["location", "description"])
+async def test_malformed_lookup_calendar_event_is_linkless_and_not_dispatched(monkeypatch, path, source):
     _spawn_env(monkeypatch)
     store = InMemoryTranscriptStore()
-    parsed = parse_ics(_ics(_event(location="https://meet.google.com" + path)), now=NOW)
+    url = "https://meet.google.com" + path
+    event = _event(location=url) if source == "location" else _event(
+        location="Conference room", description=f"Join {url} thanks",
+    )
+    parsed = parse_ics(_ics(event), now=NOW)
     await sync_user(store, USER, parsed, auto_join_default=True)
     (row,) = await store.list_meetings(USER)
     assert row["platform"] == "unknown"
@@ -98,3 +103,10 @@ async def test_malformed_lookup_calendar_event_is_linkless_and_not_dispatched(mo
     counters = await _tick(repo, runtime, now=datetime.fromisoformat(row["data"]["scheduled_at"]))
     assert counters["due"] == 0
     assert runtime.specs == []
+
+
+@pytest.mark.parametrize("punctuation", [";", ";)", ";."])
+def test_lookup_semicolon_in_prose_is_not_trimmed_into_a_joinable_link(punctuation):
+    assert find_meeting_link(
+        f"Join https://meet.google.com/lookup/daily{punctuation} thanks"
+    ) is None
