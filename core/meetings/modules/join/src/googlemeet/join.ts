@@ -14,6 +14,7 @@ import {
 import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
 import { AdmissionError } from "../shared/admission";
 import { resolveBotUiLocale } from "../browser-args";
+import { observedPageContext } from "./diagnostics";
 
 /** Thrown when authenticated mode detects a signed-out browser profile. Extends AdmissionError so
  *  the JoinDriver's single `instanceof` catch maps the typed `auth_session_missing` outcome to a
@@ -163,67 +164,69 @@ export function isEnglishUiLocale(ctx: { html_lang: string; navigator_language: 
   return ctx.navigator_language === "en-US" && /^en(-|$)/.test(ctx.html_lang);
 }
 
-/**
- * Observed page context for a selector miss. Recorded INTO the thrown error so
- * the failure is diagnosable from `meeting.data.last_error` alone — the pods
- * that saw the lobby are long gone by the time anyone reads it (#846 A4).
- */
-async function observedPageContext(page: Page): Promise<{ html_lang: string; navigator_language: string }> {
-  try {
-    const ctx = await page.evaluate(() => ({
-      lang: document.documentElement.getAttribute("lang") || "",
-      nav: navigator.language || "",
-    }));
-    return {
-      html_lang: /^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(ctx.lang) ? ctx.lang : "unknown",
-      navigator_language: /^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(ctx.nav) ? ctx.nav : "unknown",
-    };
-  } catch {
-    return { html_lang: "unknown", navigator_language: "unknown" };
-  }
+function selectorFailureContext(selectors: string[]): { step: string; selector_set: string; selector_mask: number } {
+  const sets = [
+    { selectors: googleNameInputSelectors, step: "name_entry", selector_set: "guest_name" },
+    { selectors: googleJoinButtonSelectors, step: "join_request", selector_set: "guest_join" },
+    { selectors: googleAuthJoinCtaSelectors, step: "authenticated_join_request", selector_set: "authenticated_join" },
+  ];
+  const known = sets.find(set => set.selectors.length === selectors.length &&
+    set.selectors.every((selector, index) => selector === selectors[index]));
+  return known
+    ? { step: known.step, selector_set: known.selector_set, selector_mask: 2 ** selectors.length - 1 }
+    : { step: "unknown", selector_set: "unknown", selector_mask: 0 };
 }
+
 
 /**
  * Screenshot + compose the LOUD failure message for a total selector miss
  * (no-fallbacks.md — a missing control fails with a logged reason + screenshot,
- * never a silent skip). The message keeps its historical prefix verbatim (prod
- * monitoring greps it) and appends only the observed locale. URLs and visible
- * page labels are intentionally excluded from the error and process logs.
+ * never a silent skip). Keep the monitoring prefix stable; append only static
+ * step/selector codes, counts, validated locale, and observed-lobby state.
+ * URLs, visible labels, and caller-supplied selector text never enter this diagnostic.
  */
 export async function describeSelectorMiss(
   page: Page,
   selectors: string[],
   timeoutMs: number,
   label: string,
-  candidateCount: number | null
+  candidateCount: number | null,
+  lobbyReached = false
 ): Promise<string> {
   const shot = `/app/storage/screenshots/bot-checkpoint-${label.replace(/[^a-z0-9]+/gi, "-")}-not-found.png`;
   try { await page.screenshot({ path: shot, fullPage: true }); } catch { /* best-effort */ }
   const context = await observedPageContext(page);
+  const failure = {
+    error_code: "selector_not_found",
+    ...selectorFailureContext(selectors),
+    lobby_reached: lobbyReached,
+  };
   logJSON({
     level: "warn",
     event: "join.selector_miss",
     platform: "google_meet",
     selector_count: selectors.length,
-    candidate_count: candidateCount,
+    candidate_count: candidateCount ?? -1,
     timeout_ms: timeoutMs,
     ...context,
+    ...failure,
   });
-  return `code=selector_not_found timeout_ms=${timeoutMs} html_lang=${context.html_lang} navigator_language=${context.navigator_language}`;
+  return `code=selector_not_found timeout_ms=${timeoutMs} html_lang=${context.html_lang} navigator_language=${context.navigator_language} step=${failure.step} selector_set=${failure.selector_set} selector_mask=${failure.selector_mask} selector_count=${selectors.length} candidate_count=${candidateCount ?? -1} lobby_reached=${lobbyReached}`;
 }
 
 /**
  * Wait for the FIRST of an ordered selector list to become visible
- * (locale-agnostic selectors first, English text fallbacks last). Returns the
- * matched handle and the selector that won. On total failure: screenshot + LOUD
- * throw carrying the observed locale only.
+ * in declared priority order. Returns the matched handle and selector.
+ * A total miss throws with static step/selector codes, counts, observed locale,
+ * and the caller's confirmed-lobby state, without page text.
  */
 export async function waitForAnySelector(
   page: Page,
   selectors: string[],
   timeoutMs: number,
   label: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  lobbyReached = false
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   do {
@@ -236,7 +239,7 @@ export async function waitForAnySelector(
     await page.waitForTimeout(SELECTOR_POLL_MS);
   } while (Date.now() - started < timeoutMs);
 
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, null));
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, null, lobbyReached));
 }
 
 /**
@@ -261,7 +264,8 @@ export async function waitForLobbyCta(
   selectors: string[],
   timeoutMs: number,
   label: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  lobbyReached = false
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
@@ -291,7 +295,7 @@ export async function waitForLobbyCta(
     await page.waitForTimeout(SELECTOR_POLL_MS);
   } while (Date.now() - started < timeoutMs);
 
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastCandidateCount));
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastCandidateCount, lobbyReached));
 }
 
 /**
@@ -418,17 +422,18 @@ export async function joinGoogleMeeting(
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-lobby.png', fullPage: true });
     log("📸 Diagnostic screenshot: auth lobby state");
 
+    let lobbyReached = false;
     // Mute mic and camera if visible
     try {
       const micHandle = await page.waitForSelector(googleMicrophoneButtonSelectors[0], { timeout: 3000 });
-      if (micHandle) { await clickHandle(micHandle, "microphone"); log("Microphone muted."); }
+      if (micHandle) { lobbyReached = true; await clickHandle(micHandle, "microphone"); log("Microphone muted."); }
     } catch (e) {
       log("Microphone already muted or not found.");
     }
 
     try {
       const cameraHandle = await page.waitForSelector(googleCameraButtonSelectors[0], { timeout: 3000 });
-      if (cameraHandle) { await clickHandle(cameraHandle, "camera"); log("Camera turned off."); }
+      if (cameraHandle) { lobbyReached = true; await clickHandle(cameraHandle, "camera"); log("Camera turned off."); }
     } catch (e) {
       log("Camera already off or not found.");
     }
@@ -445,7 +450,8 @@ export async function joinGoogleMeeting(
       googleAuthJoinCtaSelectors,
       30000,
       "authenticated join CTA",
-      signal
+      signal,
+      lobbyReached
     );
 
     // Signed-out guard: a guest lobby (name input rendered) means the persisted
@@ -506,7 +512,8 @@ export async function joinGoogleMeeting(
       googleJoinButtonSelectors,
       60000,
       "join button",
-      signal
+      signal,
+      true
     );
     signal?.throwIfAborted();
     await clickHandle(joinHandle!, "ask_to_join");

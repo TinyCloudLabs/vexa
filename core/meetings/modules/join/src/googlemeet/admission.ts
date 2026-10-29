@@ -15,6 +15,7 @@ import { AdmissionError } from "../shared/admission";
 import { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog } from "./gemini-notice";
 export { detectGeminiNotice, handleGeminiNotice, hasBlockingNoticeDialog, hasModalDialog };
 import { createAdmissionBlockedReporter, type AdmissionBlockReason } from "./admission-blocked";
+import { observedPageContext } from "./diagnostics";
 
 const admissionBlocked = createAdmissionBlockedReporter({
   now: Date.now,
@@ -683,6 +684,19 @@ export async function waitForGoogleMeetingAdmission(
   } catch (error: any) {
     // A cancelled join is the embedder's decision, not a platform verdict: surface the abort itself.
     if (botConfig.signal?.aborted) throw botConfig.signal.reason;
+    const errorCode = error instanceof AdmissionError
+      ? error.outcome === "denial" ? "admission_denied"
+        : error.outcome === "lobby_timeout" ? "lobby_timeout" : "admission_unconfirmed"
+      : "admission_error";
+    logJSON({
+      level: "warn",
+      event: "admission.failed",
+      platform: "google_meet",
+      step: "admission",
+      error_code: errorCode,
+      lobby_reached: true,
+      ...await observedPageContext(page),
+    });
     // Re-throw AdmissionError instances unchanged so callers can inspect outcome. Any unresolved failure
     // (not a host denial, not a cancelled join) escalates here too, so no exit — including an unexpected error
     // from a step above — can leave the bot silent in `awaiting_admission`.

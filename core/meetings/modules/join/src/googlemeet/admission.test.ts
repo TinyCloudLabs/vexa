@@ -324,6 +324,33 @@ async function outcomeOf(run: Promise<unknown>, watchdogMs = 10_000): Promise<st
     true,
   );
 
+  console.log('\n=== Terminal admission diagnostics preserve the verdict without page content ===');
+  for (const scenario of [
+    { visible: ['text=denied your request'], outcome: 'denial', code: 'admission_denied' },
+    { visible: ['text=Asking to be let in'], outcome: 'lobby_timeout', code: 'lobby_timeout' },
+    { visible: [], outcome: 'join_failure', code: 'admission_unconfirmed' },
+  ]) {
+    resetEscalation();
+    const lines: string[] = [];
+    const originalLog = console.log;
+    let got: string;
+    try {
+      console.log = (...args: unknown[]) => {
+        if (args.length === 1 && typeof args[0] === 'string') lines.push(args[0]);
+      };
+      got = await outcomeOf(waitForGoogleMeetingAdmission(mockPage(scenario.visible), 0, {}));
+    } finally {
+      console.log = originalLog;
+    }
+    const failure = lines.map(line => {
+      try { return JSON.parse(line) as Record<string, unknown>; } catch { return {}; }
+    }).find(event => event.event === 'admission.failed');
+    await check(`${scenario.outcome}: original typed outcome is unchanged`, got === `AdmissionError:${scenario.outcome}`, true);
+    await check(`${scenario.outcome}: terminal code names the admission step`, failure?.error_code === scenario.code && failure?.step === 'admission', true);
+    await check(`${scenario.outcome}: terminal diagnostic has no raw error, selector, or page text`,
+      !!failure && !('message' in failure) && !('selector' in failure) && !('text' in failure), true);
+  }
+
   console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);
   process.exit(failed > 0 ? 1 : 0);
 })();

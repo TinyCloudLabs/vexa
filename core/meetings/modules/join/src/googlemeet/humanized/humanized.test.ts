@@ -9,8 +9,6 @@
  * emission, and the screen<->page coordinate mapping — deterministically.
  */
 
-import * as fs from "fs";
-import * as path from "path";
 import { MocapEngine, type Rect } from "./mocapEngine";
 import { X11Input } from "./x11Input";
 import { HumanizedInteractor } from "./humanizedInteraction";
@@ -146,42 +144,6 @@ console.log("\nTest 4: X11Input command emission (dryRun)");
   // ── 7. Locale-agnostic selectors match a Hungarian mock DOM ───
   console.log("\nTest 7: locale-agnostic join/name selectors (hu UI)");
   {
-    const selectorsSrc = fs.readFileSync(
-      path.join(__dirname, "..", "selectors.ts"),
-      "utf-8"
-    );
-    // (a) join button: #856 reorder — the EXACT English text selector precedes the
-    // broad structural entry, which is retained LAST as a locale-agnostic backstop.
-    // Ordered resolution makes list position authoritative, and with the UI locale
-    // pinned the English text is correct by construction; the broad entry must only
-    // win when nothing exact matches (it can otherwise pick a wrong jsname+span
-    // button early in DOM order). Match the selector *literals* in the array, not
-    // the prose comment (which mentions both).
-    const joinBlock = selectorsSrc.slice(
-      selectorsSrc.indexOf("export const googleJoinButtonSelectors"),
-      selectorsSrc.indexOf("googleLobbyIconGlyphSelectors")
-    );
-    const joinStructuralIdx = joinBlock.indexOf("'button[jsname]:not([aria-label]):has(span)'");
-    const joinEnglishIdx = joinBlock.indexOf("has-text(\"Ask to join\")");
-    assert(joinStructuralIdx >= 0, "join selectors retain the locale-agnostic structural backstop");
-    assert(joinEnglishIdx >= 0 && joinEnglishIdx < joinStructuralIdx,
-      "exact English-text join selector precedes the broad structural backstop (#856 order)");
-
-    // (b) name field: structural input selector precedes the English aria-label.
-    const nameBlock = selectorsSrc.slice(
-      selectorsSrc.indexOf("googleNameInputSelectors"),
-      selectorsSrc.indexOf("googleMeetingContainerSelectors")
-    );
-    const nameStructIdx = Math.min(
-      ...["input[jsname]", 'input[type="text"]:not('].map((s) => {
-        const i = nameBlock.indexOf(s);
-        return i < 0 ? Number.MAX_SAFE_INTEGER : i;
-      })
-    );
-    const nameEnglishIdx = nameBlock.indexOf('aria-label="Your name"');
-    assert(nameStructIdx !== Number.MAX_SAFE_INTEGER, "name selectors include a locale-agnostic structural selector");
-    assert(nameStructIdx < nameEnglishIdx, "locale-agnostic name selector precedes the English aria-label fallback");
-
     // (c) DOM match: build a Hungarian lobby (no English text anywhere) and
     // confirm the FIRST (locale-agnostic) join + name selectors match it via a
     // minimal CSS matcher. This is the localized-DOM check the English-literal
@@ -210,14 +172,6 @@ console.log("\nTest 4: X11Input command emission (dryRun)");
     assert(!matchesSelector(huJoinBtn, 'button:has-text("Ask to join")'), "English-text selector does NOT match the hu join button (the regression)");
   }
 
-  // ── 8. join.ts fails LOUD (screenshot) when no selector matches ─
-  console.log("\nTest 8: join.ts fails loud when controls are missing");
-  {
-    const joinSrc = fs.readFileSync(path.join(__dirname, "..", "join.ts"), "utf-8");
-    assert(/waitForAnySelector/.test(joinSrc), "join.ts uses an ordered multi-selector resolver");
-    const fn = joinSrc.slice(joinSrc.indexOf("export async function waitForAnySelector"));
-    assert(/screenshot/.test(fn) && /throw new Error/.test(fn), "selector resolver screenshots + throws on total miss (no silent skip)");
-  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

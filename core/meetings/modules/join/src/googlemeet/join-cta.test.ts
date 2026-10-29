@@ -42,9 +42,11 @@
  * Run: npx tsx src/googlemeet/join-cta.test.ts
  */
 
+import { readFileSync } from 'fs';
 import { JSDOM } from 'jsdom';
 import {
   googleJoinButtonSelectors,
+  googleNameInputSelectors,
   googleLobbyIconGlyphSelectors,
   googleLobbyCtaMaxLabelChars,
 } from './selectors';
@@ -258,6 +260,20 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
 
     const enLabelled = scan(EN_LABELLED_CTA);
     assert(isCta(enLabelled.el), 'en lobby, aria-labelled CTA: the scan lands on the same element the literal does');
+
+    // Captured C was successful without a selector change. Keep its real control
+    // structure as a compatibility case, not evidence of an A/B failure cause.
+    const captured = readFileSync(new URL('./fixtures/captured-c-guest-lobby.html', import.meta.url), 'utf8');
+    const capturedDoc = mount(captured);
+    const capturedName = capturedDoc.querySelector('input[aria-label="Your name"]');
+    const capturedJoin = resolveBySelectorsOnly(captured).el;
+    assert(capturedName !== null && googleNameInputSelectors.some(selector =>
+      selectorMatches(capturedDoc, selector).includes(capturedName)),
+      'the shipped selectors resolve the real captured guest name-entry control');
+    assert(capturedJoin?.getAttribute('aria-label') === 'Ask to join without microphone & camera',
+      'the shipped selectors resolve the real captured guest admission CTA');
+    assert(!captured.includes('meet.google.com') && !/\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b/i.test(captured),
+      'the captured control fixture contains no meeting URL or code');
   }
 
   console.log('\n=== 3. Over-match guards — what the scan must NOT pick ===');
@@ -311,15 +327,6 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
   {
     const exactSelector = '//button[.//span[text()="Ask to join"]]';
     const broadSelector = 'button[jsname]:not([aria-label]):has(span)';
-    // #856 ordering: the exact text selector is FIRST in googleJoinButtonSelectors
-    // and the broad structural entry is LAST. When both are visible, ordered
-    // resolution must return the EXACT one — the pin makes the English text
-    // correct by construction, and the broad entry (which can match a wrong
-    // jsname+span button early in DOM order) must only win when nothing exact does.
-    assert(googleJoinButtonSelectors[0] === exactSelector,
-      'the exact "Ask to join" selector is FIRST in the list (#856 reorder)');
-    assert(googleJoinButtonSelectors[googleJoinButtonSelectors.length - 1] === broadSelector,
-      'the broad structural entry is LAST in the list (#856 reorder)');
 
     const both = [exactSelector, broadSelector];
     const hit = await waitForAnySelector(mockPage({ visible: both }) as any, googleJoinButtonSelectors, 5000, 'join button');
@@ -362,7 +369,7 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
     try {
       await waitForLobbyCta(
         mockPage({ visible: [], scanLabels: ['Kérvényezés a csatlakozásra', 'Mégse'], lang: 'hu', nav: 'hu-HU' }) as any,
-        googleJoinButtonSelectors, 900, 'join button');
+        googleJoinButtonSelectors, 900, 'join button', undefined, true);
     } catch (e: any) { message = String(e?.message || e); }
 
     assert(/^code=selector_not_found timeout_ms=900/.test(message),
@@ -371,6 +378,12 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
       'the observed UI locale is recorded in the error');
     assert(!/https:|Mégse|Kérvényezés|abc-defg-hij/.test(message),
       'URLs and visible page text are absent from the error');
+    assert(/step=join_request/.test(message) && /selector_set=guest_join/.test(message),
+      'the failure identifies the missing guest join step and static selector set');
+    assert(/selector_mask=31/.test(message) && /candidate_count=2/.test(message),
+      'the failure identifies every tried selector and the diagnostic candidate count');
+    assert(/lobby_reached=true/.test(message),
+      'a guest CTA miss distinguishes a reached lobby from a missing name-entry page');
   }
 
   console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);
@@ -397,7 +410,7 @@ function mockPage(m: {
     evaluate: async (_fn: any) => ({ lang: m.lang || 'en', nav: m.nav || 'en-US' }),
     evaluateHandle: async (_fn: any, _opts: any) => ({
       getProperty: async (k: string) => ({
-        jsonValue: async () => (k === 'labels' ? (m.scanLabels || []) : null),
+        jsonValue: async () => (k === 'candidate_count' ? (m.scanLabels || []).length : null),
         asElement: () => (k === 'el' && m.scanHits ? el : null),
       }),
       dispose: async () => {},

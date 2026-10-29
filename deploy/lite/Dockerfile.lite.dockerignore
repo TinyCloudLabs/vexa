@@ -17,3 +17,4 @@
 .env
 .env.*
 deploy/execution-targets.json
+tools/bot-dom-capture/
