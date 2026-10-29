@@ -46,7 +46,7 @@ import type { MediaSample } from './media-recovery.js';
 import { createTtsPlayback } from './tts-playback.js';
 import { createHttpAttributedAudioRecorder } from './attributed-audio.js';
 import type { AttributedAudioFrame } from '@vexa/gmeet-pipeline';
-import { resolve } from 'node:path';
+import { installCheckpointScreenshotPolicy } from './checkpoint-screenshots.js';
 
 // The Playwright binding is asynchronous but the AudioWorklet callback is not.  Bound the page
 // queue BEFORE Array.from()/protocol serialization can retain unbounded PCM in Chromium.
@@ -637,17 +637,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
 
   if (process.env.VEXA_CHECKPOINT_SCREENSHOTS !== '1') {
-    const noPixels = Buffer.alloc(0);
-    const disableCheckpointScreenshots = (target: Page): void => {
-      const screenshot = target.screenshot.bind(target);
-      target.screenshot = async (options) => {
-        const output = options?.path && resolve(options.path);
-        if (output === '/app/storage/screenshots' || output?.startsWith('/app/storage/screenshots/')) return noPixels;
-        return screenshot(options);
-      };
-    };
-    for (const existing of context.pages()) disableCheckpointScreenshots(existing);
-    context.on('page', disableCheckpointScreenshots);
+    installCheckpointScreenshotPolicy(context);
   }
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).

@@ -90,7 +90,7 @@ if (!isMeetUrl && !isTeamsUrl && !isZoomUrl) {
   const view = await startDebugView();
   console.log("\n────────────────────────────────────────────");
   console.log(" DEBUG VIEW");
-  console.log(view.novncUrl ? "  human (pixels): available" : "  human (pixels): headed window on this desktop");
+  console.log(view.novncUrl ? "  human (pixels): available" : "  human (pixels): VNC/noVNC disabled; local headed window only");
   console.log("  agent (control): available");
   console.log("────────────────────────────────────────────\n");
 

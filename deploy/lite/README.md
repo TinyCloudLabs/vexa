@@ -69,10 +69,18 @@ Supervised by `supervisord`:
 | terminal | **3001** | agent-domain browser-CLI workbench (Next.js + custom `server.mjs` SSE/`/ws` relay) |
 | redis | 6379 | bus + scheduler + per-dispatch streams (internal) |
 | Xvfb · fluxbox · PulseAudio | :99 | display + audio for the headful bot browser |
-| x11vnc · noVNC | 5900 / 6080 | browser view (debugging) |
+| x11vnc · noVNC | loopback 5900 / 6080 | manual debug only; off by default, password required |
 
 External (the `make lite` sidecars): **PostgreSQL** (metadata) and **MinIO** (recordings +
 agent workspaces).
+
+### Optional local visual debugging
+
+The two visual services have `autostart=false`. Escalation does not start them. Leave `VEXA_VISUAL_DEBUG` absent or `0` in production. Explicit local debug use requires `VEXA_VISUAL_DEBUG=1` and `VEXA_VISUAL_DEBUG_PASSWORD_FILE` on the Lite container's environment at creation, with that private password file mounted read-only. See the [password format and real-service regression](../../core/meetings/modules/join/README.md#explicit-local-visual-debugging).
+
+After that explicit configuration, start them manually with `docker exec <local-lite-container> supervisorctl start x11vnc websockify`. `supervisorctl status x11vnc websockify` must report `RUNNING`; stop them with `supervisorctl stop websockify x11vnc` and verify `STOPPED`. Without opt-in or a valid private password file, the guarded launchers fail closed. VNC requires password authentication; RFB binds only `127.0.0.1` / `::1`, and the noVNC bridge binds only `127.0.0.1`. Reach them only inside that development network namespace or through a deliberately configured secure tunnel; Docker port publishing alone does not reach container loopback.
+
+This is the shared, unsanitized X display, not a per-bot or sanitized snapshot. Use an isolated local development container.
 
 ### Architecture
 
