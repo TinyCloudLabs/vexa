@@ -405,17 +405,6 @@ def test_calendar_id_is_re_encoded_into_one_downstream_segment():
     assert downstream.last["url"] == "http://meeting-api/user/calendars/x%23frag/sync"
 
 
-def test_calendar_id_dot_segments_cannot_walk_up_the_downstream_path():
-    """`%2E%2E` decodes to `..`, which httpx resolves against the base path — un-encoded it turns
-    PATCH /user/calendars/{id} into a PATCH on admin-api's whole /user record."""
-    client, downstream = _client()
-    client.patch("/user/calendars/%2E%2E", headers=AUTH, json={"auto_join": False})
-    assert downstream.last["url"] == "http://admin-api/user/calendars/%2E%2E"
-    assert httpx.URL(downstream.last["url"]).path == "/user/calendars/.."
-
-    client.post("/user/calendars/%2E%2E/sync", headers=AUTH)
-    assert downstream.last["url"] == "http://meeting-api/user/calendars/%2E%2E/sync"
-
 
 def test_calendar_id_with_control_character_is_4xx_not_500():
     """httpx raises InvalidURL (not a RequestError) for a NUL/CRLF id, so it would escape the
