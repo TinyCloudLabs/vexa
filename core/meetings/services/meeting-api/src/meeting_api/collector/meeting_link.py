@@ -1,5 +1,5 @@
-"""Meeting-link → ``(platform, native_meeting_id)`` parsing — the server-side twin of the
-terminal's ``clients/terminal/src/surfaces/meetingId.ts`` (same id formats, same platforms).
+"""Meeting-link → ``(platform, native_meeting_id)`` parsing for the meeting API.
+Also accepts Google Meet's native ``lookup/<nickname>`` paths.
 
 Used by ``POST /meetings`` / ``PATCH /meetings/{id}`` (a planned meeting created from a pasted
 link) and by ``calendar_sync`` (extracting the joinable link out of an ICS event's LOCATION /
@@ -8,7 +8,7 @@ DESCRIPTION). Pure string logic — no I/O, no framework imports; the one config
 reloads see the live env.
 
 Id formats (mirrors the dashboard join-form):
-  * google_meet → ``abc-defg-hij``
+  * google_meet → ``abc-defg-hij`` or the literal ``lookup/<nickname>`` path
   * zoom        → 9–11 digits
   * teams       → the ``19:meeting_…@thread.v2`` thread id, or the ``/meet/<id>`` short-link segment
   * jitsi       → the room name (the URL's path segment). Hosts: meet.jit.si and
@@ -24,6 +24,9 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 _GMEET_ID = re.compile(r"^[a-z]{3}-[a-z]{4}-[a-z]{3}$")
+# A lookup identity retains its path namespace (even a dashed-code-shaped nickname is
+# not that code). ASCII URL-safe nicknames only; the whole key fits varchar(255).
+_GMEET_LOOKUP = re.compile(r"lookup/[A-Za-z0-9_-]{1,248}")
 _ZOOM_ID = re.compile(r"\d{9,11}")
 # The repeat is BOUNDED on purpose. Unbounded (`[^@%\s/]+@thread\.v2`) this pattern is scanned
 # with `.search()` over caller-supplied text, so every start offset that fails at `@thread.v2`
@@ -87,11 +90,20 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
     # Bare Google Meet code, e.g. "abc-defg-hij"
     if _GMEET_ID.match(value.lower()):
         return ("google_meet", value.lower())
+    if _GMEET_LOOKUP.fullmatch(value):
+        return ("google_meet", value)
+    if value.lower().startswith("meet.google.com/lookup/"):
+        value = "https://" + value
 
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
     if host:
         if _host_is(host, "meet.google.com"):
+            if "lookup" in parsed.path.split("/"):
+                lookup = parsed.path.removeprefix("/").removesuffix("/")
+                if _GMEET_LOOKUP.fullmatch(lookup) and not any(ch.isspace() for ch in value):
+                    return ("google_meet", lookup)
+                return None
             code = next((p for p in reversed(parsed.path.split("/")) if p), "").lower()
             return ("google_meet", code) if _GMEET_ID.match(code) else None
         # Deliberately a NAME heuristic, not a domain allowlist: it is what claims a vanity or

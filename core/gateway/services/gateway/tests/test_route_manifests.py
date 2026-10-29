@@ -75,8 +75,11 @@ def test_the_assembled_table_matches_the_app_exactly():
     manifests to the thing they describe, so a row that drifts is caught by the routes themselves
     rather than by a copy of the table living in a test."""
     app = _app()
-    registered = {(m, r.path) for r in app.routes if isinstance(r, APIRoute)
-                  for m in (r.methods or ()) if m != "HEAD"}
+    registered = {
+        (m, r.path.replace("{native_meeting_id:path}", "{native_meeting_id}"))
+        for r in app.routes if isinstance(r, APIRoute)
+        for m in (r.methods or ()) if m != "HEAD"
+    }
     declared = set(ROUTE_SCOPES) | set(UNSCOPED_ROUTES)
     assert registered == declared, {
         "declared but not registered": sorted(declared - registered),

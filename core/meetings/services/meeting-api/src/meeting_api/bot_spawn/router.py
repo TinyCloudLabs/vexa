@@ -50,13 +50,9 @@ from .service import (
 #: 422 here rather than an asyncpg truncation 500 deep in the spawn path (#843).
 NATIVE_MEETING_ID_MAX_LEN = 255
 
-#: URL-structural characters that must never appear in a native_meeting_id. The id is
-#: interpolated into a URL PATH SEGMENT (`construct_meeting_url` — google_meet/teams) and reused
-#: as the DELETE path param and the dashboard lookup key, so any of these breaks that use (#892):
-#: a Teams passcode left on the id (`…982?p=X8hc…`) built `…/meetup-join/…982?p=X8hc…`
-#: (join_failure) and stored an unfindable `platform_specific_id`. No valid id across platforms
-#: carries them — Meet dash-codes (`abc-defg-hij`), Zoom digits, Teams `19:…@thread.v2` / bare
-#: short ids, and Jitsi rooms all exclude `? # & = /` and whitespace (see collector.meeting_link).
+#: URL-structural characters forbidden in a single-token native meeting id. Google Meet's
+#: validated literal lookup/<nickname> path is the only multi-segment exception; both forms
+#: are addressable by the native-keyed routes.
 NATIVE_MEETING_ID_URL_CHARS = "?#&=/"
 
 #: Top-level body keys that MEAN "passcode" but are not the api.v1 field. A caller who reaches for
@@ -319,7 +315,8 @@ def build_router(
             )
 
         platform = str(body.get("platform", "")).strip()
-        native_meeting_id = str(body.get("native_meeting_id", "")).strip()
+        raw_native_id = body.get("native_meeting_id")
+        native_meeting_id = "" if raw_native_id is None else str(raw_native_id).strip()
         meeting_url = body.get("meeting_url")
         # A caller-supplied meeting_url is an any-URL passthrough to the bot's browser
         # (zoom/jitsi) — validate at the point of entry (SSRF hygiene, 422 on violation).
@@ -388,8 +385,7 @@ def build_router(
         # Length and control bytes; plus the URL-structural chars below. The id's SEMANTIC shape is
         # STILL not validated: ids that look wrong do join (a bare-numeric Teams id transcribed a
         # real meeting in production), so a format rule would refuse working meetings. The one shape
-        # rule is that the id must be a bare, URL-safe token — it is embedded into a URL path segment
-        # and a lookup key, not carrying its own query string.
+        # rule is a URL-safe token, or Google Meet's validated lookup/<nickname> path.
         if native_meeting_id:
             if len(native_meeting_id) > NATIVE_MEETING_ID_MAX_LEN:
                 raise HTTPException(
@@ -408,7 +404,14 @@ def build_router(
             # (`397421056486982?p=X8hc…`) is short and control-free, so it passed both guards above,
             # then built a broken join URL and stored an unfindable id. Refuse at the door and name
             # the fix. Whitespace beyond the control range (a literal space) is caught here too.
-            if any(ch in NATIVE_MEETING_ID_URL_CHARS or ch.isspace() for ch in native_meeting_id):
+            lookup_id = (
+                platform == "google_meet"
+                and native_meeting_id.startswith("lookup/")
+                and parse_meeting_url(native_meeting_id) == ("google_meet", native_meeting_id)
+            )
+            if not lookup_id and any(
+                ch in NATIVE_MEETING_ID_URL_CHARS or ch.isspace() for ch in native_meeting_id
+            ):
                 raise HTTPException(
                     status_code=422,
                     detail=(

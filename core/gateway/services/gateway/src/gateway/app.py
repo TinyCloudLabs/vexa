@@ -135,7 +135,7 @@ def undeclared_routes(app: FastAPI, table=None, unscoped=None) -> List[Tuple[str
         for method in sorted(route.methods or ()):
             if method == "HEAD":
                 continue  # never registered by FastAPI itself; mirrors its GET sibling if it is
-            key = (method, route.path)
+            key = (method, route.path.replace("{native_meeting_id:path}", "{native_meeting_id}"))
             if key not in (ROUTE_SCOPES if table is None else table) and \
                     key not in (UNSCOPED_ROUTES if unscoped is None else unscoped):
                 missing.append(key)
@@ -192,20 +192,20 @@ def _invalid_path_param_response() -> Response:
 
 def _route_template(request: Request) -> Optional[str]:
     route = request.scope.get("route")
-    return getattr(route, "path", None)
+    path = getattr(route, "path", None)
+    return path.replace("{native_meeting_id:path}", "{native_meeting_id}") if path else None
 
 
 def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
     """The scopes declared for the route this request MATCHED, or ``None`` when it declares none.
 
-    Resolved from the matched route's template (``request.scope["route"].path``) rather than from
-    the request path, so ``/user/calendars/{id}`` is one declaration instead of a prefix that also
+    Resolved from the matched route's template (normalizing the native-id path converter)
+    rather than the request path, so ``/user/calendars/{id}`` is one declaration instead of a prefix that also
     swallows whatever route is added beside it next. ``None`` means DENY: the caller of this
     function fails closed, so a route that reaches ``_authorize`` without a declaration answers 403
     instead of forwarding.
     """
-    route = request.scope.get("route")
-    path = getattr(route, "path", None)
+    path = _route_template(request)
     if not path:
         return None
     return (ROUTE_SCOPES if table is None else table).get((request.method.upper(), path))
@@ -521,15 +521,15 @@ def create_app(
     async def bots_status(request: Request):
         return await _forward("GET", _meeting("/bots/status"), request)
 
-    @app.delete("/bots/{platform}/{native_meeting_id}")
+    @app.delete("/bots/{platform}/{native_meeting_id:path}")
     async def stop_bot(platform: str, native_meeting_id: str, request: Request):
         return await _forward("DELETE", _meeting(f"/bots/{platform}/{native_meeting_id}"), request)
 
-    @app.put("/bots/{platform}/{native_meeting_id}/config", status_code=202)
+    @app.put("/bots/{platform}/{native_meeting_id:path}/config", status_code=202)
     async def update_config(platform: str, native_meeting_id: str, request: Request):
         return await _forward("PUT", _meeting(f"/bots/{platform}/{native_meeting_id}/config"), request)
 
-    @app.post("/bots/{platform}/{native_meeting_id}/speak")
+    @app.post("/bots/{platform}/{native_meeting_id:path}/speak")
     async def speak(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/bots/{platform}/{native_meeting_id}/speak"), request)
 
@@ -552,7 +552,7 @@ def create_app(
     # shape ({id, token, mode, expires_at}), NOT the sealed TranscriptShareResponse public-URL shape
     # ({share_id, url, expires_at, expires_in_seconds}) — the public-URL-share backend is gone; only
     # the capability-token share exists. See the PR's "signed gaps" section.
-    @app.post("/transcripts/{platform}/{native_meeting_id}/share")
+    @app.post("/transcripts/{platform}/{native_meeting_id:path}/share")
     async def mint_transcript_share_alias(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/meetings/{platform}/{native_meeting_id}/share"), request)
 
@@ -562,7 +562,7 @@ def create_app(
     async def search_transcripts(request: Request):
         return await _forward("GET", _meeting("/transcripts/search"), request)
 
-    @app.get("/transcripts/{platform}/{native_meeting_id}")
+    @app.get("/transcripts/{platform}/{native_meeting_id:path}")
     async def transcript(platform: str, native_meeting_id: str, request: Request):
         return await _forward("GET", _meeting(f"/transcripts/{platform}/{native_meeting_id}"), request)
 
@@ -638,7 +638,7 @@ def create_app(
     # Mint an INDEPENDENT transcript share link for a meeting (owner) — Lane A / M0.
     # The caller's own description of a meeting — title + arbitrary metadata — writable in ANY
     # status (meeting-api refuses nothing here; nothing in the dispatch pipeline reads it).
-    @app.post("/meetings/{platform}/{native_meeting_id}/annotate")
+    @app.post("/meetings/{platform}/{native_meeting_id:path}/annotate")
     async def annotate_meeting(platform: str, native_meeting_id: str, request: Request):
         return await _forward(
             "POST", _meeting(f"/meetings/{platform}/{native_meeting_id}/annotate"), request
@@ -664,24 +664,24 @@ def create_app(
     async def mint_transcript_share_by_id(meeting_id: int, request: Request):
         return await _forward("POST", _meeting(f"/meetings/{meeting_id}/share"), request)
 
-    @app.post("/meetings/{platform}/{native_meeting_id}/share")
+    @app.post("/meetings/{platform}/{native_meeting_id:path}/share")
     async def mint_transcript_share(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/meetings/{platform}/{native_meeting_id}/share"), request)
 
     # Bind a meeting to a shared workspace (owner) — Lane A (optional convenience).
-    @app.post("/meetings/{platform}/{native_meeting_id}/workspace")
+    @app.post("/meetings/{platform}/{native_meeting_id:path}/workspace")
     async def bind_meeting_workspace(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/meetings/{platform}/{native_meeting_id}/workspace"), request)
 
     # Who was in this meeting, as far as the core actually knows — invitation attendees + heard
     # speakers, each row labelled with its source (Vexa-ai/vexa#451). Owner-scoped downstream.
-    @app.get("/meetings/{platform}/{native_meeting_id}/participants")
+    @app.get("/meetings/{platform}/{native_meeting_id:path}/participants")
     async def get_meeting_participants(platform: str, native_meeting_id: str, request: Request):
         return await _forward(
             "GET", _meeting(f"/meetings/{platform}/{native_meeting_id}/participants"), request
         )
 
-    @app.put("/meetings/{platform}/{native_meeting_id}/intent")
+    @app.put("/meetings/{platform}/{native_meeting_id:path}/intent")
     async def set_meeting_intent(platform: str, native_meeting_id: str, request: Request):
         return await _forward(
             "PUT", _meeting(f"/meetings/{platform}/{native_meeting_id}/intent"), request
@@ -692,18 +692,18 @@ def create_app(
     # (platform, native) → the caller's newest OWNED row and forwards to the same row-id handler
     # (unknown/unowned native → 404, FSM-owned row → 409). Additive: the by-ROW-id int routes above
     # are unchanged; these 2-segment paths never shadow them (FastAPI matches on segment count).
-    @app.patch("/meetings/{platform}/{native_meeting_id}")
+    @app.patch("/meetings/{platform}/{native_meeting_id:path}")
     async def patch_native_meeting(platform: str, native_meeting_id: str, request: Request):
         return await _forward("PATCH", _meeting(f"/meetings/{platform}/{native_meeting_id}"), request)
 
-    @app.delete("/meetings/{platform}/{native_meeting_id}")
+    @app.delete("/meetings/{platform}/{native_meeting_id:path}")
     async def delete_native_meeting(platform: str, native_meeting_id: str, request: Request):
         return await _forward("DELETE", _meeting(f"/meetings/{platform}/{native_meeting_id}"), request)
 
     # native-keyed chat READ (#579 C3): the sealed api.v1 GET the 0.10 dashboard's chat panel calls.
     # Thin passthrough to meeting-api's honest empty-list restore (0.12 does not persist in-meeting
     # chat server-side). The POST (send) half is a SIGNED GAP — no bot-command backend in 0.12.
-    @app.get("/bots/{platform}/{native_meeting_id}/chat")
+    @app.get("/bots/{platform}/{native_meeting_id:path}/chat")
     async def read_meeting_chat(platform: str, native_meeting_id: str, request: Request):
         return await _forward("GET", _meeting(f"/bots/{platform}/{native_meeting_id}/chat"), request)
 

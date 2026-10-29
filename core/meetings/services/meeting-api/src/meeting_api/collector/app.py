@@ -206,7 +206,7 @@ def build_router(
         return JSONResponse(content={"query": q, "hits": hits, "count": len(hits)})
 
     # --- GET /transcripts/{platform}/{native_meeting_id} → api.v1 TranscriptionResponse ---
-    @router.get("/transcripts/{platform}/{native_meeting_id}")
+    @router.get("/transcripts/{platform}/{native_meeting_id:path}")
     async def get_transcript(
         platform: str,
         native_meeting_id: str,
@@ -748,7 +748,7 @@ def build_router(
         )
         return JSONResponse(content=row)
 
-    @router.post("/meetings/{platform}/{native_meeting_id}/annotate")
+    @router.post("/meetings/{platform}/{native_meeting_id:path}/annotate")
     async def annotate_native_meeting(
         platform: str,
         native_meeting_id: str,
@@ -771,7 +771,7 @@ def build_router(
         row = await store.annotate_meeting(user_id, meeting_id, title=title, metadata=metadata)
         return _annotate_result(row, user_id, meeting_id, title, metadata)
 
-    @router.patch("/meetings/{platform}/{native_meeting_id}")
+    @router.patch("/meetings/{platform}/{native_meeting_id:path}")
     async def patch_native_meeting(
         platform: str,
         native_meeting_id: str,
@@ -792,32 +792,6 @@ def build_router(
         row = await _apply_meeting_patch(user_id, meeting_id, payload)
         return JSONResponse(content=row)
 
-    @router.delete("/meetings/{platform}/{native_meeting_id}")
-    async def delete_native_meeting(
-        platform: str,
-        native_meeting_id: str,
-        x_user_id: Optional[str] = Header(default=None),
-    ):
-        user_id = _resolve_user_id(x_user_id)
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
-        if meeting_id is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Meeting not found for platform {platform} and ID {native_meeting_id}",
-            )
-        receipt = await _apply_meeting_delete(user_id, meeting_id)
-        body = {
-            "status": "deleted", "id": meeting_id,
-            "platform": platform, "native_meeting_id": native_meeting_id,
-        }
-        if receipt["kind"] == "artifacts":
-            body.update({
-                "deleted": "completed_meeting_artifacts",
-                "objects_deleted": receipt["objects_deleted"],
-                "backup_residuals": "expire_under_deployment_retention_policy",
-            })
-        return JSONResponse(content=body)
-
     # --- GET /bots/{platform}/{native_meeting_id}/chat (#579 C3, sealed api.v1 ChatMessagesResponse).
     # Thin HONEST restore: the route + owner boundary are real (unowned/unknown native → 404), but
     # 0.12 does not PERSIST in-meeting chat server-side (chat frames flow live over the va:…:chat WS
@@ -825,7 +799,7 @@ def build_router(
     # backend lands. The response conforms to the sealed shape; the empty list is the truthful state,
     # not a fabricated one. The POST (send) half is a SIGNED GAP — see the PR (no bot-command backend
     # in the 0.12 core). ---
-    @router.get("/bots/{platform}/{native_meeting_id}/chat")
+    @router.get("/bots/{platform}/{native_meeting_id:path}/chat")
     async def read_meeting_chat(
         platform: str,
         native_meeting_id: str,
@@ -865,7 +839,7 @@ def build_router(
     # source, because matching a voice label to an invitee is a guess and the wrong guess silently
     # merges two humans. #861's preparation forbids promoting transcript speakers into a roster; keeping
     # the sources side by side is how this route obeys that while still answering the question. ---
-    @router.get("/meetings/{platform}/{native_meeting_id}/participants")
+    @router.get("/meetings/{platform}/{native_meeting_id:path}/participants")
     async def get_meeting_participants(
         platform: str,
         native_meeting_id: str,
@@ -920,7 +894,7 @@ def build_router(
     # --- POST /meetings/{platform}/{native_meeting_id}/workspace → BIND the meeting to a shared workspace
     # (meetings.data.workspace_id). Owner-scoped. Members of that workspace can then subscribe to this
     # meeting's live transcript feed (authorize_subscribe branch b). Many meetings → one workspace. ---
-    @router.post("/meetings/{platform}/{native_meeting_id}/workspace")
+    @router.post("/meetings/{platform}/{native_meeting_id:path}/workspace")
     async def bind_workspace(
         platform: str,
         native_meeting_id: str,
@@ -1050,7 +1024,7 @@ def build_router(
     # (only its hash is stored). Redeemed at POST /transcripts/share/accept — NO workspace involved.
     # Kept for 0.10 clients and the /transcripts/{platform}/{native}/share alias; new callers use the
     # by-row-id route above, which can address rows this one cannot. ---
-    @router.post("/meetings/{platform}/{native_meeting_id}/share")
+    @router.post("/meetings/{platform}/{native_meeting_id:path}/share")
     async def mint_transcript_share(
         platform: str,
         native_meeting_id: str,
@@ -1107,7 +1081,7 @@ def build_router(
     # Appends {workspace, path, title?, kind?} to meeting.data['docs'], deduped by path (idempotent).
     # Owner-scoped. Returns the updated docs array. Doc bodies live in the agent workspace — only the
     # ref lands here. ---
-    @router.post("/meetings/{platform}/{native_meeting_id}/docs")
+    @router.post("/meetings/{platform}/{native_meeting_id:path}/docs")
     async def connect_doc(
         platform: str,
         native_meeting_id: str,
@@ -1145,7 +1119,7 @@ def build_router(
 
     # --- DELETE /meetings/{platform}/{native_meeting_id}/docs → disconnect a doc by path (body or
     # query ?path=). Owner-scoped, idempotent. Returns the updated docs array. ---
-    @router.delete("/meetings/{platform}/{native_meeting_id}/docs")
+    @router.delete("/meetings/{platform}/{native_meeting_id:path}/docs")
     async def disconnect_doc(
         platform: str,
         native_meeting_id: str,
@@ -1176,12 +1150,38 @@ def build_router(
         )
         return JSONResponse(content={"docs": docs})
 
+    @router.delete("/meetings/{platform}/{native_meeting_id:path}")
+    async def delete_native_meeting(
+        platform: str,
+        native_meeting_id: str,
+        x_user_id: Optional[str] = Header(default=None),
+    ):
+        user_id = _resolve_user_id(x_user_id)
+        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
+        if meeting_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting not found for platform {platform} and ID {native_meeting_id}",
+            )
+        receipt = await _apply_meeting_delete(user_id, meeting_id)
+        body = {
+            "status": "deleted", "id": meeting_id,
+            "platform": platform, "native_meeting_id": native_meeting_id,
+        }
+        if receipt["kind"] == "artifacts":
+            body.update({
+                "deleted": "completed_meeting_artifacts",
+                "objects_deleted": receipt["objects_deleted"],
+                "backup_residuals": "expire_under_deployment_retention_policy",
+            })
+        return JSONResponse(content=body)
+
     # --- PUT /meetings/{platform}/{native_meeting_id}/intent → set the USER-owned INTENT status.
     # The user dropdown is the source of truth for the pre-FSM states `idle` / `scheduled`. Writes
     # meetings.status to `idle`|`scheduled` ONLY; rejects (422) any FSM-owned value. For `scheduled`
     # with `at`, the ISO8601 time is stamped into meeting.data['scheduled_at'] (scheduler wiring is a
     # later track). Owner-scoped. On a genuine change, publishes the flat frame to u:{user_id}:meetings.
-    @router.put("/meetings/{platform}/{native_meeting_id}/intent")
+    @router.put("/meetings/{platform}/{native_meeting_id:path}/intent")
     async def set_intent(
         platform: str,
         native_meeting_id: str,

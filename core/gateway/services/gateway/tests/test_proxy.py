@@ -81,6 +81,15 @@ def test_insufficient_scope_is_403():
     assert "scope" in r.json()["detail"].lower()
 
 
+def test_lookup_stop_keeps_bot_scope_requirement():
+    client, downstream = _client(authorizer=FakeAuthorizer(
+        user={"user_id": 7, "scopes": ["tx"], "max_concurrent": 1},
+    ))
+    response = client.delete("/bots/google_meet/lookup/daily", headers=AUTH)
+    assert response.status_code == 403, response.text
+    assert downstream.last is None
+
+
 def test_authed_request_passes_body_and_status_verbatim():
     """On success the downstream status + body are returned verbatim."""
     downstream = FakeDownstream(status_code=201, body={"id": 99, "platform": "google_meet"})

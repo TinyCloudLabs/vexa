@@ -103,7 +103,7 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
     ``RuntimeClient`` for the direct-teardown guarantee) ports."""
     router = APIRouter()
 
-    @router.delete("/bots/{platform}/{native_meeting_id}")
+    @router.delete("/bots/{platform}/{native_meeting_id:path}")
     async def stop_bot(
         platform: str,
         native_meeting_id: str,
