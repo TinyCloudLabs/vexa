@@ -284,6 +284,21 @@ first auto-joining source in stable source order supplies its bot name. You can 
 auto-join per meeting in its prep view. Connections created without an explicit bot name default
 to the legacy user-wide setting, then `Vexa`.
 
+Google Meet `https://meet.google.com/lookup/<nickname>` links follow this same policy: the
+native key is the **bare nickname**, with its spelling preserved, and the original lookup URL
+is retained for the bot. Import and the scheduled sweep run inside Vexa; a caller application's
+temporary refusal of lookup links does **not** gate either path. A recognized lookup event with
+auto-join enabled can dispatch without a manual `POST /bots`. Malformed lookup paths, including
+semicolon parameters or extra path segments, import as link-less events and do not auto-join
+unless another valid conferencing link is present.
+
+Before an operator rollback, disable lookup auto-join on every contributing calendar and on
+existing scheduled lookup rows, then verify sync has not re-enabled any of them. Stop or finish
+active lookup bots while the currently deployed services are still available. Restore the
+immediately previous live compose and image pins, preserving scheduled rows, transcripts, and
+volumes; do not reset the database. Re-enable sources and scheduled rows only after verifying
+the restored service's lookup behavior.
+
 ## Disconnect
 
 On **Calendar**, choose **Disconnect** for the exact named feed. Meetings that also belong to
