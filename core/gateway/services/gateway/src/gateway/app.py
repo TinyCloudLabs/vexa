@@ -168,7 +168,7 @@ _MCP_HEADERS = ("mcp-session-id", "mcp-protocol-version")
 # then quote once for the upstream hop. Multi-segment proxy tails use the same rule per segment.
 def _path_segment(value: str) -> str:
     candidate = value
-    while True:
+    for _ in range(4):
         if candidate in {".", ".."} or any(
             ch in "/\\" or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate
         ):
@@ -177,6 +177,7 @@ def _path_segment(value: str) -> str:
         if decoded == candidate:
             return quote(value, safe="")
         candidate = decoded
+    raise HTTPException(status_code=400, detail="invalid path parameter")
 
 
 def _path_tail(value: str, request: Request) -> str:

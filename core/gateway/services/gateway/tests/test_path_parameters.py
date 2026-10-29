@@ -1,5 +1,6 @@
 """Path parameters stay in their declared upstream route through real httpx URL handling."""
 from contextlib import asynccontextmanager
+from time import perf_counter
 
 import httpx
 import pytest
@@ -49,6 +50,8 @@ NATIVE_ROUTES = [
 @pytest.mark.parametrize("method,prefix,suffix,target", NATIVE_ROUTES)
 @pytest.mark.parametrize("platform,native", [
     ("google_meet", "daily"),
+    ("google_meet", "abc-defg-hij"),
+    ("google_meet", "TeamNick_1-x"),
     ("google%3Flabel%3D1", "daily%23note"),
     ("google_meet", "room%2520name"),
 ])
@@ -78,7 +81,10 @@ async def test_other_parameter_routes_preserve_exact_upstream_address(method, pa
         assert seen == [(method, target, "7")]
 
 
-@pytest.mark.parametrize("value", ["%2E", "%2E%2E", "%252E%252E", "%5C", "%255C", "%252F", "%00", "%0A"])
+@pytest.mark.parametrize("value", [
+    "%2E", "%2E%2E", "%252E%252E", "%25252E%25252E",
+    "%5C", "%255C", "%252F", "%2525252F", "%00", "%0A",
+])
 @pytest.mark.parametrize("method,template", [
     ("GET", "/transcripts/{value}/daily"),
     ("DELETE", "/bots/google_meet/{value}"),
@@ -129,3 +135,25 @@ async def test_scope_refusals_do_not_forward(scopes, method, path):
         response = await client.request(method, path)
         assert response.status_code == 403
         assert seen == []
+
+
+@pytest.mark.parametrize("path", ["/agent/session%0A", "/agent/sessions/name%0A"])
+async def test_agent_trailing_newline_is_refused_before_forwarding(path):
+    async with gateway_client() as (client, seen):
+        response = await client.get(path)
+        assert response.status_code == 400
+        assert seen == []
+
+
+@pytest.mark.parametrize("prefix", ["/bots/google_meet/", "/agent/", "/mcp/"])
+async def test_deep_encoding_is_bounded_before_authentication(prefix):
+    async with gateway_client() as (client, seen):
+        client.headers.clear()
+        deeply_encoded = "%" + "25" * 15000
+        started = perf_counter()
+        response = await client.request("DELETE", prefix + deeply_encoded)
+        elapsed = perf_counter() - started
+        assert response.status_code == 400
+        assert seen == []
+        # Generous relative to ordinary local request latency; catches unbounded decoding.
+        assert elapsed < 1.0, f"parameter refusal took {elapsed:.3f}s"
