@@ -284,6 +284,165 @@ first auto-joining source in stable source order supplies its bot name. You can 
 auto-join per meeting in its prep view. Connections created without an explicit bot name default
 to the legacy user-wide setting, then `Vexa`.
 
+Google Meet `https://meet.google.com/lookup/<nickname>` links follow this same policy: the
+native key is the **bare nickname**, with its spelling preserved, and the original lookup URL
+is retained for the bot. Import and the scheduled sweep run inside Vexa; a caller application's
+temporary refusal of lookup links does **not** gate either path. A recognized lookup event with
+auto-join enabled can dispatch without a manual `POST /bots`. Malformed lookup paths, including
+semicolon parameters or extra path segments, import as link-less events and do not auto-join
+unless another valid conferencing link is present.
+This includes prose punctuation: `Join https://meet.google.com/lookup/daily; thanks`
+(also `daily;)` or `daily;.`) imports **without a meeting link** when no other valid link is
+present. Remove that semicolon in the event rather than relying on punctuation trimming.
+
+### Operator rollback: pause lookup meetings only
+
+Use the **Vexa gateway** as `API_BASE` below, not PTX's `/v1` API. Use each affected owner's
+`bot,tx` API key; shared/read-only rows cannot be patched. Keep the per-owner meeting IDs and
+calendar source IDs from `GET /meetings` (paginate with `limit=100&offset=…`) and
+`data.calendar_sources` before changing any event.
+
+1. **Before deploying**, capture the running PTX commit, full resolved compose, and actual
+   image tags **and digests** in the operator's private deployment record. Rollback uses that
+   captured, immediately previous accepted configuration, not a historical compose from this
+   page. **Never downgrade meeting-api to `63970d8` with the current bot**: the `a4be1f0`
+   ancestry includes the bot's `joining → needs_help` lifecycle transition.
+
+2. **Pause existing lookup plans per meeting**, including future scheduled occurrences, using
+   the row ID (not the nickname). In the meeting's prep view turn **Auto-join** off, or:
+
+   ```bash
+   curl --fail-with-body -sS -X PATCH "$API_BASE/meetings/$MEETING_ID" \
+     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+     -d '{"auto_join":false}' |
+     jq -e '.data.auto_join == false and .data.auto_join_user_set == true'
+   curl --fail-with-body -sS "$API_BASE/meetings/$MEETING_ID" \
+     -H "X-API-Key: $API_KEY" |
+     jq -e '.data.auto_join == false and .data.auto_join_user_set == true'
+   ```
+
+   The API sets `auto_join_user_set=true`; do **not** submit that marker directly. Calendar
+   reconciliation respects this per-meeting override. A 409 means the sweep already claimed
+   the row: treat it as an active bot in step 5, not a successfully paused plan.
+
+3. **Prevent new lookup occurrences at their source without pausing unrelated events.** In
+   every contributing provider calendar, temporarily remove Google Meet conferencing and lookup
+   URLs from **only the affected lookup events/recurring series**, including conferencing fields,
+   LOCATION, and DESCRIPTION. Preserve the original links privately for later restoration.
+   Coordinate a hold on adding new lookup events during rollback. Existing row overrides alone
+   do not cover a newly imported UID or future occurrence.
+
+   `PATCH /user/calendars/{id}` with `{"auto_join":false}` is available, but pauses **all**
+   meetings from that source, not just lookups; it is **not** the lookup-only procedure here.
+   If an operator explicitly chooses that broader pause, verify `GET /user/calendars` shows
+   `auto_join:false` on every contributing source; another enabled source can still arm a
+   shared meeting. Leave unrelated calendars unchanged for the lookup-only procedure.
+
+4. **Sync and verify the pause**, once for each affected calendar connection:
+
+   ```bash
+   curl --fail-with-body -sS -X POST "$API_BASE/user/calendars/$CALENDAR_ID/sync" \
+     -H "X-API-Key: $API_KEY"
+   curl --fail-with-body -sS "$API_BASE/user/calendars/$CALENDAR_ID/sync" \
+     -H "X-API-Key: $API_KEY" | jq .
+   ```
+
+   Check the sync result for errors, then repeat the per-row GET assertions from step 2 for
+   retained plans (a removed/cancelled event may remove its calendar-managed plan). Re-enumerate
+   **all pages** of meetings for each affected owner; pause any new lookup plans too. For an
+   operator with read-only database access, this check deliberately covers **every armed
+   scheduled lookup**, not just the current lead/grace window, so zero also proves none is due:
+
+   ```bash
+   psql "$VEXA_DATABASE_URL" -X -v ON_ERROR_STOP=1 <<'SQL'
+   BEGIN READ ONLY;
+   SELECT id, user_id, status,
+          data->>'auto_join' AS auto_join,
+          data->>'auto_join_user_set' AS auto_join_user_set
+   FROM meetings
+   WHERE platform = 'google_meet'
+     AND data->>'constructed_meeting_url' ~* '^https?://[^/]+/lookup([/;]|$)'
+     AND status = 'scheduled'
+     AND data->>'auto_join' IS DISTINCT FROM 'false';
+   COMMIT;
+   SQL
+   ```
+
+   **Required result: zero rows**, across all affected users. The DSN is operator-supplied;
+   do not print credentials. This query is read-only and does not invoke the sweep. Repeat the
+   check after sync and immediately before downgrade; any returned row blocks rollback.
+
+5. **Stop only nicknames with a live lookup bot, while current services are still live.**
+   Re-enumerate the owner's meetings (all pages) and group by bare `native_meeting_id`.
+   If a nickname has **no** row in `requested`, `joining`, `awaiting_admission`, `active`,
+   `needs_help`, `needs_human_help`, or `stopping`, **skip DELETE**: paused plans are not bots.
+   Do not rely on `/bots/status`, which omits some help statuses.
+
+   **Before stopping a live nickname**, privately record every owned `scheduled` or `idle`
+   sibling on it: row ID, title, meeting URL, scheduled time in UTC, workspace, calendar source
+   IDs/UIDs, and the intended eventual auto-join choice. The stop endpoint is **nickname-wide,
+   not row-scoped**: it cancels every non-terminal row on that nickname, including paused
+   plans, as terminal `failed`/`stopped`. It does this even without a running bot. Those plans
+   cannot be re-enabled with PATCH; calendar sync intentionally will not re-arm the same
+   stopped occurrence. Record them before DELETE and use the explicit recreation below.
+   Read the live row's bare `native_meeting_id`, URL-encode it, and call:
+
+   ```bash
+   NATIVE_PATH=$(jq -rn --arg id "$NATIVE_ID" '$id | @uri')
+   curl --fail-with-body -sS -X DELETE "$API_BASE/bots/google_meet/$NATIVE_PATH" \
+     -H "X-API-Key: $API_KEY"
+   curl --fail-with-body -sS "$API_BASE/meetings/$MEETING_ID" \
+     -H "X-API-Key: $API_KEY" |
+     jq -e '.status == "completed" or .status == "failed"'
+   ```
+
+   Repeat the read until terminal; `stopping` or a 404 from DELETE is **not** proof of exit.
+   Check every owned lookup row in `requested`, `joining`, `awaiting_admission`, `active`,
+   `needs_help`, `needs_human_help`, or `stopping`, including siblings on the same nickname.
+   Confirm their runtime workloads have exited using the operator's existing container/run
+   checks; do not downgrade while a lookup bot is still running.
+
+6. Restore the captured, immediately previous accepted image pins with the normal PTX
+   `infra/dstack/deploy-ptx-dev.sh` procedure. Preserve independently accepted gateway changes,
+   surviving scheduled rows, terminal history, transcripts, and volumes; do not reset the
+   database. **Keep lookup auto-join off after rollback**: the previous parser accepts
+   malformed/semicolon lookup paths. Keep overrides and lookup-only source edits (or an
+   explicitly chosen broader pause) until corrected links and the accepted parser are verified.
+
+   For surviving `scheduled`/`idle` rows, only then restore the events and deliberately
+   re-enable each held meeting through its prep view or `PATCH /meetings/{id}` with
+   `{"auto_join":true}`. **Do not PATCH the canceled terminal rows or expect a simple resync
+   to recreate them.** For each canceled occurrence the owner still wants, first create a new
+   manual plan from the saved title, corrected URL, UTC time, and workspace. Do this only after
+   the accepted parser is back; do not reschedule elapsed occurrences without the owner's
+   deliberate choice. With those saved values set in the variables below:
+
+   ```bash
+   NEW_MEETING_ID=$(
+     jq -n --arg title "$TITLE" --arg url "$CORRECTED_MEETING_URL" \
+       --arg at "$SCHEDULED_AT_UTC" --arg workspace "$WORKSPACE_ID" \
+       '{title:$title, meeting_url:$url, scheduled_at:($at | if . == "" then null else . end),
+         workspace_id:$workspace, auto_join:false}' |
+     curl --fail-with-body -sS -X POST "$API_BASE/meetings" \
+       -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+       --data-binary @- |
+     jq -er '.id'
+   )
+   curl --fail-with-body -sS -X PATCH "$API_BASE/meetings/$NEW_MEETING_ID" \
+     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+     -d '{"auto_join":false}' |
+     jq -e '(.status == "scheduled" or .status == "idle") and .data.auto_join == false and .data.auto_join_user_set == true'
+   ```
+
+   Require POST 201 and a **new ID**, not the old terminal ID. A 409 means another
+   non-terminal row already owns that nickname: inspect it instead of creating duplicates.
+   The following PATCH marks the new plan's pause as user-set before restoring the event.
+   Restore its corrected provider event, sync the contributing sources as in step 4, and
+   GET the **new** row to verify the time, link, workspace, source association, and both pause
+   flags. Calendar sync can adopt this manually recreated plan; it does not revive the stopped
+   row. Only after verification and the owner's choice, re-enable the new ID via the prep view
+   or PATCH `{"auto_join":true}`. Retain the old terminal row as history.
+
 ## Disconnect
 
 On **Calendar**, choose **Disconnect** for the exact named feed. Meetings that also belong to

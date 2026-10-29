@@ -21,10 +21,10 @@ from __future__ import annotations
 import os
 import re
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 _GMEET_ID = re.compile(r"^[a-z]{3}-[a-z]{4}-[a-z]{3}$")
-_GMEET_LOOKUP_PATH = re.compile(r"^/lookup/([^/?#&=\s\x00-\x1f\x7f]+)/?$")
+_GMEET_LOOKUP_PATH = re.compile(r"^/lookup/([^/;?#&=\s\x00-\x1f\x7f]+)/?$")
 _ZOOM_ID = re.compile(r"\d{9,11}")
 # The repeat is BOUNDED on purpose. Unbounded (`[^@%\s/]+@thread\.v2`) this pattern is scanned
 # with `.search()` over caller-supplied text, so every start offset that fails at `@thread.v2`
@@ -93,9 +93,11 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
     host = (parsed.hostname or "").lower()
     if host:
         if _host_is(host, "meet.google.com"):
-            lookup = _GMEET_LOOKUP_PATH.fullmatch(parsed.path)
-            if lookup and host == "meet.google.com":
-                return ("google_meet", lookup.group(1))
+            # urlsplit retains semicolon parameters so they cannot validate as a different URL.
+            path = urlsplit(value).path
+            if path == "/lookup" or path.startswith(("/lookup/", "/lookup;")):
+                lookup = _GMEET_LOOKUP_PATH.fullmatch(path)
+                return ("google_meet", lookup.group(1)) if lookup and host == "meet.google.com" else None
             code = next((p for p in reversed(parsed.path.split("/")) if p), "").lower()
             return ("google_meet", code) if _GMEET_ID.match(code) else None
         # Deliberately a NAME heuristic, not a domain allowlist: it is what claims a vanity or
@@ -178,7 +180,10 @@ def find_meeting_link(text: str) -> Optional[tuple[str, str, str]]:
     if not text:
         return None
     for m in re.finditer(r"https?://[^\s<>\"']+", text):
-        url = m.group(0).rstrip(").,;")
+        url = m.group(0).rstrip(").,")
+        # A semicolon is part of lookup path validation, not removable prose punctuation.
+        if not urlsplit(url).path.startswith(("/lookup/", "/lookup;")):
+            url = url.rstrip(";")
         # Free-text scan: hold jitsi to the explicit hosts (meet.jit.si + VEXA_JITSI_HOSTS) —
         # a calendar description is full of arbitrary links, and the pasted-link naming
         # heuristics (*jitsi* / ``meet.*``) would misread them as rooms.
