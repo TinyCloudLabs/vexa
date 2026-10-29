@@ -372,8 +372,20 @@ calendar source IDs from `GET /meetings` (paginate with `limit=100&offset=…`) 
    do not print credentials. This query is read-only and does not invoke the sweep. Repeat the
    check after sync and immediately before downgrade; any returned row blocks rollback.
 
-5. **Stop active lookup bots while current services are still live.** Read the bare
-   `native_meeting_id` from the owned row, URL-encode it, and call:
+5. **Stop only nicknames with a live lookup bot, while current services are still live.**
+   Re-enumerate the owner's meetings (all pages) and group by bare `native_meeting_id`.
+   If a nickname has **no** row in `requested`, `joining`, `awaiting_admission`, `active`,
+   `needs_help`, `needs_human_help`, or `stopping`, **skip DELETE**: paused plans are not bots.
+   Do not rely on `/bots/status`, which omits some help statuses.
+
+   **Before stopping a live nickname**, privately record every owned `scheduled` or `idle`
+   sibling on it: row ID, title, meeting URL, scheduled time in UTC, workspace, calendar source
+   IDs/UIDs, and the intended eventual auto-join choice. The stop endpoint is **nickname-wide,
+   not row-scoped**: it cancels every non-terminal row on that nickname, including paused
+   plans, as terminal `failed`/`stopped`. It does this even without a running bot. Those plans
+   cannot be re-enabled with PATCH; calendar sync intentionally will not re-arm the same
+   stopped occurrence. Record them before DELETE and use the explicit recreation below.
+   Read the live row's bare `native_meeting_id`, URL-encode it, and call:
 
    ```bash
    NATIVE_PATH=$(jq -rn --arg id "$NATIVE_ID" '$id | @uri')
@@ -392,12 +404,44 @@ calendar source IDs from `GET /meetings` (paginate with `limit=100&offset=…`) 
 
 6. Restore the captured, immediately previous accepted image pins with the normal PTX
    `infra/dstack/deploy-ptx-dev.sh` procedure. Preserve independently accepted gateway changes,
-   scheduled rows, transcripts, and volumes; do not reset the database. **Keep lookup auto-join
-   off after rollback**: the previous parser accepts malformed/semicolon lookup paths. Keep
-   the per-row overrides and lookup-only source edits (or an explicitly chosen broader pause)
-   in place until corrected links and the accepted parser have been verified. Only then restore
-   the lookup events and deliberately re-enable each held meeting through its prep view or
-   `PATCH /meetings/{id}` with `{"auto_join":true}`.
+   surviving scheduled rows, terminal history, transcripts, and volumes; do not reset the
+   database. **Keep lookup auto-join off after rollback**: the previous parser accepts
+   malformed/semicolon lookup paths. Keep overrides and lookup-only source edits (or an
+   explicitly chosen broader pause) until corrected links and the accepted parser are verified.
+
+   For surviving `scheduled`/`idle` rows, only then restore the events and deliberately
+   re-enable each held meeting through its prep view or `PATCH /meetings/{id}` with
+   `{"auto_join":true}`. **Do not PATCH the canceled terminal rows or expect a simple resync
+   to recreate them.** For each canceled occurrence the owner still wants, first create a new
+   manual plan from the saved title, corrected URL, UTC time, and workspace. Do this only after
+   the accepted parser is back; do not reschedule elapsed occurrences without the owner's
+   deliberate choice. With those saved values set in the variables below:
+
+   ```bash
+   NEW_MEETING_ID=$(
+     jq -n --arg title "$TITLE" --arg url "$CORRECTED_MEETING_URL" \
+       --arg at "$SCHEDULED_AT_UTC" --arg workspace "$WORKSPACE_ID" \
+       '{title:$title, meeting_url:$url, scheduled_at:($at | if . == "" then null else . end),
+         workspace_id:$workspace, auto_join:false}' |
+     curl --fail-with-body -sS -X POST "$API_BASE/meetings" \
+       -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+       --data-binary @- |
+     jq -er '.id'
+   )
+   curl --fail-with-body -sS -X PATCH "$API_BASE/meetings/$NEW_MEETING_ID" \
+     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+     -d '{"auto_join":false}' |
+     jq -e '(.status == "scheduled" or .status == "idle") and .data.auto_join == false and .data.auto_join_user_set == true'
+   ```
+
+   Require POST 201 and a **new ID**, not the old terminal ID. A 409 means another
+   non-terminal row already owns that nickname: inspect it instead of creating duplicates.
+   The following PATCH marks the new plan's pause as user-set before restoring the event.
+   Restore its corrected provider event, sync the contributing sources as in step 4, and
+   GET the **new** row to verify the time, link, workspace, source association, and both pause
+   flags. Calendar sync can adopt this manually recreated plan; it does not revive the stopped
+   row. Only after verification and the owner's choice, re-enable the new ID via the prep view
+   or PATCH `{"auto_join":true}`. Retain the old terminal row as history.
 
 ## Disconnect
 
