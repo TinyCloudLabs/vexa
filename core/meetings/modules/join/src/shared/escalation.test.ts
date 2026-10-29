@@ -4,9 +4,6 @@
 import { ESCALATION_RETRY_COOLDOWN_MS, resetEscalation, triggerEscalation, wasEscalationTriggered } from './escalation';
 import { setHooks, type JoinState } from '../_host';
 
-// Without DISPLAY, startVncStack returns before spawning anything, so these checks never touch VNC.
-delete process.env.DISPLAY;
-
 let failures = 0;
 function check(name: string, ok: boolean, detail = ''): void {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${ok ? '' : ` - ${detail}`}`);

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
+import { visualDebugCommands } from './visual-debug';
 import { log, callNeedsHumanHelpCallback } from '../_host';
 
 let escalationTriggered = false;
@@ -43,7 +43,7 @@ export function checkEscalation(
 }
 
 /**
- * Trigger escalation: start VNC stack and notify meeting-api.
+ * Trigger escalation: notify meeting-api without enabling visual export.
  * Idempotent — only fires once per admission attempt. A refused or failed attempt is retried
  * no sooner than ESCALATION_RETRY_COOLDOWN_MS later. `now` is injectable so tests run on virtual time.
  */
@@ -52,7 +52,6 @@ export async function triggerEscalation(botConfig: any, reason: string, now: num
   escalationInFlight = true;
   try {
     log(`[Escalation] Triggered: ${reason}`);
-    await startVncStack();
     const accepted = await callNeedsHumanHelpCallback(botConfig, reason);
     // Only an accepted escalation is one-shot. A refused one is retried after the cooldown.
     if (accepted) escalationTriggered = true;
@@ -64,25 +63,14 @@ export async function triggerEscalation(botConfig: any, reason: string, now: num
 }
 
 /**
- * Lazily start VNC stack on the existing Xvfb :99 display.
- * Meeting bots already render to :99 — this just exposes it.
+ * Explicit debug-only visual export. Escalation never starts these services.
  */
-export async function startVncStack(): Promise<void> {
-  if (vncStarted) return;
+export async function startVncStack(): Promise<boolean> {
+  const commands = visualDebugCommands();
+  if (!commands.length) return false;
+  if (vncStarted) return true;
 
-  // Platform guard: VNC exposes an X11 display. On a non-Linux host (a
-  // contributor's macOS laptop) there is no Xvfb :99 — but the join layer there
-  // runs HEADED Chromium, so a real window is already visible and VNC is moot.
-  // Spawning x11vnc on macOS throws ENOENT and previously crashed the process
-  // (weld-point #3 in the #439 isolation audit). Skip cleanly instead.
-  const display = process.env.DISPLAY;
-  if (process.platform !== 'linux' || !display) {
-    log(`[Debug] VNC skipped (platform=${process.platform}, DISPLAY=${display || 'unset'}) — headed browser is directly visible; attach the agent over CDP instead.`);
-    vncStarted = true; // mark done so we don't retry
-    return;
-  }
-
-  log(`[Debug] Starting VNC stack on ${display}`);
+  log('[Debug] Starting password-protected loopback-only visual debug');
 
   // spawn() failures surface as an async 'error' event; without a listener Node
   // throws and kills the bot. Attach a tolerant handler on each child.
@@ -96,34 +84,24 @@ export async function startVncStack(): Promise<void> {
     }
   };
 
-  // x11vnc — expose existing Xvfb display
-  safeSpawn('x11vnc', ['-display', display, '-forever', '-nopw', '-shared', '-rfbport', '5900']);
-
-  // websockify — bridge VNC to WebSocket for noVNC
-  const novncDir = '/usr/share/novnc';
-  const wsArgs = existsSync(novncDir)
-    ? ['--web', novncDir, '6080', 'localhost:5900']
-    : ['6080', 'localhost:5900'];
-  safeSpawn('websockify', wsArgs);
+  for (const { command, args } of commands) safeSpawn(command, args);
 
   // Wait for VNC port to be ready (up to 3s)
   await waitForPort(5900, 3000);
   vncStarted = true;
-  log('[Debug] VNC stack started — port 5900 (VNC), 6080 (noVNC web)');
+  log('[Debug] Visual debug started on loopback ports 5900/6080');
+  return true;
 }
 
 /**
- * Public, escalation-INDEPENDENT debug entry. This is the un-gating the joining
- * layer needs: a dev (or the agent) can turn on the live view for a HEALTHY
- * join, not only when the bot gets stuck. Pixels via VNC/noVNC (Linux), control
- * via CDP (any platform). Returns the endpoints so a runner can print them.
+ * Explicit opt-in debug entry. VNC/noVNC require a private password file;
+ * neither meeting configuration nor escalation enables them.
  */
 export async function startDebugView(): Promise<{ vncUrl?: string; novncUrl?: string; cdpUrl: string }> {
-  await startVncStack();
-  const onLinux = process.platform === 'linux' && !!process.env.DISPLAY;
+  const enabled = await startVncStack();
   return {
-    vncUrl: onLinux ? 'vnc://localhost:5900' : undefined,
-    novncUrl: onLinux ? 'http://localhost:6080/vnc.html' : undefined,
+    vncUrl: enabled ? 'vnc://127.0.0.1:5900' : undefined,
+    novncUrl: enabled ? 'http://127.0.0.1:6080/vnc.html' : undefined,
     cdpUrl: 'http://localhost:9222', // Playwright connectOverCDP target
   };
 }

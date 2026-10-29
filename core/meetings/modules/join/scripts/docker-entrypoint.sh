@@ -3,7 +3,7 @@
 # src/ and scripts/ are mounted live from the host (make debug) — tsx runs the
 # TypeScript directly, so a host edit + re-run is instant, no rebuild. The image
 # bakes only the reproducible environment (Xvfb + humanized X11 + noVNC + deps).
-# startDebugView() auto-spawns x11vnc + websockify(noVNC:6080) because DISPLAY is set.
+# Visual export requires VEXA_VISUAL_DEBUG=1 and a private VEXA_VISUAL_DEBUG_PASSWORD_FILE.
 set -e
 
 : "${MEETING_URL:?set MEETING_URL to a meet.google.com or Teams meeting link}"

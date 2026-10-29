@@ -87,6 +87,32 @@ Run `pnpm --filter @vexa/bot test:browser-failure` to inject a real Chromium cra
 This test requires Chromium and fails when it is unavailable. It does not reproduce OOM or
 replace a long Google Meet validation.
 
+### Checkpoint screenshots: off by default
+
+Bot-managed pages do not render or write `Page.screenshot` requests whose **effective filesystem destination** is `/app/storage/screenshots` or a descendant unless the bot process explicitly sets `VEXA_CHECKPOINT_SCREENSHOTS=1` **before browser launch**. Existing ancestor symlinks and existing/dangling output-file symlinks are resolved before collecting pixels. Keep this flag unset or `0` in production. Other values do not opt in. Disabled checkpoint calls resolve with an empty buffer so existing join/diagnostic callers continue without collecting page pixels.
+
+Explicit opt-in restores the existing, unsanitized checkpoint behavior. This flag does not change join selectors, admission decisions, diagnostic messages, recordings, audio capture, pathless screenshots, or effective destinations outside the checkpoint directory (including outward-pointing aliases). It covers existing/later pages and later separate contexts created through this bot's Browser instance, without changing the global Page prototype. Filesystem resolution errors other than a missing suffix fail before pixel collection.
+
+The flag does not delete artifacts written previously.
+
+The separate local-only `tools/bot-dom-capture` tool remains unchanged: its explicit operator mounts capture sanitized DOM and rendered PNGs to its private output, not to the checkpoint directory. It does not require enabling raw checkpoint screenshots.
+
+The regression `test:checkpoint-screenshots` exercises a real browser/filesystem with `NODE_ENV=production`, unset/disabled/non-opt-in values, explicit `1`, child pages, later separate contexts/Browser pages, relative/normalized paths, symlinked ancestors, existing/dangling output-file aliases, missing-parent/`..` combinations, cyclic aliases, and effective outside-path controls. Run it in a disposable, networkless bot container after the normal workspace build, from the repository root:
+
+```sh
+docker run --rm --network none \
+  -e NODE_ENV=production -e NODE_OPTIONS=--import=tsx \
+  -e BOT_WORKER_ENTRY=/app/core/meetings/services/bot/dist/checkpoint-screenshots.boundary.test.ts \
+  --mount "type=bind,source=$PWD/core/meetings/services/bot/dist/capture-bridge.js,target=/app/core/meetings/services/bot/dist/capture-bridge.js,readonly" \
+  --mount "type=bind,source=$PWD/core/meetings/services/bot/dist/checkpoint-screenshots.js,target=/app/core/meetings/services/bot/dist/checkpoint-screenshots.js,readonly" \
+  --mount "type=bind,source=$PWD/core/meetings/services/bot/src/checkpoint-screenshots.boundary.test.ts,target=/app/core/meetings/services/bot/dist/checkpoint-screenshots.boundary.test.ts,readonly" \
+  ghcr.io/tinycloudlabs/vexa/bot@sha256:efa1e11d9fafc74fdf398a29905b96262ce91002d9d3fdac1159898017d9e8b7
+```
+
+This uses the existing image with read-only compiled-adapter/test overlays, not a new image build. Only synthetic pages are rendered; no Meet, account, production mount, or paid provider is used.
+
+Visual debugging has an independent default-off gate: `VEXA_VISUAL_DEBUG=1` and `VEXA_VISUAL_DEBUG_PASSWORD_FILE` must be explicitly set on the process starting it. Escalation only notifies the host; it never starts VNC/noVNC, even with debug opt-in. Both listeners bind loopback only, and VNC requires password authentication. Keep both screenshot and visual-debug flags absent or `0` in production. See [`@vexa/join`](../../modules/join/README.md#explicit-local-visual-debugging) for password requirements and the networkless real-service regression.
+
 **Owns:** none — the bot is a worker that implements published meetings contracts.
 **Consumes:** [`invocation.v1`](../../contracts/invocation.v1) (boot config),
 [`acts.v1`](../../contracts/acts.v1) (inbound commands),

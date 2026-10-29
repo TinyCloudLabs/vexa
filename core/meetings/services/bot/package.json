@@ -13,6 +13,7 @@
     "test:memory": "tsx scripts/memory-probe.ts",
     "test:privacy": "tsx src/log-sanitizer.test.ts",
     "test:browser-failure": "tsx src/browser-failure.boundary.test.ts",
+    "test:checkpoint-screenshots": "tsx src/checkpoint-screenshots.boundary.test.ts",
     "replay": "tsx src/replay.test.ts",
     "check:isolation": "node scripts/check-isolation.js"
   },
