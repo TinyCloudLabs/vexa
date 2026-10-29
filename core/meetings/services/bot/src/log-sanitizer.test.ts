@@ -11,6 +11,9 @@ const script = `
   console.log(JSON.stringify({level:'warn', event:'join.unknown_blocking_dialog', platform:'google_meet', msg:'SYNTH_MODAL_TEXT_650'}));
   console.log(JSON.stringify({level:'warn', event:'join.ui_locale_not_english', platform:'google_meet', html_lang:'fi', navigator_language:'en-US', msg:'SYNTH_LOCALE_TEXT_651'}));
   console.log(JSON.stringify({ts:'2026-10-20T00:00:00.000Z', level:'warn', event:'join.gemini_notice_handled', platform:'google_meet', success:true, attempt:1, msg:'SYNTH_NOTICE_TEXT_640', title:'SYNTH_NAME_641'}));
+  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',platform:'google_meet',error_code:'selector_not_found',step:'join_request',selector_set:'guest_join',selector_mask:31,selector_count:5,candidate_count:2,timeout_ms:60000,lobby_reached:true,html_lang:'en',navigator_language:'en-US',selector:'button:has-text("SYNTH_NAME_652")',label:'SYNTH_LABEL_653',html:'SYNTH_DOM_654',path:'/private/SYNTH_PATH_655'}));
+  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',step:'SYNTH_STEP_656',selector_set:'SYNTH_SET_657',selector_mask:'SYNTH_MASK_658',lobby_reached:'SYNTH_LOBBY_659'}));
+  console.warn(JSON.stringify({level:'warn',event:'admission.failed',platform:'google_meet',step:'admission',error_code:'admission_unconfirmed',lobby_reached:true,html_lang:'en',navigator_language:'en-US',message:'SYNTH_ADMISSION_PAGE_660'}));
   console.info(JSON.stringify({level:'info', event:'capture_signal.tape_started', frames:8}));
   console.warn({level:'warn', event:'capture_signal.tape_upload_failed', error_code:'upload_failed', attempts:3});
   console.log('SYNTH_NAME_592', {text:'SYNTH_TRANSCRIPT_592'});
@@ -51,6 +54,21 @@ assert.deepEqual(Object.keys(JSON.parse(localeLine)).sort(), ['event', 'html_lan
 assert.equal(output.includes('SYNTH_MODAL_TEXT_650') || output.includes('SYNTH_LOCALE_TEXT_651'), false, 'event leaked free text');
 assert.equal(output.includes('SYNTH_NOTICE_TEXT_640') || output.includes('SYNTH_NAME_641'), false, 'notice event leaked free text');
 assert.equal([...output.matchAll(/"meeting_id":/g)].length, 1);
+const missLine = output.split('\n').find((line) => line.includes('"step":"join_request"'));
+assert.ok(missLine, 'selector failure diagnostics must survive the production process sanitizer');
+assert.deepEqual(JSON.parse(missLine), {
+  level:'warn', event:'join.selector_miss', platform:'google_meet', error_code:'selector_not_found',
+  step:'join_request', selector_set:'guest_join', selector_mask:31, selector_count:5,
+  candidate_count:2, timeout_ms:60000, lobby_reached:true, html_lang:'en', navigator_language:'en-US',
+});
+for (const canary of ['SYNTH_NAME_652','SYNTH_LABEL_653','SYNTH_DOM_654','SYNTH_PATH_655','SYNTH_STEP_656','SYNTH_SET_657','SYNTH_MASK_658','SYNTH_LOBBY_659']) {
+  assert.equal(output.includes(canary), false, `selector diagnostics leaked ${canary}`);
+}
+const terminalLine = output.split('\n').find((line) => line.includes('"event":"admission.failed"'));
+assert.ok(terminalLine, 'terminal admission reason must survive the process sanitizer');
+assert.equal(JSON.parse(terminalLine).error_code, 'admission_unconfirmed');
+assert.equal(JSON.parse(terminalLine).step, 'admission');
+assert.equal(output.includes('SYNTH_ADMISSION_PAGE_660'), false, 'terminal reason leaked page content');
 assert.doesNotMatch(output, /"user_id"|plain/);
 const telemetryModule = fileURLToPath(new URL('./telemetry.ts', import.meta.url));
 const importScript = `

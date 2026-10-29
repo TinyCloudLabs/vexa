@@ -81,6 +81,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
+      - run: node --test tools/bot-dom-capture/*.test.mjs
 
   # THE required check — branch protection + merge queue watch this single context.
   gates:
