@@ -83,6 +83,9 @@ class TestParseGoogleMeetLookup:
     def test_lookup_requires_exactly_one_nickname_segment(self):
         assert parse_meeting_url("https://meet.google.com/lookup/") is None
         assert parse_meeting_url("https://meet.google.com/lookup/a/b") is None
+    def test_lookup_rejects_google_meet_subdomain(self):
+        assert parse_meeting_url("https://foo.meet.google.com/lookup/TeamNick") is None
+
 
 class TestFindMeetingLinkJitsi:
     def test_found_in_free_text(self):

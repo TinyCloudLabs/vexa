@@ -94,7 +94,7 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
     if host:
         if _host_is(host, "meet.google.com"):
             lookup = _GMEET_LOOKUP_PATH.fullmatch(parsed.path)
-            if lookup:
+            if lookup and host == "meet.google.com":
                 return ("google_meet", lookup.group(1))
             code = next((p for p in reversed(parsed.path.split("/")) if p), "").lower()
             return ("google_meet", code) if _GMEET_ID.match(code) else None
