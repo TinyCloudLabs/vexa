@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 _GMEET_ID = re.compile(r"^[a-z]{3}-[a-z]{4}-[a-z]{3}$")
+_GMEET_LOOKUP_PATH = re.compile(r"^/lookup/([^/?#&=\s\x00-\x1f\x7f]+)/?$")
 _ZOOM_ID = re.compile(r"\d{9,11}")
 # The repeat is BOUNDED on purpose. Unbounded (`[^@%\s/]+@thread\.v2`) this pattern is scanned
 # with `.search()` over caller-supplied text, so every start offset that fails at `@thread.v2`
@@ -92,6 +93,9 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
     host = (parsed.hostname or "").lower()
     if host:
         if _host_is(host, "meet.google.com"):
+            lookup = _GMEET_LOOKUP_PATH.fullmatch(parsed.path)
+            if lookup:
+                return ("google_meet", lookup.group(1))
             code = next((p for p in reversed(parsed.path.split("/")) if p), "").lower()
             return ("google_meet", code) if _GMEET_ID.match(code) else None
         # Deliberately a NAME heuristic, not a domain allowlist: it is what claims a vanity or

@@ -776,6 +776,22 @@ def _spawn_env(monkeypatch):
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
 
 
+def test_post_bots_null_native_id_derives_google_meet_lookup_id(monkeypatch):
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post(
+        "/bots",
+        headers=HEADERS,
+        json={
+            "platform": "google_meet",
+            "native_meeting_id": None,
+            "meeting_url": "https://meet.google.com/lookup/c2dhdn5hqs",
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["native_meeting_id"] == "c2dhdn5hqs"
+    assert repo._meetings[1]["native_meeting_id"] == "c2dhdn5hqs"
+
 def test_post_bots_url_only_derives_native_id(monkeypatch):
     """Row 1: platform + meeting_url, no native id → 201 with the id derived from the URL."""
     _spawn_env(monkeypatch)

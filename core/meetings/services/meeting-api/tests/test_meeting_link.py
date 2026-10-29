@@ -64,6 +64,26 @@ class TestParseExistingPlatformsUnchanged:
         assert parse_meeting_url("https://teams.live.com/meet/9361792952021?p=abc") == ("teams", "9361792952021")
 
 
+class TestParseGoogleMeetLookup:
+    def test_lookup_nickname_is_the_native_id(self):
+        assert parse_meeting_url("https://meet.google.com/lookup/c2dhdn5hqs") == (
+            "google_meet",
+            "c2dhdn5hqs",
+        )
+
+    def test_lookup_nickname_preserves_spelling_and_ignores_query(self):
+        url = "https://meet.google.com/lookup/TeamNick?authuser=0"
+        assert parse_meeting_url(url) == ("google_meet", "TeamNick")
+        assert find_meeting_link(f"Join: {url}") == (
+            "google_meet",
+            "TeamNick",
+            url,
+        )
+
+    def test_lookup_requires_exactly_one_nickname_segment(self):
+        assert parse_meeting_url("https://meet.google.com/lookup/") is None
+        assert parse_meeting_url("https://meet.google.com/lookup/a/b") is None
+
 class TestFindMeetingLinkJitsi:
     def test_found_in_free_text(self):
         got = find_meeting_link("Join us: https://meet.jit.si/VexaStandup today")
