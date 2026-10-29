@@ -1,0 +1,1 @@
+- **Accept Google Meet lookup links (TC-2181).** Meeting creation now derives the lookup nickname as its native ID, and treats a null ID as absent.

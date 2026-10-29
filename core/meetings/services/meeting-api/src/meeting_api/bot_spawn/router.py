@@ -319,7 +319,8 @@ def build_router(
             )
 
         platform = str(body.get("platform", "")).strip()
-        native_meeting_id = str(body.get("native_meeting_id", "")).strip()
+        native_meeting_id = body.get("native_meeting_id")
+        native_meeting_id = str(native_meeting_id).strip() if native_meeting_id is not None else ""
         meeting_url = body.get("meeting_url")
         # A caller-supplied meeting_url is an any-URL passthrough to the bot's browser
         # (zoom/jitsi) — validate at the point of entry (SSRF hygiene, 422 on violation).
