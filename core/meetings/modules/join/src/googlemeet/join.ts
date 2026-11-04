@@ -15,6 +15,7 @@ import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
 import { AdmissionError } from "../shared/admission";
 import { resolveBotUiLocale } from "../browser-args";
 import { observedPageContext } from "./diagnostics";
+import { watchGoogleJoinRefusal, throwIfGoogleJoinRefused } from "./refusal";
 
 /** Thrown when authenticated mode detects a signed-out browser profile. Extends AdmissionError so
  *  the JoinDriver's single `instanceof` catch maps the typed `auth_session_missing` outcome to a
@@ -218,7 +219,8 @@ export async function describeSelectorMiss(
  * Wait for the FIRST of an ordered selector list to become visible
  * in declared priority order. Returns the matched handle and selector.
  * A total miss throws with static step/selector codes, counts, observed locale,
- * and the caller's confirmed-lobby state, without page text.
+ * and the caller's confirmed-lobby state, without page text. `guard` runs before
+ * every poll and ends the wait by throwing (Meet refusing the join, refusal.ts).
  */
 export async function waitForAnySelector(
   page: Page,
@@ -226,11 +228,13 @@ export async function waitForAnySelector(
   timeoutMs: number,
   label: string,
   signal?: AbortSignal,
-  lobbyReached = false
+  lobbyReached = false,
+  guard?: () => Promise<void>
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   do {
     signal?.throwIfAborted();
+    if (guard) await guard();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log("[Google Meet] Selector matched");
@@ -258,6 +262,7 @@ export async function waitForAnySelector(
  * the selector list could not, it logs a telemetry line — the only evidence a
  * future re-promotion could stand on (does a real non-English lobby exist where
  * the scan uniquely wins?). It does not shorten or lengthen the selector budget.
+ * `guard` runs before every poll, as in waitForAnySelector.
  */
 export async function waitForLobbyCta(
   page: Page,
@@ -265,7 +270,8 @@ export async function waitForLobbyCta(
   timeoutMs: number,
   label: string,
   signal?: AbortSignal,
-  lobbyReached = false
+  lobbyReached = false,
+  guard?: () => Promise<void>
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
@@ -273,6 +279,7 @@ export async function waitForLobbyCta(
   let lastCandidateCount: number | null = null;
   do {
     signal?.throwIfAborted();
+    if (guard) await guard();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log("[Google Meet] Selector matched");
@@ -328,6 +335,10 @@ export async function joinGoogleMeeting(
   // immediately before each join/ask-to-join click. A click already sent is not undone; the
   // embedder withdraws (TC-903).
   const signal = botConfig.signal;
+  // Before navigating: Meet can refuse the join during the lobby load or on the click, and
+  // answers on the network first (refusal.ts). Every lobby wait below stops on that refusal.
+  watchGoogleJoinRefusal(page);
+  const refused = (stage: string) => () => throwIfGoogleJoinRefused(page, stage);
   const navUrl = withPinnedMeetLocale(meetingUrl, resolveBotUiLocale());
   signal?.throwIfAborted();
   await page.goto(navUrl, { waitUntil: "domcontentloaded" });
@@ -451,7 +462,8 @@ export async function joinGoogleMeeting(
       30000,
       "authenticated join CTA",
       signal,
-      lobbyReached
+      lobbyReached,
+      refused("lobby, authenticated join CTA")
     );
 
     // Signed-out guard: a guest lobby (name input rendered) means the persisted
@@ -482,7 +494,9 @@ export async function joinGoogleMeeting(
       googleNameInputSelectors,
       120000,
       "name input",
-      signal
+      signal,
+      false,
+      refused("lobby, name input")
     );
     log("Name input field found.");
 
@@ -513,7 +527,8 @@ export async function joinGoogleMeeting(
       60000,
       "join button",
       signal,
-      true
+      true,
+      refused("lobby, join button")
     );
     signal?.throwIfAborted();
     await clickHandle(joinHandle!, "ask_to_join");
