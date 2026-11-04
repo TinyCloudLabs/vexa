@@ -14,6 +14,8 @@ const script = `
   console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',platform:'google_meet',error_code:'selector_not_found',step:'join_request',selector_set:'guest_join',selector_mask:31,selector_count:5,candidate_count:2,timeout_ms:60000,lobby_reached:true,html_lang:'en',navigator_language:'en-US',selector:'button:has-text("SYNTH_NAME_652")',label:'SYNTH_LABEL_653',html:'SYNTH_DOM_654',path:'/private/SYNTH_PATH_655'}));
   console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',step:'SYNTH_STEP_656',selector_set:'SYNTH_SET_657',selector_mask:'SYNTH_MASK_658',lobby_reached:'SYNTH_LOBBY_659'}));
   console.warn(JSON.stringify({level:'warn',event:'admission.failed',platform:'google_meet',step:'admission',error_code:'admission_unconfirmed',lobby_reached:true,html_lang:'en',navigator_language:'en-US',message:'SYNTH_ADMISSION_PAGE_660'}));
+  console.log(JSON.stringify({ts:'2026-11-04T00:00:00.000Z',level:'warn',event:'join.refused',platform:'google_meet',error_code:'join_refused',refused_call:'resolve_meeting_space',attempt:1,attempts_max:3,evidence:'SYNTH_REFUSAL_TEXT_661',url:'https://meet.google.com/abc-defg-hij'}));
+  console.log(JSON.stringify({level:'warn',event:'join.refused',platform:'google_meet',error_code:'join_refused',refused_call:'SYNTH_CALL_662',attempt:2,attempts_max:3}));
   console.info(JSON.stringify({level:'info', event:'capture_signal.tape_started', frames:8}));
   console.warn({level:'warn', event:'capture_signal.tape_upload_failed', error_code:'upload_failed', attempts:3});
   console.log('SYNTH_NAME_592', {text:'SYNTH_TRANSCRIPT_592'});
@@ -69,6 +71,14 @@ assert.ok(terminalLine, 'terminal admission reason must survive the process sani
 assert.equal(JSON.parse(terminalLine).error_code, 'admission_unconfirmed');
 assert.equal(JSON.parse(terminalLine).step, 'admission');
 assert.equal(output.includes('SYNTH_ADMISSION_PAGE_660'), false, 'terminal reason leaked page content');
+const refusedLines = output.split('\n').filter((line) => line.includes('"event":"join.refused"'));
+assert.equal(refusedLines.length, 2, 'every refused Meet knock must survive the process sanitizer');
+assert.deepEqual(JSON.parse(refusedLines[0]), {
+  level:'warn', event:'join.refused', platform:'google_meet', error_code:'join_refused',
+  refused_call:'resolve_meeting_space', attempt:1, attempts_max:3,
+});
+assert.equal(Object.hasOwn(JSON.parse(refusedLines[1]), 'refused_call'), false, 'an unknown refused_call value is dropped');
+assert.equal(output.includes('SYNTH_REFUSAL_TEXT_661') || output.includes('SYNTH_CALL_662'), false, 'refusal event leaked free text');
 assert.doesNotMatch(output, /"user_id"|plain/);
 const telemetryModule = fileURLToPath(new URL('./telemetry.ts', import.meta.url));
 const importScript = `
@@ -267,9 +277,11 @@ const providerJoinScript = `
         if (platform === 'zoom') return false;
         return true;
       },
-      locator() {
+      locator(selector) {
+        // Every control is on screen except Meet's refusal copy, which would end the join (refusal.ts).
+        const visible = !String(selector).includes('join this video call');
         const loc = {
-          first() { return loc; }, async isVisible() { return true; }, async waitFor() {},
+          first() { return loc; }, async isVisible() { return visible; }, async waitFor() {},
           async click() { if (fail) throw new Error('SYNTH_PROVIDER_BODY_615'); }, async fill(value) { typed = value; }, async inputValue() { return ''; },
           async getAttribute() { return null; }, async elementHandle() { return { async click() {}, async dispose() {} }; },
         };

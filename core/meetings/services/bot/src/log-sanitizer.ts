@@ -6,6 +6,7 @@ const EVENTS: Record<string, true> = {
   'capture_signal.tape_upload_skipped': true, 'capture_signal.cap_invalid': true,
   transcription_retry: true, transcription_failed: true, transcript_publish_drain_timeout: true,
   'join.lobby_locale': true, 'join.selector_miss': true, 'join.name_entry': true, 'join.gemini_notice_handled': true, 'join.unknown_blocking_dialog': true, 'join.ui_locale_not_english': true,
+  'join.refused': true,
   'admission.waiting': true, 'admission.admitted': true, 'admission.rejected': true, 'admission.blocked': true, 'admission.failed': true,
   'leave.completed': true, 'leave.failed': true, 'removal.detected': true, 'removal.monitor_stopped': true,
   'process.fatal': true,
@@ -40,6 +41,10 @@ const ERROR_CODES: Record<string, true> = {
   host_denial: true, captcha_pending: true, captcha_unsolved: true, error_page: true,
   selector_not_found: true,
   admission_unconfirmed: true, admission_error: true,
+  join_refused: true,
+};
+const REFUSED_CALLS: Record<string, true> = {
+  resolve_meeting_space: true, create_meeting_device: true, refusal_screen: true,
 };
 const ADMISSION_BLOCK_REASONS: Record<string, true> = {
   modal_dialog: true, consent_text: true, notes_text: true, waiting_room_indicator: true, no_positive_evidence: true,
@@ -74,6 +79,8 @@ function safeRecord(value: unknown): Record<string, unknown> | null {
       result.step = field;
     } else if (key === 'selector_set' && typeof field === 'string' && Object.hasOwn(SELECTOR_SETS, field)) {
       result.selector_set = field;
+    } else if (key === 'refused_call' && typeof field === 'string' && Object.hasOwn(REFUSED_CALLS, field)) {
+      result.refused_call = field;
     } else if (Object.hasOwn(NUMBERS, key) && typeof field === 'number' && Number.isFinite(field)) {
       result[key] = field;
     } else if (Object.hasOwn(BOOLEANS, key) && typeof field === 'boolean') {
