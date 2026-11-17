@@ -437,6 +437,23 @@ export const googleLobbyIconGlyphSelectors: string[] = [
 // a disclosure/consent paragraph rendered as a button — and is not a CTA.
 export const googleLobbyCtaMaxLabelChars = 48;
 
+// Fixed vocabulary for the join-button-miss diagnostic. When the join CTA is not found, the scan
+// reports WHICH of these exact (lower-cased, whole-label) button texts were visible, as a bitmask
+// (bit i = entry i), and how many visible text buttons were not in this list. Only the mask and the
+// count are logged: the log sanitizer forbids free text, so unknown labels are counted, never read.
+// Append new entries at the END (bit positions are what monitoring decodes). Max 30 entries.
+// Decode: bit 0 ask to join, 1 join now, 2 join, 3 continue as guest, 4 sign in, 5 got it, 6 dismiss,
+// 7 cancel, 8 accept all, 9 reject all, 10 more options, 11 return to home screen, 12 submit feedback,
+// 13 rejoin, 14 switch account, 15 use another account, 16 next, 17 continue, 18 ok, 19 close,
+// 20 try again, 21 learn more, 22 back to home screen, 23 join anyway, 24 create account, 25 i agree,
+// 26 reload, 27 skip, 28 no thanks, 29 allow.
+export const googleLobbyLabelVocabulary: string[] = [
+  "ask to join", "join now", "join", "continue as guest", "sign in", "got it", "dismiss", "cancel",
+  "accept all", "reject all", "more options", "return to home screen", "submit feedback", "rejoin",
+  "switch account", "use another account", "next", "continue", "ok", "close", "try again", "learn more",
+  "back to home screen", "join anyway", "create account", "i agree", "reload", "skip", "no thanks", "allow",
+];
+
 export const googleCameraButtonSelectors: string[] = [
   '[aria-label*="Turn off camera"]',
   'button[aria-label*="Turn off camera"]',
