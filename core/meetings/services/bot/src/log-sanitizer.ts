@@ -27,7 +27,7 @@ const NUMBERS: Record<string, true> = {
   sample_rate: true, channels: true, timeout_ms: true, pending_count: true, selector_count: true,
   candidate_count: true, participant_tiles: true, self_name_count: true, real_tiles: true, recaptcha_frames: true,
   count: true, ts_ms: true,
-  selector_mask: true,
+  selector_mask: true, label_mask: true, label_other: true,
 };
 const BOOLEANS: Record<string, true> = {
   ok: true, success: true, confirmed: true, leave_result: true, truncated: true, capped: true,

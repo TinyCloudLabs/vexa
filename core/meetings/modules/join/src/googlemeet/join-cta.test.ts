@@ -49,6 +49,7 @@ import {
   googleNameInputSelectors,
   googleLobbyIconGlyphSelectors,
   googleLobbyCtaMaxLabelChars,
+  googleLobbyLabelVocabulary,
 } from './selectors';
 import {
   findLobbyPrimaryCta,
@@ -187,6 +188,7 @@ function mount(html: string): Document {
 const SCAN_OPTS = {
   iconGlyphSelector: googleLobbyIconGlyphSelectors.join(', '),
   maxLabelChars: googleLobbyCtaMaxLabelChars,
+  labelVocabulary: googleLobbyLabelVocabulary,
 };
 const scan = (html: string) => { mount(html); return findLobbyPrimaryCta(SCAN_OPTS); };
 
@@ -321,6 +323,23 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
     }</body></html>`);
     assert(iconsOnly.el === null && iconsOnly.candidate_count === 0,
       'a lobby of icon buttons only → no candidates at all (the scan is not a catch-all)');
+
+    // Join-button-miss diagnostic: which KNOWN labels are visible, as a bitmask + count of the rest.
+    const vocab = (s: string) => googleLobbyLabelVocabulary.indexOf(s);
+    assert(googleLobbyLabelVocabulary.length <= 30 && new Set(googleLobbyLabelVocabulary).size === googleLobbyLabelVocabulary.length,
+      'the label vocabulary has unique entries and fits in a 31-bit mask');
+    const screen = scan(`<!doctype html><html lang="en"><body>
+      <button>Continue as guest</button><button> Sign   in </button><button>Some Unlisted Label</button>
+      <button>Another unlisted</button><button aria-label="Mic"><i class="google-symbols">mic</i></button>
+    </body></html>`);
+    assert(screen.candidate_count === 4 && screen.el === null,
+      'four visible text buttons (the icon button is excluded) → ambiguous, nothing resolved');
+    assert(screen.label_mask === ((1 << vocab('continue as guest')) | (1 << vocab('sign in'))),
+      'known labels are matched whole-label, case- and whitespace-insensitively, into a bitmask');
+    assert(screen.label_other === 2, 'labels outside the vocabulary are counted, never recorded');
+    const partial = scan('<!doctype html><html lang="en"><body><button>Join the call with friends</button></body></html>');
+    assert(partial.label_mask === 0 && partial.label_other === 1,
+      'a label only CONTAINING a vocabulary word is not a match (whole-label equality)');
   }
 
   console.log('\n=== 4. Ordered resolution — EXACT text wins over the broad structural entry ===');
@@ -368,7 +387,7 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
     let message = '';
     try {
       await waitForLobbyCta(
-        mockPage({ visible: [], scanLabels: ['Kérvényezés a csatlakozásra', 'Mégse'], lang: 'hu', nav: 'hu-HU' }) as any,
+        mockPage({ visible: [], scanLabels: ['Kérvényezés a csatlakozásra', 'Mégse'], scanMask: 3, scanOther: 1, lang: 'hu', nav: 'hu-HU' }) as any,
         googleJoinButtonSelectors, 900, 'join button', undefined, true);
     } catch (e: any) { message = String(e?.message || e); }
 
@@ -382,6 +401,8 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
       'the failure identifies the missing guest join step and static selector set');
     assert(/selector_mask=31/.test(message) && /candidate_count=2/.test(message),
       'the failure identifies every tried selector and the diagnostic candidate count');
+    assert(/label_mask=3 label_other=1/.test(message),
+      'the failure carries the scan label bitmask and unknown-label count, never label text');
     assert(/lobby_reached=true/.test(message),
       'a guest CTA miss distinguishes a reached lobby from a missing name-entry page');
   }
@@ -394,7 +415,7 @@ const isCta = (el: Element | null) => el !== null && el.getAttribute('data-cta')
 // Only the surface the resolvers touch: ordered locator visibility, the
 // structural scan handle, the failure screenshot and the locale probe.
 function mockPage(m: {
-  visible: string[]; scanLabels?: string[]; scanHits?: boolean; lang?: string; nav?: string;
+  visible: string[]; scanLabels?: string[]; scanHits?: boolean; lang?: string; nav?: string; scanMask?: number; scanOther?: number;
 }) {
   const el = { __element: true };
   return {
@@ -410,7 +431,8 @@ function mockPage(m: {
     evaluate: async (_fn: any) => ({ lang: m.lang || 'en', nav: m.nav || 'en-US' }),
     evaluateHandle: async (_fn: any, _opts: any) => ({
       getProperty: async (k: string) => ({
-        jsonValue: async () => (k === 'candidate_count' ? (m.scanLabels || []).length : null),
+        jsonValue: async () => (k === 'candidate_count' ? (m.scanLabels || []).length
+          : k === 'label_mask' ? (m.scanMask ?? 0) : k === 'label_other' ? (m.scanOther ?? 0) : null),
         asElement: () => (k === 'el' && m.scanHits ? el : null),
       }),
       dispose: async () => {},

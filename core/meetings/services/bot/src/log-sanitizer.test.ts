@@ -11,8 +11,8 @@ const script = `
   console.log(JSON.stringify({level:'warn', event:'join.unknown_blocking_dialog', platform:'google_meet', msg:'SYNTH_MODAL_TEXT_650'}));
   console.log(JSON.stringify({level:'warn', event:'join.ui_locale_not_english', platform:'google_meet', html_lang:'fi', navigator_language:'en-US', msg:'SYNTH_LOCALE_TEXT_651'}));
   console.log(JSON.stringify({ts:'2026-10-20T00:00:00.000Z', level:'warn', event:'join.gemini_notice_handled', platform:'google_meet', success:true, attempt:1, msg:'SYNTH_NOTICE_TEXT_640', title:'SYNTH_NAME_641'}));
-  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',platform:'google_meet',error_code:'selector_not_found',step:'join_request',selector_set:'guest_join',selector_mask:31,selector_count:5,candidate_count:2,timeout_ms:60000,lobby_reached:true,html_lang:'en',navigator_language:'en-US',selector:'button:has-text("SYNTH_NAME_652")',label:'SYNTH_LABEL_653',html:'SYNTH_DOM_654',path:'/private/SYNTH_PATH_655'}));
-  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',step:'SYNTH_STEP_656',selector_set:'SYNTH_SET_657',selector_mask:'SYNTH_MASK_658',lobby_reached:'SYNTH_LOBBY_659'}));
+  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',platform:'google_meet',error_code:'selector_not_found',step:'join_request',selector_set:'guest_join',selector_mask:31,selector_count:5,candidate_count:2,label_mask:5,label_other:1,timeout_ms:60000,lobby_reached:true,html_lang:'en',navigator_language:'en-US',selector:'button:has-text("SYNTH_NAME_652")',label:'SYNTH_LABEL_653',html:'SYNTH_DOM_654',path:'/private/SYNTH_PATH_655',label_text:'SYNTH_LABELTEXT_663'}));
+  console.warn(JSON.stringify({level:'warn',event:'join.selector_miss',step:'SYNTH_STEP_656',selector_set:'SYNTH_SET_657',selector_mask:'SYNTH_MASK_658',label_mask:'SYNTH_LMASK_664',label_other:'SYNTH_LOTHER_665',lobby_reached:'SYNTH_LOBBY_659'}));
   console.warn(JSON.stringify({level:'warn',event:'admission.failed',platform:'google_meet',step:'admission',error_code:'admission_unconfirmed',lobby_reached:true,html_lang:'en',navigator_language:'en-US',message:'SYNTH_ADMISSION_PAGE_660'}));
   console.log(JSON.stringify({ts:'2026-11-04T00:00:00.000Z',level:'warn',event:'join.refused',platform:'google_meet',error_code:'join_refused',refused_call:'resolve_meeting_space',attempt:1,attempts_max:3,evidence:'SYNTH_REFUSAL_TEXT_661',url:'https://meet.google.com/abc-defg-hij'}));
   console.log(JSON.stringify({level:'warn',event:'join.refused',platform:'google_meet',error_code:'join_refused',refused_call:'SYNTH_CALL_662',attempt:2,attempts_max:3}));
@@ -61,9 +61,9 @@ assert.ok(missLine, 'selector failure diagnostics must survive the production pr
 assert.deepEqual(JSON.parse(missLine), {
   level:'warn', event:'join.selector_miss', platform:'google_meet', error_code:'selector_not_found',
   step:'join_request', selector_set:'guest_join', selector_mask:31, selector_count:5,
-  candidate_count:2, timeout_ms:60000, lobby_reached:true, html_lang:'en', navigator_language:'en-US',
+  candidate_count:2, label_mask:5, label_other:1, timeout_ms:60000, lobby_reached:true, html_lang:'en', navigator_language:'en-US',
 });
-for (const canary of ['SYNTH_NAME_652','SYNTH_LABEL_653','SYNTH_DOM_654','SYNTH_PATH_655','SYNTH_STEP_656','SYNTH_SET_657','SYNTH_MASK_658','SYNTH_LOBBY_659']) {
+for (const canary of ['SYNTH_NAME_652','SYNTH_LABEL_653','SYNTH_DOM_654','SYNTH_PATH_655','SYNTH_STEP_656','SYNTH_SET_657','SYNTH_MASK_658','SYNTH_LOBBY_659','SYNTH_LABELTEXT_663','SYNTH_LMASK_664','SYNTH_LOTHER_665']) {
   assert.equal(output.includes(canary), false, `selector diagnostics leaked ${canary}`);
 }
 const terminalLine = output.split('\n').find((line) => line.includes('"event":"admission.failed"'));

@@ -9,7 +9,8 @@ import {
   googleAuthJoinCtaSelectors,
   googleSignedOutLobbyProbeSelectors,
   googleLobbyIconGlyphSelectors,
-  googleLobbyCtaMaxLabelChars
+  googleLobbyCtaMaxLabelChars,
+  googleLobbyLabelVocabulary
 } from "./selectors";
 import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
 import { AdmissionError } from "../shared/admission";
@@ -67,8 +68,8 @@ export const STRUCTURAL_CTA_ORIGIN = "structural:lobby-primary-cta";
 
 /** Result of the browser-context lobby scan. Text is used only to classify
  * candidates; only the count and a possible element handle leave the page. */
-export interface LobbyCtaScan { el: Element | null; candidate_count: number }
-export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars: number }
+export interface LobbyCtaScan { el: Element | null; candidate_count: number; label_mask: number; label_other: number }
+export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars: number; labelVocabulary: string[] }
 
 /**
  * Locale-agnostic primary-CTA scan for the Google Meet lobby.
@@ -95,6 +96,8 @@ export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars:
  */
 export function findLobbyPrimaryCta(opts: LobbyCtaScanOptions): LobbyCtaScan {
   const candidates: Element[] = [];
+  let labelMask = 0;
+  let labelOther = 0;
   const buttons = document.querySelectorAll("button");
   for (let i = 0; i < buttons.length; i++) {
     const btn = buttons[i] as HTMLButtonElement;
@@ -110,29 +113,43 @@ export function findLobbyPrimaryCta(opts: LobbyCtaScanOptions): LobbyCtaScan {
     if (text.indexOf("_") >= 0) continue;
     if (!/\p{L}/u.test(text)) continue;
     candidates.push(btn);
+    // Diagnostic only: classify against the fixed vocabulary; unknown text is counted, never kept.
+    const known = opts.labelVocabulary.indexOf(text.toLowerCase());
+    if (known >= 0) labelMask |= 1 << known; else labelOther++;
   }
-  return { el: candidates.length === 1 ? candidates[0] : null, candidate_count: candidates.length };
+  return {
+    el: candidates.length === 1 ? candidates[0] : null,
+    candidate_count: candidates.length,
+    label_mask: labelMask,
+    label_other: labelOther,
+  };
 }
 
 /** Run findLobbyPrimaryCta in the page and lift the winner into an ElementHandle. */
 async function scanLobbyPrimaryCta(
   page: Page
-): Promise<{ handle: ElementHandle<Element> | null; candidate_count: number }> {
+): Promise<{ handle: ElementHandle<Element> | null; candidate_count: number; label_mask: number; label_other: number }> {
   const opts: LobbyCtaScanOptions = {
     iconGlyphSelector: googleLobbyIconGlyphSelectors.join(", "),
     maxLabelChars: googleLobbyCtaMaxLabelChars,
+    labelVocabulary: googleLobbyLabelVocabulary,
   };
+  const count = (v: unknown): number => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0);
   let scan: any = null;
   try {
     scan = await page.evaluateHandle(findLobbyPrimaryCta, opts);
     const candidateCount = (await (await scan.getProperty("candidate_count")).jsonValue()) as number;
+    const labelMask = (await (await scan.getProperty("label_mask")).jsonValue()) as number;
+    const labelOther = (await (await scan.getProperty("label_other")).jsonValue()) as number;
     const handle = (await scan.getProperty("el")).asElement();
     return {
       handle: (handle as ElementHandle<Element>) || null,
-      candidate_count: Number.isSafeInteger(candidateCount) && candidateCount >= 0 ? candidateCount : 0,
+      candidate_count: count(candidateCount),
+      label_mask: count(labelMask),
+      label_other: count(labelOther),
     };
   } catch {
-    return { handle: null, candidate_count: 0 };
+    return { handle: null, candidate_count: 0, label_mask: 0, label_other: 0 };
   } finally {
     if (scan) { try { await scan.dispose(); } catch { /* best-effort */ } }
   }
@@ -192,7 +209,8 @@ export async function describeSelectorMiss(
   timeoutMs: number,
   label: string,
   candidateCount: number | null,
-  lobbyReached = false
+  lobbyReached = false,
+  labels: { mask: number; other: number } | null = null
 ): Promise<string> {
   const shot = `/app/storage/screenshots/bot-checkpoint-${label.replace(/[^a-z0-9]+/gi, "-")}-not-found.png`;
   try { await page.screenshot({ path: shot, fullPage: true }); } catch { /* best-effort */ }
@@ -208,11 +226,13 @@ export async function describeSelectorMiss(
     platform: "google_meet",
     selector_count: selectors.length,
     candidate_count: candidateCount ?? -1,
+    label_mask: labels?.mask ?? -1,
+    label_other: labels?.other ?? -1,
     timeout_ms: timeoutMs,
     ...context,
     ...failure,
   });
-  return `code=selector_not_found timeout_ms=${timeoutMs} html_lang=${context.html_lang} navigator_language=${context.navigator_language} step=${failure.step} selector_set=${failure.selector_set} selector_mask=${failure.selector_mask} selector_count=${selectors.length} candidate_count=${candidateCount ?? -1} lobby_reached=${lobbyReached}`;
+  return `code=selector_not_found timeout_ms=${timeoutMs} html_lang=${context.html_lang} navigator_language=${context.navigator_language} step=${failure.step} selector_set=${failure.selector_set} selector_mask=${failure.selector_mask} selector_count=${selectors.length} candidate_count=${candidateCount ?? -1} label_mask=${labels?.mask ?? -1} label_other=${labels?.other ?? -1} lobby_reached=${lobbyReached}`;
 }
 
 /**
@@ -277,6 +297,7 @@ export async function waitForLobbyCta(
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
   let polls = 0;
   let lastCandidateCount: number | null = null;
+  let lastLabels: { mask: number; other: number } | null = null;
   do {
     signal?.throwIfAborted();
     if (guard) await guard();
@@ -288,6 +309,7 @@ export async function waitForLobbyCta(
     if (Date.now() - started >= graceMs && polls % CTA_SCAN_EVERY_POLLS === 0) {
       const scan = await scanLobbyPrimaryCta(page);
       lastCandidateCount = scan.candidate_count;
+      lastLabels = { mask: scan.label_mask, other: scan.label_other };
       // Diagnostic-only: the scan is NOT allowed to resolve the CTA. If it would
       // have uniquely picked a button the selector list has not matched this poll,
       // record that as telemetry — prod evidence for whether a real non-English
@@ -302,7 +324,7 @@ export async function waitForLobbyCta(
     await page.waitForTimeout(SELECTOR_POLL_MS);
   } while (Date.now() - started < timeoutMs);
 
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastCandidateCount, lobbyReached));
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, lastCandidateCount, lobbyReached, lastLabels));
 }
 
 /**
