@@ -30,9 +30,11 @@ import { googleJoinRefusedIndicators } from "./selectors";
 /** Reason code at the head of every refusal message; join evidence reads it as a platform refusal. */
 export const GOOGLE_JOIN_REFUSED = "google_meet_join_refused";
 
-/** Knocks per join, the first included. Meet's refusal is flaky; a meeting that refuses every one of
- *  these is reported as refused rather than knocked on until the lobby budget runs out. */
-export const GOOGLE_JOIN_MAX_KNOCKS = 3;
+/** Knocks per join, the first included. Meet's refusal is flaky and independent per knock (upstream
+ *  Vexa-ai/vexa#2003: ~64% of prod knocks refused, so 3 knocks fail 26% of joins and 10 fail ~1%).
+ *  A meeting that refuses every one of these is reported as refused rather than knocked on until the
+ *  lobby budget runs out. */
+export const GOOGLE_JOIN_MAX_KNOCKS = 10;
 
 /** The call whose 403 refused the knock; null when only the refusal screen was seen. */
 export type GoogleRefusingCall = "ResolveMeetingSpace" | "CreateMeetingDevice";
